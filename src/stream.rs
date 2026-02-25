@@ -109,6 +109,26 @@ pub enum StreamEmitError {
     AlreadyTerminated,
 }
 
+impl std::fmt::Display for StreamEmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "stream I/O error: {e}"),
+            Self::Json(e) => write!(f, "stream JSON error: {e}"),
+            Self::AlreadyTerminated => write!(f, "stream already terminated"),
+        }
+    }
+}
+
+impl std::error::Error for StreamEmitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Json(e) => Some(e),
+            Self::AlreadyTerminated => None,
+        }
+    }
+}
+
 impl From<io::Error> for StreamEmitError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)

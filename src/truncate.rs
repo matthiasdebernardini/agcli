@@ -20,9 +20,15 @@ pub struct TruncatedEntries {
 
 impl TruncatedEntries {
     /// Remove the temp file written during truncation, if any.
+    ///
+    /// Idempotent: succeeds even if the file was already removed.
     pub fn cleanup(&self) -> io::Result<()> {
         if let Some(path) = &self.full_output {
-            fs::remove_file(path)?;
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -80,30 +86,48 @@ fn write_full_output(lines: &[String], prefix: &str) -> io::Result<PathBuf> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    let filename = format!("{prefix}-{}-{now}.log", process::id());
-    let path = std::env::temp_dir().join(filename);
+        .as_nanos();
+    let pid = process::id();
 
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
+    for attempt in 0u32..5 {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let filename = format!("{prefix}-{pid}-{now}{suffix}.log");
+        let path = std::env::temp_dir().join(filename);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
 
-    let file = opts.open(&path)?;
-    let mut writer = BufWriter::new(file);
-    for (i, line) in lines.iter().enumerate() {
-        writer.write_all(line.as_bytes())?;
-        if i + 1 < lines.len() {
-            writer.write_all(b"\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+
+        match opts.open(&path) {
+            Ok(file) => {
+                let mut writer = BufWriter::new(file);
+                for (i, line) in lines.iter().enumerate() {
+                    writer.write_all(line.as_bytes())?;
+                    if i + 1 < lines.len() {
+                        writer.write_all(b"\n")?;
+                    }
+                }
+                writer.flush()?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
-    writer.flush()?;
 
-    Ok(path)
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "failed to create unique temp file after 5 attempts",
+    ))
 }
 
 #[cfg(test)]
@@ -142,5 +166,26 @@ mod tests {
         let metadata = std::fs::metadata(full_path).expect("must stat");
         assert_eq!(metadata.mode() & 0o777, 0o600);
         result.cleanup().expect("cleanup must succeed");
+    }
+
+    #[test]
+    fn cleanup_is_idempotent() {
+        let lines = (0..10).map(|idx| format!("line-{idx}")).collect::<Vec<_>>();
+        let result = truncate_lines_with_file(lines, 3, "idempotent-test").expect("must truncate");
+        assert!(result.full_output.is_some());
+        result.cleanup().expect("first cleanup must succeed");
+        result.cleanup().expect("second cleanup must also succeed");
+    }
+
+    #[test]
+    fn cleanup_no_file_succeeds() {
+        let result = TruncatedEntries {
+            lines: 0,
+            total: 0,
+            truncated: false,
+            full_output: None,
+            entries: vec![],
+        };
+        result.cleanup().expect("cleanup with no file must succeed");
     }
 }

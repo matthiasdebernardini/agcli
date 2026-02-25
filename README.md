@@ -13,7 +13,7 @@ It is built around the design in [design.md](design.md):
 
 ```toml
 [dependencies]
-agcli = "0.1.0"
+agcli = "0.3.0"
 serde_json = "1"
 ```
 
@@ -25,7 +25,7 @@ use serde_json::json;
 
 fn main() {
     let cli = AgentCli::new("ops", "Agent-native operations CLI")
-        .version("0.1.0")
+        .version("0.3.0")
         .command(
             Command::new("status", "Show system health")
                 .usage("ops status")

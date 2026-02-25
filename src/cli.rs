@@ -74,22 +74,11 @@ impl fmt::Display for ParseInvocationError {
     }
 }
 
-/// Returns true if `s` looks like a negative number (integer or float).
+impl std::error::Error for ParseInvocationError {}
+
+/// Returns true if `s` looks like a negative number (integer, float, or scientific notation).
 fn looks_like_negative_number(s: &str) -> bool {
-    if !s.starts_with('-') || s.len() < 2 {
-        return false;
-    }
-    let rest = &s[1..];
-    let mut seen_dot = false;
-    for (i, ch) in rest.chars().enumerate() {
-        if ch == '.' && !seen_dot && i > 0 {
-            seen_dot = true;
-        } else if !ch.is_ascii_digit() {
-            return false;
-        }
-    }
-    // Must have at least one digit
-    rest.chars().any(|c| c.is_ascii_digit())
+    s.starts_with('-') && s.len() >= 2 && s.parse::<f64>().is_ok()
 }
 
 /// Parse argv into an `Invocation`.
@@ -139,7 +128,7 @@ where
             continue;
         }
 
-        // Long flags: --key or --key=value
+        // Long flags: --key=value or bare --key (bool)
         if let Some(flag) = token.strip_prefix("--") {
             if flag.is_empty() {
                 return Err(ParseInvocationError::InvalidFlag(token.clone()));
@@ -154,16 +143,7 @@ where
                 continue;
             }
 
-            // Consume next token as value unless it starts with '--'
-            // (single-dash values like -123 are allowed as flag values)
-            if let Some(next) = tokens.get(i + 1) {
-                let is_value = !next.starts_with('-') || looks_like_negative_number(next);
-                if is_value {
-                    flags.insert(flag.to_string(), next.clone());
-                    i += 2;
-                    continue;
-                }
-            }
+            // Bare --flag is always boolean
             flags.insert(flag.to_string(), "true".to_string());
             i += 1;
             continue;
@@ -176,25 +156,27 @@ where
             continue;
         }
 
-        // Short flags: -x or -abc (bundled)
+        // Short flags: -x, -x=value, or -abc (bundled, all bool)
         if token.starts_with('-') && token.len() > 1 {
             let short = &token[1..];
+
+            // Check for -k=value
+            if let Some((key, value)) = short.split_once('=')
+                && key.chars().count() == 1
+            {
+                flags.insert(key.to_string(), value.to_string());
+                i += 1;
+                continue;
+            }
+
             if short.chars().count() == 1 {
-                // Single short flag: -x
-                // Consume next token as value unless it starts with '--'
-                // (allow negative numbers as values)
-                if let Some(next) = tokens.get(i + 1)
-                    && (!next.starts_with('-') || looks_like_negative_number(next))
-                {
-                    flags.insert(short.to_string(), next.clone());
-                    i += 2;
-                    continue;
-                }
+                // Single short flag: -x (always bool)
                 flags.insert(short.to_string(), "true".to_string());
                 i += 1;
                 continue;
             }
 
+            // Bundled short flags: -abc (all bool)
             for ch in short.chars() {
                 flags.insert(ch.to_string(), "true".to_string());
             }
@@ -321,6 +303,14 @@ pub struct CommandError {
     pub next_actions: Vec<NextAction>,
 }
 
+impl fmt::Display for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for CommandError {}
+
 impl CommandError {
     pub fn new(
         message: impl Into<String>,
@@ -405,6 +395,11 @@ impl Command {
     }
 
     pub fn subcommand(mut self, command: Command) -> Self {
+        debug_assert!(
+            !self.subcommands.contains_key(&command.name),
+            "duplicate subcommand: {}",
+            command.name
+        );
         self.subcommands.insert(command.name.clone(), command);
         self
     }
@@ -430,7 +425,7 @@ impl Command {
         if !self.subcommands.is_empty() && self.handler.is_none() {
             format!("{program} {joined} <subcommand>")
         } else {
-            format!("{program} {joined} [--flag <value>] [args...]")
+            format!("{program} {joined} [--flag=<value>] [args...]")
         }
     }
 }
@@ -497,6 +492,11 @@ impl AgentCli {
     }
 
     pub fn command(mut self, command: Command) -> Self {
+        debug_assert!(
+            !self.commands.contains_key(&command.name),
+            "duplicate command: {}",
+            command.name
+        );
         self.commands.insert(command.name.clone(), command);
         self
     }
@@ -695,6 +695,21 @@ impl AgentCli {
             }
         };
 
+        // Reject trailing unknown tokens when the command has subcommands
+        if !resolved.remaining.is_empty() && !command.subcommands.is_empty() {
+            let path_strs: Vec<&str> = resolved.path.iter().map(String::as_str).collect();
+            return self.error_execution(
+                invocation.command_line().to_string(),
+                format!("unknown subcommand: {}", resolved.remaining[0]),
+                "UNKNOWN_SUBCOMMAND",
+                format!(
+                    "Use one of the listed subcommands under `{}`.",
+                    resolved.path.join(" ")
+                ),
+                self.subcommand_actions(&path_strs, command),
+            );
+        }
+
         self.command_tree_execution(invocation, &resolved.path, command)
     }
 
@@ -731,6 +746,12 @@ impl AgentCli {
         let mut docs = Vec::with_capacity(self.commands.len());
         self.command_docs_into(program, &mut path_buf, &self.commands, &mut docs, 0);
         let mut result = Map::new();
+
+        // Insert user-provided extras first so core keys always win
+        for (key, value) in &self.root_extra {
+            result.insert(key.clone(), value.clone());
+        }
+
         result.insert(
             "description".to_string(),
             Value::String(self.description.clone()),
@@ -743,10 +764,6 @@ impl AgentCli {
             serde_json::to_value(docs)
                 .unwrap_or_else(|e| Value::String(format!("serialization failed: {e}"))),
         );
-
-        for (key, value) in &self.root_extra {
-            result.insert(key.clone(), value.clone());
-        }
 
         Value::Object(result)
     }
@@ -951,10 +968,8 @@ mod tests {
         let invocation = parse_invocation([
             "wokhei",
             "create-header",
-            "--relay",
-            "ws://localhost:7777",
-            "-d",
-            "payload.json",
+            "--relay=ws://localhost:7777",
+            "-d=payload.json",
             "extra",
         ])
         .expect("invocation should parse");
@@ -1063,15 +1078,14 @@ mod tests {
 
     #[test]
     fn long_flag_with_negative_value() {
-        let invocation =
-            parse_invocation(["app", "--count", "-1"]).expect("invocation should parse");
+        let invocation = parse_invocation(["app", "--count=-1"]).expect("invocation should parse");
         assert_eq!(invocation.flag("count"), Some("-1"));
         assert!(invocation.positionals().is_empty());
     }
 
     #[test]
     fn short_flag_with_negative_value() {
-        let invocation = parse_invocation(["app", "-n", "-5"]).expect("invocation should parse");
+        let invocation = parse_invocation(["app", "-n=-5"]).expect("invocation should parse");
         assert_eq!(invocation.flag("n"), Some("-5"));
         assert!(invocation.positionals().is_empty());
     }
@@ -1103,8 +1117,7 @@ mod tests {
 
     #[test]
     fn prompt_returns_cow_borrowed_for_flag() {
-        let invocation =
-            parse_invocation(["app", "--prompt", "hello world"]).expect("should parse");
+        let invocation = parse_invocation(["app", "--prompt=hello world"]).expect("should parse");
         let request = CommandRequest {
             invocation: &invocation,
             command_path: &[],
@@ -1127,5 +1140,111 @@ mod tests {
         let prompt = request.prompt().expect("should have prompt");
         assert!(matches!(prompt, Cow::Owned(_)));
         assert_eq!(&*prompt, "foo bar");
+    }
+
+    // --- Strict flag parser tests ---
+
+    #[test]
+    fn bare_long_flag_is_boolean() {
+        let invocation =
+            parse_invocation(["app", "--verbose", "positional"]).expect("should parse");
+        assert_eq!(invocation.flag("verbose"), Some("true"));
+        assert_eq!(invocation.positionals(), &[String::from("positional")]);
+    }
+
+    #[test]
+    fn bare_short_flag_is_boolean() {
+        let invocation = parse_invocation(["app", "-v", "positional"]).expect("should parse");
+        assert_eq!(invocation.flag("v"), Some("true"));
+        assert_eq!(invocation.positionals(), &[String::from("positional")]);
+    }
+
+    #[test]
+    fn long_flag_equals_carries_value() {
+        let invocation = parse_invocation(["app", "--output=file.txt"]).expect("should parse");
+        assert_eq!(invocation.flag("output"), Some("file.txt"));
+        assert!(invocation.positionals().is_empty());
+    }
+
+    #[test]
+    fn short_flag_equals_carries_value() {
+        let invocation = parse_invocation(["app", "-o=file.txt"]).expect("should parse");
+        assert_eq!(invocation.flag("o"), Some("file.txt"));
+        assert!(invocation.positionals().is_empty());
+    }
+
+    #[test]
+    fn strict_parser_does_not_swallow_commands() {
+        // `--follow status` should NOT consume `status` as the flag value
+        let invocation = parse_invocation(["app", "--follow", "status"]).expect("should parse");
+        assert_eq!(invocation.flag("follow"), Some("true"));
+        assert_eq!(invocation.positionals(), &[String::from("status")]);
+    }
+
+    #[test]
+    fn scientific_notation_negative_number() {
+        let invocation = parse_invocation(["app", "-1e3"]).expect("should parse");
+        assert_eq!(invocation.positionals(), &[String::from("-1e3")]);
+        assert!(invocation.flags().is_empty());
+    }
+
+    #[test]
+    fn shorthand_decimal_negative_number() {
+        let invocation = parse_invocation(["app", "-.5"]).expect("should parse");
+        assert_eq!(invocation.positionals(), &[String::from("-.5")]);
+        assert!(invocation.flags().is_empty());
+    }
+
+    // --- Help with trailing unknown tokens ---
+
+    #[test]
+    fn help_with_trailing_unknown_returns_error() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "gateway", "bogus", "--help"]);
+
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error envelope");
+        };
+        assert_eq!(envelope.error.code, "UNKNOWN_SUBCOMMAND");
+    }
+
+    // --- root_field cannot shadow core keys ---
+
+    #[test]
+    fn root_field_cannot_shadow_core_keys() {
+        let cli = AgentCli::new("test", "Test CLI")
+            .version("1.0.0")
+            .root_field("description", json!("hacked"))
+            .root_field("version", json!("hacked"))
+            .root_field("commands", json!("hacked"));
+
+        let run = cli.run_argv(["test"]);
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        // Core keys must not be overwritten by root_field
+        assert_eq!(envelope.result["description"], json!("Test CLI"));
+        assert_eq!(envelope.result["version"], json!("1.0.0"));
+        assert!(envelope.result["commands"].is_array());
+    }
+
+    // --- Duplicate command debug_assert ---
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "duplicate command")]
+    fn duplicate_command_panics_in_debug() {
+        AgentCli::new("test", "Test CLI")
+            .command(Command::new("status", "first"))
+            .command(Command::new("status", "second"));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "duplicate subcommand")]
+    fn duplicate_subcommand_panics_in_debug() {
+        Command::new("parent", "Parent")
+            .subcommand(Command::new("child", "first"))
+            .subcommand(Command::new("child", "second"));
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 /// HATEOAS action template that tells an agent what to run next.
@@ -111,10 +111,11 @@ impl ErrorBody {
 }
 
 /// Success response envelope.
-#[derive(Clone, Debug, Serialize, PartialEq)]
-#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
+///
+/// Always serializes with `"ok": true`. The `ok` field is not stored;
+/// it is injected at serialization time and validated at deserialization time.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SuccessEnvelope {
-    pub ok: bool,
     pub command: String,
     pub result: Value,
     pub next_actions: Vec<NextAction>,
@@ -123,7 +124,6 @@ pub struct SuccessEnvelope {
 impl SuccessEnvelope {
     pub fn new(command: impl Into<String>, result: Value, next_actions: Vec<NextAction>) -> Self {
         Self {
-            ok: true,
             command: command.into(),
             result,
             next_actions,
@@ -131,11 +131,51 @@ impl SuccessEnvelope {
     }
 }
 
+impl Serialize for SuccessEnvelope {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("SuccessEnvelope", 4)?;
+        s.serialize_field("ok", &true)?;
+        s.serialize_field("command", &self.command)?;
+        s.serialize_field("result", &self.result)?;
+        s.serialize_field("next_actions", &self.next_actions)?;
+        s.end()
+    }
+}
+
+#[cfg(feature = "deserialize")]
+impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            ok: bool,
+            command: String,
+            result: Value,
+            next_actions: Vec<NextAction>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if !raw.ok {
+            return Err(serde::de::Error::custom(
+                "expected ok=true for SuccessEnvelope",
+            ));
+        }
+        Ok(SuccessEnvelope {
+            command: raw.command,
+            result: raw.result,
+            next_actions: raw.next_actions,
+        })
+    }
+}
+
 /// Error response envelope.
-#[derive(Clone, Debug, Serialize, PartialEq)]
-#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
+///
+/// Always serializes with `"ok": false`. The `ok` field is not stored;
+/// it is injected at serialization time and validated at deserialization time.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ErrorEnvelope {
-    pub ok: bool,
     pub command: String,
     pub error: ErrorBody,
     pub fix: String,
@@ -151,7 +191,6 @@ impl ErrorEnvelope {
         next_actions: Vec<NextAction>,
     ) -> Self {
         Self {
-            ok: false,
             command: command.into(),
             error: ErrorBody::new(message, code),
             fix: fix.into(),
@@ -160,13 +199,77 @@ impl ErrorEnvelope {
     }
 }
 
+impl Serialize for ErrorEnvelope {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("ErrorEnvelope", 5)?;
+        s.serialize_field("ok", &false)?;
+        s.serialize_field("command", &self.command)?;
+        s.serialize_field("error", &self.error)?;
+        s.serialize_field("fix", &self.fix)?;
+        s.serialize_field("next_actions", &self.next_actions)?;
+        s.end()
+    }
+}
+
+#[cfg(feature = "deserialize")]
+impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            ok: bool,
+            command: String,
+            error: ErrorBody,
+            fix: String,
+            next_actions: Vec<NextAction>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.ok {
+            return Err(serde::de::Error::custom(
+                "expected ok=false for ErrorEnvelope",
+            ));
+        }
+        Ok(ErrorEnvelope {
+            command: raw.command,
+            error: raw.error,
+            fix: raw.fix,
+            next_actions: raw.next_actions,
+        })
+    }
+}
+
 /// Unified envelope enum.
 #[derive(Clone, Debug, Serialize, PartialEq)]
-#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[serde(untagged)]
 pub enum Envelope {
     Success(SuccessEnvelope),
     Error(ErrorEnvelope),
+}
+
+#[cfg(feature = "deserialize")]
+impl<'de> serde::Deserialize<'de> for Envelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let ok = value
+            .get("ok")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| serde::de::Error::custom("missing or invalid `ok` field"))?;
+        if ok {
+            serde_json::from_value(value)
+                .map(Envelope::Success)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Envelope::Error)
+                .map_err(serde::de::Error::custom)
+        }
+    }
 }
 
 impl Envelope {
@@ -186,13 +289,23 @@ impl Envelope {
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self)
-            .unwrap_or_else(|e| format!(r#"{{"ok":false,"error":"serialization failed: {e}"}}"#))
+        serde_json::to_string(self).unwrap_or_else(|e| {
+            serde_json::to_string(&serde_json::json!({
+                "ok": false,
+                "error": format!("serialization failed: {e}")
+            }))
+            .unwrap_or_default()
+        })
     }
 
     pub fn to_json_pretty(&self) -> String {
-        serde_json::to_string_pretty(self)
-            .unwrap_or_else(|e| format!(r#"{{"ok":false,"error":"serialization failed: {e}"}}"#))
+        serde_json::to_string_pretty(self).unwrap_or_else(|e| {
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": false,
+                "error": format!("serialization failed: {e}")
+            }))
+            .unwrap_or_default()
+        })
     }
 }
 
@@ -250,5 +363,58 @@ mod tests {
             encoded["fix"],
             Value::String("Use valid JSON input".to_string())
         );
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn success_envelope_roundtrips() {
+        let original = SuccessEnvelope::new(
+            "test cmd",
+            json!({ "data": 42 }),
+            vec![NextAction::new("test cmd", "Run again")],
+        );
+        let json = serde_json::to_string(&original).expect("must serialize");
+        let decoded: SuccessEnvelope = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(original, decoded);
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn error_envelope_roundtrips() {
+        let original = ErrorEnvelope::new("test cmd", "oops", "ERR", "fix it", vec![]);
+        let json = serde_json::to_string(&original).expect("must serialize");
+        let decoded: ErrorEnvelope = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(original, decoded);
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn success_envelope_rejects_ok_false() {
+        let json = r#"{"ok":false,"command":"test","result":null,"next_actions":[]}"#;
+        let result: Result<SuccessEnvelope, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn error_envelope_rejects_ok_true() {
+        let json = r#"{"ok":true,"command":"test","error":{"message":"x","code":"X"},"fix":"y","next_actions":[]}"#;
+        let result: Result<ErrorEnvelope, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn envelope_dispatches_by_ok_field() {
+        let success_json =
+            serde_json::to_string(&SuccessEnvelope::new("cmd", json!(null), vec![])).unwrap();
+        let error_json =
+            serde_json::to_string(&ErrorEnvelope::new("cmd", "err", "E", "fix", vec![])).unwrap();
+
+        let s: Envelope = serde_json::from_str(&success_json).expect("must deserialize success");
+        assert!(matches!(s, Envelope::Success(_)));
+
+        let e: Envelope = serde_json::from_str(&error_json).expect("must deserialize error");
+        assert!(matches!(e, Envelope::Error(_)));
     }
 }

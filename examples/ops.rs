@@ -18,7 +18,7 @@ fn main() {
                     }))
                     .next_action(NextAction::new("ops status", "Re-check status"))
                     .next_action(
-                        NextAction::new("ops logs <source> [--lines <lines>]", "Inspect logs")
+                        NextAction::new("ops logs <source> [--lines=<lines>]", "Inspect logs")
                             .with_param(
                                 "source",
                                 ActionParam::new()
@@ -36,7 +36,7 @@ fn main() {
         )
         .command(
             Command::new("logs", "View logs with context-safe truncation")
-                .usage("ops logs <source> [--lines <lines>] [--follow]")
+                .usage("ops logs <source> [--lines=<lines>] [--follow]")
                 .handler(|req, _ctx| {
                     let source = req.arg(0).unwrap_or("worker");
                     let lines = req
@@ -58,7 +58,7 @@ fn main() {
 
                     Ok(
                         CommandOutput::new(json!(payload)).next_action(NextAction::new(
-                            "ops logs <source> [--lines <lines>] [--follow]",
+                            "ops logs <source> [--lines=<lines>] [--follow]",
                             "Adjust line count or follow logs",
                         )),
                     )
