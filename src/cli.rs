@@ -126,12 +126,12 @@ where
                 continue;
             }
 
-            if let Some(next) = tokens.get(i + 1) {
-                if !next.starts_with('-') {
-                    flags.insert(flag.to_string(), next.clone());
-                    i += 2;
-                    continue;
-                }
+            if let Some(next) = tokens.get(i + 1)
+                && !next.starts_with('-')
+            {
+                flags.insert(flag.to_string(), next.clone());
+                i += 2;
+                continue;
             }
             flags.insert(flag.to_string(), "true".to_string());
             i += 1;
@@ -141,12 +141,12 @@ where
         if token.starts_with('-') && token.len() > 1 {
             let short = &token[1..];
             if short.chars().count() == 1 {
-                if let Some(next) = tokens.get(i + 1) {
-                    if !next.starts_with('-') {
-                        flags.insert(short.to_string(), next.clone());
-                        i += 2;
-                        continue;
-                    }
+                if let Some(next) = tokens.get(i + 1)
+                    && !next.starts_with('-')
+                {
+                    flags.insert(short.to_string(), next.clone());
+                    i += 2;
+                    continue;
                 }
                 flags.insert(short.to_string(), "true".to_string());
                 i += 1;
@@ -382,12 +382,10 @@ impl Command {
         if let Some(usage) = &self.usage {
             return usage.clone();
         }
-        if self.subcommands.is_empty() {
-            format!("{program} {} [--flag <value>] [args...]", path.join(" "))
-        } else if self.handler.is_some() {
-            format!("{program} {} [--flag <value>] [args...]", path.join(" "))
-        } else {
+        if !self.subcommands.is_empty() && self.handler.is_none() {
             format!("{program} {} <subcommand>", path.join(" "))
+        } else {
+            format!("{program} {} [--flag <value>] [args...]", path.join(" "))
         }
     }
 }

@@ -1,3 +1,4 @@
+#![allow(clippy::pedantic)]
 //! Agent-native CLI primitives for Rust.
 //!
 //! This crate enforces an agent-first response model:
