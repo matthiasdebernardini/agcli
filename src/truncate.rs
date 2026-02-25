@@ -1,13 +1,14 @@
 use std::fs;
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Context-safe result for potentially large line-oriented output.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct TruncatedEntries {
     pub lines: usize,
     pub total: usize,
@@ -17,9 +18,19 @@ pub struct TruncatedEntries {
     pub entries: Vec<String>,
 }
 
+impl TruncatedEntries {
+    /// Remove the temp file written during truncation, if any.
+    pub fn cleanup(&self) -> io::Result<()> {
+        if let Some(path) = &self.full_output {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+}
+
 /// Truncate lines to `max_lines` and, when truncated, write full output to a temp file.
 pub fn truncate_lines_with_file(
-    lines: &[String],
+    lines: Vec<String>,
     max_lines: usize,
     file_prefix: &str,
 ) -> io::Result<TruncatedEntries> {
@@ -32,19 +43,19 @@ pub fn truncate_lines_with_file(
             total,
             truncated: false,
             full_output: None,
-            entries: lines.to_vec(),
+            entries: lines,
         });
     }
 
+    let path = write_full_output(&lines, &safe_prefix)?;
     let start = total.saturating_sub(max_lines);
-    let entries = lines[start..].to_vec();
-    let path = write_full_output(lines, &safe_prefix)?;
+    let entries: Vec<String> = lines.into_iter().skip(start).collect();
 
     Ok(TruncatedEntries {
         lines: entries.len(),
         total,
         truncated: true,
-        full_output: Some(path.to_string_lossy().to_string()),
+        full_output: Some(path.to_string_lossy().into_owned()),
         entries,
     })
 }
@@ -64,13 +75,34 @@ fn sanitize_prefix(value: &str) -> String {
 }
 
 fn write_full_output(lines: &[String], prefix: &str) -> io::Result<PathBuf> {
+    use std::fs::OpenOptions;
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let filename = format!("{prefix}-{}-{now}.log", process::id());
     let path = std::env::temp_dir().join(filename);
-    fs::write(&path, lines.join("\n"))?;
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let file = opts.open(&path)?;
+    let mut writer = BufWriter::new(file);
+    for (i, line) in lines.iter().enumerate() {
+        writer.write_all(line.as_bytes())?;
+        if i + 1 < lines.len() {
+            writer.write_all(b"\n")?;
+        }
+    }
+    writer.flush()?;
+
     Ok(path)
 }
 
@@ -81,7 +113,7 @@ mod tests {
     #[test]
     fn no_truncation_for_small_output() {
         let lines = vec!["a".to_string(), "b".to_string()];
-        let result = truncate_lines_with_file(&lines, 10, "logs").expect("must truncate");
+        let result = truncate_lines_with_file(lines, 10, "logs").expect("must truncate");
         assert!(!result.truncated);
         assert_eq!(result.total, 2);
         assert!(result.full_output.is_none());
@@ -90,11 +122,25 @@ mod tests {
     #[test]
     fn truncation_writes_full_output_file() {
         let lines = (0..10).map(|idx| format!("line-{idx}")).collect::<Vec<_>>();
-        let result = truncate_lines_with_file(&lines, 3, "logs").expect("must truncate");
+        let result = truncate_lines_with_file(lines, 3, "logs").expect("must truncate");
         assert!(result.truncated);
         assert_eq!(result.lines, 3);
         assert_eq!(result.total, 10);
-        let full_path = result.full_output.expect("expected temp file");
-        assert!(std::path::Path::new(&full_path).exists());
+        let full_path = result.full_output.as_ref().expect("expected temp file");
+        assert!(std::path::Path::new(full_path).exists());
+        result.cleanup().expect("cleanup must succeed");
+        assert!(!std::path::Path::new(full_path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_has_restrictive_permissions() {
+        use std::os::unix::fs::MetadataExt;
+        let lines = (0..10).map(|idx| format!("line-{idx}")).collect::<Vec<_>>();
+        let result = truncate_lines_with_file(lines, 3, "perms-test").expect("must truncate");
+        let full_path = result.full_output.as_ref().expect("expected temp file");
+        let metadata = std::fs::metadata(full_path).expect("must stat");
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        result.cleanup().expect("cleanup must succeed");
     }
 }

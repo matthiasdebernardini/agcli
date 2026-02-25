@@ -1,6 +1,6 @@
 [package]
 name = "agcli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A tiny, no-bloat foundation crate for building agentic CLIs in Rust."
 license = "MIT"
@@ -9,6 +9,9 @@ homepage = "https://github.com/matthiasdebernardini/agcli"
 readme = "README.md"
 keywords = ["cli", "agent", "json", "framework"]
 categories = ["command-line-interface"]
+
+[features]
+deserialize = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

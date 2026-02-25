@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,13 +9,16 @@ use serde_json::{Map, Value, json};
 
 use crate::envelope::{Envelope, ErrorEnvelope, NextAction, SuccessEnvelope};
 
+/// Maximum recursion depth for command tree traversal.
+const MAX_COMMAND_DEPTH: usize = 32;
+
 /// Parsed command-line invocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
     program: String,
     command_line: String,
     raw_args: Vec<String>,
-    flags: BTreeMap<String, String>,
+    flags: HashMap<String, String>,
     positionals: Vec<String>,
     help_requested: bool,
 }
@@ -28,11 +32,16 @@ impl Invocation {
         &self.command_line
     }
 
+    /// Consume the invocation and return the owned command_line string.
+    pub fn into_command_line(self) -> String {
+        self.command_line
+    }
+
     pub fn raw_args(&self) -> &[String] {
         &self.raw_args
     }
 
-    pub fn flags(&self) -> &BTreeMap<String, String> {
+    pub fn flags(&self) -> &HashMap<String, String> {
         &self.flags
     }
 
@@ -65,6 +74,24 @@ impl fmt::Display for ParseInvocationError {
     }
 }
 
+/// Returns true if `s` looks like a negative number (integer or float).
+fn looks_like_negative_number(s: &str) -> bool {
+    if !s.starts_with('-') || s.len() < 2 {
+        return false;
+    }
+    let rest = &s[1..];
+    let mut seen_dot = false;
+    for (i, ch) in rest.chars().enumerate() {
+        if ch == '.' && !seen_dot && i > 0 {
+            seen_dot = true;
+        } else if !ch.is_ascii_digit() {
+            return false;
+        }
+    }
+    // Must have at least one digit
+    rest.chars().any(|c| c.is_ascii_digit())
+}
+
 /// Parse argv into an `Invocation`.
 pub fn parse_invocation<I, S>(args: I) -> Result<Invocation, ParseInvocationError>
 where
@@ -85,7 +112,7 @@ where
         format!("{program} {}", tokens.join(" "))
     };
 
-    let mut flags = BTreeMap::new();
+    let mut flags = HashMap::new();
     let mut positionals = Vec::new();
     let mut help_requested = false;
     let mut positional_only = false;
@@ -112,6 +139,7 @@ where
             continue;
         }
 
+        // Long flags: --key or --key=value
         if let Some(flag) = token.strip_prefix("--") {
             if flag.is_empty() {
                 return Err(ParseInvocationError::InvalidFlag(token.clone()));
@@ -126,23 +154,37 @@ where
                 continue;
             }
 
-            if let Some(next) = tokens.get(i + 1)
-                && !next.starts_with('-')
-            {
-                flags.insert(flag.to_string(), next.clone());
-                i += 2;
-                continue;
+            // Consume next token as value unless it starts with '--'
+            // (single-dash values like -123 are allowed as flag values)
+            if let Some(next) = tokens.get(i + 1) {
+                let is_value = !next.starts_with('-') || looks_like_negative_number(next);
+                if is_value {
+                    flags.insert(flag.to_string(), next.clone());
+                    i += 2;
+                    continue;
+                }
             }
             flags.insert(flag.to_string(), "true".to_string());
             i += 1;
             continue;
         }
 
+        // Negative numbers as positionals: -123, -3.14
+        if looks_like_negative_number(token) {
+            positionals.push(token.clone());
+            i += 1;
+            continue;
+        }
+
+        // Short flags: -x or -abc (bundled)
         if token.starts_with('-') && token.len() > 1 {
             let short = &token[1..];
             if short.chars().count() == 1 {
+                // Single short flag: -x
+                // Consume next token as value unless it starts with '--'
+                // (allow negative numbers as values)
                 if let Some(next) = tokens.get(i + 1)
-                    && !next.starts_with('-')
+                    && (!next.starts_with('-') || looks_like_negative_number(next))
                 {
                     flags.insert(short.to_string(), next.clone());
                     i += 2;
@@ -177,7 +219,7 @@ where
 /// Mutable state shared across command invocations.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExecutionContext {
-    memory: BTreeMap<String, Value>,
+    memory: HashMap<String, Value>,
 }
 
 impl ExecutionContext {
@@ -193,7 +235,7 @@ impl ExecutionContext {
         self.memory.remove(key)
     }
 
-    pub fn memory(&self) -> &BTreeMap<String, Value> {
+    pub fn memory(&self) -> &HashMap<String, Value> {
         &self.memory
     }
 }
@@ -226,14 +268,14 @@ impl<'a> CommandRequest<'a> {
         self.invocation.flag(key)
     }
 
-    pub fn prompt(&self) -> Option<String> {
+    pub fn prompt(&self) -> Option<Cow<'_, str>> {
         if let Some(prompt) = self.flag("prompt") {
-            return Some(prompt.to_string());
+            return Some(Cow::Borrowed(prompt));
         }
         if self.positionals.is_empty() {
             return None;
         }
-        Some(self.positionals.join(" "))
+        Some(Cow::Owned(self.positionals.join(" ")))
     }
 }
 
@@ -319,6 +361,8 @@ pub struct Command {
     subcommands: BTreeMap<String, Command>,
 }
 
+use std::collections::BTreeMap;
+
 impl fmt::Debug for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Command")
@@ -378,14 +422,15 @@ impl Command {
         &self.description
     }
 
-    fn usage_or_default(&self, program: &str, path: &[String]) -> String {
+    fn usage_or_default(&self, program: &str, path: &[&str]) -> String {
         if let Some(usage) = &self.usage {
             return usage.clone();
         }
+        let joined = path.join(" ");
         if !self.subcommands.is_empty() && self.handler.is_none() {
-            format!("{program} {} <subcommand>", path.join(" "))
+            format!("{program} {joined} <subcommand>")
         } else {
-            format!("{program} {} [--flag <value>] [args...]", path.join(" "))
+            format!("{program} {joined} [--flag <value>] [args...]")
         }
     }
 }
@@ -488,11 +533,12 @@ impl AgentCli {
         if argv.is_empty() {
             argv.push(self.name.clone());
         }
-        let fallback_command = argv.join(" ");
 
-        let invocation = match parse_invocation(argv) {
+        let invocation = match parse_invocation(argv.iter().map(String::as_str)) {
             Ok(value) => value,
             Err(error) => {
+                // Defer fallback_command construction to the error path
+                let fallback_command = argv.join(" ");
                 return self.error_execution(
                     fallback_command,
                     error.to_string(),
@@ -544,6 +590,7 @@ impl AgentCli {
             if resolved.remaining.is_empty() {
                 return self.command_tree_execution(&invocation, &resolved.path, command);
             }
+            let path_strs: Vec<&str> = resolved.path.iter().map(String::as_str).collect();
             return self.error_execution(
                 invocation.command_line().to_string(),
                 format!("unknown subcommand: {}", resolved.remaining[0]),
@@ -552,7 +599,7 @@ impl AgentCli {
                     "Use one of the listed subcommands under `{}`.",
                     resolved.path.join(" ")
                 ),
-                self.subcommand_actions(&resolved.path, command),
+                self.subcommand_actions(&path_strs, command),
             );
         }
 
@@ -575,15 +622,16 @@ impl AgentCli {
             positionals: resolved.remaining,
         };
 
+        let path_strs: Vec<&str> = resolved.path.iter().map(String::as_str).collect();
         match handler(&request, context) {
             Ok(output) => {
                 let mut next_actions = output.next_actions;
                 if next_actions.is_empty() {
-                    next_actions = self.default_command_actions(&resolved.path, command);
+                    next_actions = self.default_command_actions(&path_strs, command);
                 }
                 Execution {
                     envelope: SuccessEnvelope::new(
-                        invocation.command_line().to_string(),
+                        invocation.into_command_line(),
                         output.result,
                         next_actions,
                     )
@@ -593,10 +641,10 @@ impl AgentCli {
             Err(error) => {
                 let mut next_actions = error.next_actions;
                 if next_actions.is_empty() {
-                    next_actions = self.default_command_actions(&resolved.path, command);
+                    next_actions = self.default_command_actions(&path_strs, command);
                 }
                 self.error_execution(
-                    invocation.command_line().to_string(),
+                    invocation.into_command_line(),
                     error.message,
                     error.code,
                     error.fix,
@@ -656,8 +704,11 @@ impl AgentCli {
         path: &[String],
         command: &Command,
     ) -> Execution {
-        let usage = command.usage_or_default(invocation.program(), path);
-        let subcommands = self.command_docs(invocation.program(), path, &command.subcommands);
+        let path_strs: Vec<&str> = path.iter().map(String::as_str).collect();
+        let usage = command.usage_or_default(invocation.program(), &path_strs);
+        let mut buf = Vec::new();
+        self.command_docs_recursive(invocation.program(), &mut buf, &command.subcommands, 0);
+        let subcommands = buf;
         let result = json!({
             "name": command.name(),
             "description": command.description(),
@@ -669,14 +720,16 @@ impl AgentCli {
             envelope: SuccessEnvelope::new(
                 invocation.command_line().to_string(),
                 result,
-                self.subcommand_actions(path, command),
+                self.subcommand_actions(&path_strs, command),
             )
             .into(),
         }
     }
 
     fn root_result(&self, program: &str) -> Value {
-        let docs = self.command_docs(program, &[], &self.commands);
+        let mut path_buf = Vec::new();
+        let mut docs = Vec::with_capacity(self.commands.len());
+        self.command_docs_into(program, &mut path_buf, &self.commands, &mut docs, 0);
         let mut result = Map::new();
         result.insert(
             "description".to_string(),
@@ -687,7 +740,8 @@ impl AgentCli {
         }
         result.insert(
             "commands".to_string(),
-            serde_json::to_value(docs).expect("command docs serialization must succeed"),
+            serde_json::to_value(docs)
+                .unwrap_or_else(|e| Value::String(format!("serialization failed: {e}"))),
         );
 
         for (key, value) in &self.root_extra {
@@ -707,14 +761,14 @@ impl AgentCli {
 
         let mut actions = Vec::with_capacity(self.commands.len());
         for command in self.commands.values() {
-            let path = vec![command.name.clone()];
+            let path = [command.name.as_str()];
             let usage = command.usage_or_default(&self.name, &path);
             actions.push(NextAction::new(usage, command.description.clone()));
         }
         actions
     }
 
-    fn default_command_actions(&self, path: &[String], command: &Command) -> Vec<NextAction> {
+    fn default_command_actions(&self, path: &[&str], command: &Command) -> Vec<NextAction> {
         if !command.default_next_actions.is_empty() {
             return command.default_next_actions.clone();
         }
@@ -726,15 +780,15 @@ impl AgentCli {
         ]
     }
 
-    fn subcommand_actions(&self, path: &[String], command: &Command) -> Vec<NextAction> {
+    fn subcommand_actions(&self, path: &[&str], command: &Command) -> Vec<NextAction> {
         if command.subcommands.is_empty() {
             return self.default_command_actions(path, command);
         }
 
-        let mut actions = Vec::new();
+        let mut actions = Vec::with_capacity(command.subcommands.len() + 1);
         for sub in command.subcommands.values() {
-            let mut sub_path = path.to_vec();
-            sub_path.push(sub.name.clone());
+            let mut sub_path: Vec<&str> = path.to_vec();
+            sub_path.push(&sub.name);
             let usage = sub.usage_or_default(&self.name, &sub_path);
             actions.push(NextAction::new(usage, sub.description.clone()));
         }
@@ -758,23 +812,63 @@ impl AgentCli {
         }
     }
 
-    fn command_docs(
+    /// Build command docs using push/pop pattern to avoid quadratic cloning.
+    fn command_docs_into<'a>(
         &self,
         program: &str,
-        prefix: &[String],
-        commands: &BTreeMap<String, Command>,
-    ) -> Vec<CommandDoc> {
-        let mut docs = Vec::new();
+        path_buf: &mut Vec<&'a str>,
+        commands: &'a BTreeMap<String, Command>,
+        out: &mut Vec<CommandDoc>,
+        depth: usize,
+    ) {
+        if depth >= MAX_COMMAND_DEPTH {
+            return;
+        }
         for command in commands.values() {
-            let mut path = prefix.to_vec();
-            path.push(command.name.clone());
-            let usage = command.usage_or_default(program, &path);
+            path_buf.push(&command.name);
+            let usage = command.usage_or_default(program, path_buf);
+            let mut sub_docs = Vec::with_capacity(command.subcommands.len());
+            self.command_docs_into(
+                program,
+                path_buf,
+                &command.subcommands,
+                &mut sub_docs,
+                depth + 1,
+            );
+            out.push(CommandDoc {
+                name: command.name.clone(),
+                description: command.description.clone(),
+                usage,
+                subcommands: sub_docs,
+            });
+            path_buf.pop();
+        }
+    }
+
+    /// Helper for command_tree_execution that starts a fresh path buffer.
+    fn command_docs_recursive<'a>(
+        &self,
+        program: &str,
+        path_buf: &mut Vec<&'a str>,
+        commands: &'a BTreeMap<String, Command>,
+        depth: usize,
+    ) -> Vec<CommandDoc> {
+        if depth >= MAX_COMMAND_DEPTH {
+            return Vec::new();
+        }
+        let mut docs = Vec::with_capacity(commands.len());
+        for command in commands.values() {
+            path_buf.push(&command.name);
+            let usage = command.usage_or_default(program, path_buf);
+            let sub_docs =
+                self.command_docs_recursive(program, path_buf, &command.subcommands, depth + 1);
             docs.push(CommandDoc {
                 name: command.name.clone(),
                 description: command.description.clone(),
                 usage,
-                subcommands: self.command_docs(program, &path, &command.subcommands),
+                subcommands: sub_docs,
             });
+            path_buf.pop();
         }
         docs
     }
@@ -946,5 +1040,92 @@ mod tests {
         };
         assert_eq!(envelope.error.code, "INVALID_EVENT");
         assert_eq!(envelope.fix, "Pass valid event JSON and required tags.");
+    }
+
+    // --- New parser edge-case tests ---
+
+    #[test]
+    fn negative_number_treated_as_positional() {
+        let invocation =
+            parse_invocation(["app", "status", "-123"]).expect("invocation should parse");
+        assert_eq!(
+            invocation.positionals(),
+            &[String::from("status"), String::from("-123")]
+        );
+        assert!(invocation.flags().is_empty());
+    }
+
+    #[test]
+    fn negative_float_treated_as_positional() {
+        let invocation = parse_invocation(["app", "-3.14"]).expect("invocation should parse");
+        assert_eq!(invocation.positionals(), &[String::from("-3.14")]);
+    }
+
+    #[test]
+    fn long_flag_with_negative_value() {
+        let invocation =
+            parse_invocation(["app", "--count", "-1"]).expect("invocation should parse");
+        assert_eq!(invocation.flag("count"), Some("-1"));
+        assert!(invocation.positionals().is_empty());
+    }
+
+    #[test]
+    fn short_flag_with_negative_value() {
+        let invocation = parse_invocation(["app", "-n", "-5"]).expect("invocation should parse");
+        assert_eq!(invocation.flag("n"), Some("-5"));
+        assert!(invocation.positionals().is_empty());
+    }
+
+    #[test]
+    fn long_flag_equals_syntax() {
+        let invocation = parse_invocation(["app", "--count=-1"]).expect("invocation should parse");
+        assert_eq!(invocation.flag("count"), Some("-1"));
+    }
+
+    #[test]
+    fn double_dash_forces_positionals() {
+        let invocation = parse_invocation(["app", "--", "--not-a-flag", "-abc"])
+            .expect("invocation should parse");
+        assert_eq!(
+            invocation.positionals(),
+            &[String::from("--not-a-flag"), String::from("-abc")]
+        );
+        assert!(invocation.flags().is_empty());
+    }
+
+    #[test]
+    fn bundled_short_flags() {
+        let invocation = parse_invocation(["app", "-abc"]).expect("invocation should parse");
+        assert_eq!(invocation.flag("a"), Some("true"));
+        assert_eq!(invocation.flag("b"), Some("true"));
+        assert_eq!(invocation.flag("c"), Some("true"));
+    }
+
+    #[test]
+    fn prompt_returns_cow_borrowed_for_flag() {
+        let invocation =
+            parse_invocation(["app", "--prompt", "hello world"]).expect("should parse");
+        let request = CommandRequest {
+            invocation: &invocation,
+            command_path: &[],
+            positionals: &[],
+        };
+        let prompt = request.prompt().expect("should have prompt");
+        assert!(matches!(prompt, Cow::Borrowed(_)));
+        assert_eq!(&*prompt, "hello world");
+    }
+
+    #[test]
+    fn prompt_returns_cow_owned_for_positionals() {
+        let invocation = parse_invocation(["app"]).expect("should parse");
+        let positionals = vec!["foo".to_string(), "bar".to_string()];
+        let request = CommandRequest {
+            invocation: &invocation,
+            command_path: &[],
+            positionals: &positionals,
+        };
+        let prompt = request.prompt().expect("should have prompt");
+        assert!(matches!(prompt, Cow::Owned(_)));
+        assert_eq!(&*prompt, "foo bar");
     }
 }

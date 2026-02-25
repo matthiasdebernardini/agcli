@@ -48,7 +48,7 @@ fn main() {
                         .map(|idx| format!("[{source}] line-{idx}"))
                         .collect::<Vec<_>>();
                     let payload =
-                        truncate_lines_with_file(&fake_logs, lines, "ops-logs").map_err(|_| {
+                        truncate_lines_with_file(fake_logs, lines, "ops-logs").map_err(|_| {
                             CommandError::new(
                                 "failed to write full log output",
                                 "LOG_WRITE_FAILED",

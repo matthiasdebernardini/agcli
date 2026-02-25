@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 /// HATEOAS action template that tells an agent what to run next.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct NextAction {
     pub command: String,
     pub description: String,
@@ -30,7 +31,8 @@ impl NextAction {
 }
 
 /// Metadata for a templated `next_action` parameter.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct ActionParam {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -92,7 +94,8 @@ impl Default for ActionParam {
 }
 
 /// Machine-readable error payload.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct ErrorBody {
     pub message: String,
     pub code: String,
@@ -108,7 +111,8 @@ impl ErrorBody {
 }
 
 /// Success response envelope.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct SuccessEnvelope {
     pub ok: bool,
     pub command: String,
@@ -128,7 +132,8 @@ impl SuccessEnvelope {
 }
 
 /// Error response envelope.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct ErrorEnvelope {
     pub ok: bool,
     pub command: String,
@@ -156,7 +161,8 @@ impl ErrorEnvelope {
 }
 
 /// Unified envelope enum.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[serde(untagged)]
 pub enum Envelope {
     Success(SuccessEnvelope),
@@ -181,12 +187,12 @@ impl Envelope {
 
     pub fn to_json(&self) -> String {
         serde_json::to_string(self)
-            .expect("envelope serialization should never fail with valid serde_json::Value")
+            .unwrap_or_else(|e| format!(r#"{{"ok":false,"error":"serialization failed: {e}"}}"#))
     }
 
     pub fn to_json_pretty(&self) -> String {
         serde_json::to_string_pretty(self)
-            .expect("envelope serialization should never fail with valid serde_json::Value")
+            .unwrap_or_else(|e| format!(r#"{{"ok":false,"error":"serialization failed: {e}"}}"#))
     }
 }
 

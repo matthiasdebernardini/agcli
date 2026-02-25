@@ -1,12 +1,13 @@
 use std::io::{self, Write};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::envelope::{ErrorBody, ErrorEnvelope, NextAction, SuccessEnvelope};
 
 /// Step lifecycle status for stream events.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
 pub enum StepStatus {
     Started,
@@ -15,7 +16,8 @@ pub enum StepStatus {
 }
 
 /// Log level for stream events.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Info,
@@ -24,7 +26,8 @@ pub enum LogLevel {
 }
 
 /// Typed NDJSON stream event.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum StreamEvent {
     Start {
