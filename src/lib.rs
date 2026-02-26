@@ -40,5 +40,5 @@ pub use cli::{
     Invocation, ParseInvocationError, parse_invocation,
 };
 pub use envelope::{ActionParam, Envelope, ErrorBody, ErrorEnvelope, NextAction, SuccessEnvelope};
-pub use stream::{LogLevel, NdjsonEmitter, StepStatus, StreamEmitError, StreamEvent};
+pub use stream::{FlushPolicy, LogLevel, NdjsonEmitter, StepStatus, StreamEmitError, StreamEvent};
 pub use truncate::{TruncatedEntries, truncate_lines_with_file};

@@ -888,16 +888,14 @@ impl AgentCli {
             return self.default_command_actions(path, command);
         }
 
-        let mut actions: Vec<NextAction> = command
-            .subcommands
-            .values()
-            .map(|sub| {
-                let mut sub_path: Vec<&str> = path.to_vec();
-                sub_path.push(&sub.name);
-                let usage = sub.usage_or_default(&self.name, &sub_path);
-                next_action_from_usage(&usage, sub.description.clone())
-            })
-            .collect();
+        let mut path_buf: Vec<&str> = path.to_vec();
+        let mut actions = Vec::with_capacity(command.subcommands.len() + 1);
+        for sub in command.subcommands.values() {
+            path_buf.push(&sub.name);
+            let usage = sub.usage_or_default(&self.name, &path_buf);
+            actions.push(next_action_from_usage(&usage, sub.description.clone()));
+            path_buf.pop();
+        }
         actions.push(NextAction::new(
             self.name.clone(),
             "Inspect the full command tree",

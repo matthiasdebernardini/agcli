@@ -256,7 +256,7 @@ The `agcli` crate implements all 5 principles as reusable Rust primitives. It pr
 
 ```toml
 [dependencies]
-agcli = "0.4.0"
+agcli = "0.5.0"
 serde_json = "1"
 ```
 

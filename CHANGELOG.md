@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.5.0) - 2026-02-26
+
+### Features
+
+- Add `FlushPolicy` enum for configurable `NdjsonEmitter` flush behavior (Every, Terminal, Never)
+- Add criterion benchmark harness covering root invocation, command execution, parse_invocation, truncation, and NDJSON emitter
+
+### Performance
+
+- Eliminate per-subcommand `path.to_vec()` allocation in `subcommand_actions` using push/pop reuse pattern
+- Pre-allocate actions vector with `Vec::with_capacity` in `subcommand_actions`
+
 ## [0.4.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.4.0) - 2026-02-26
 
 ### Bug Fixes

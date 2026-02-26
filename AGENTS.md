@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-agcli = "0.4.0"
+agcli = "0.5.0"
 serde_json = "1"
 ```
 

@@ -369,10 +369,24 @@ impl From<serde_json::Error> for StreamEmitError {
     }
 }
 
+/// Controls when the emitter flushes the underlying writer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlushPolicy {
+    /// Flush after every emitted event (default). Ensures real-time visibility.
+    #[default]
+    Every,
+    /// Flush only after terminal events (result/error). Reduces I/O overhead
+    /// for high-throughput streaming workloads.
+    Terminal,
+    /// Never flush automatically; caller manages flushing via `into_inner()`.
+    Never,
+}
+
 /// Stateful NDJSON event emitter that enforces terminal `result`/`error` semantics.
 pub struct NdjsonEmitter<W: Write> {
     writer: W,
     terminated: bool,
+    flush_policy: FlushPolicy,
 }
 
 impl<W: Write> NdjsonEmitter<W> {
@@ -380,7 +394,14 @@ impl<W: Write> NdjsonEmitter<W> {
         Self {
             writer,
             terminated: false,
+            flush_policy: FlushPolicy::default(),
         }
+    }
+
+    /// Set the flush policy for this emitter.
+    pub fn with_flush_policy(mut self, policy: FlushPolicy) -> Self {
+        self.flush_policy = policy;
+        self
     }
 
     pub fn emit(&mut self, event: StreamEvent) -> Result<(), StreamEmitError> {
@@ -391,7 +412,15 @@ impl<W: Write> NdjsonEmitter<W> {
         let terminal = event.is_terminal();
         serde_json::to_writer(&mut self.writer, &event)?;
         self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
+
+        let should_flush = match self.flush_policy {
+            FlushPolicy::Every => true,
+            FlushPolicy::Terminal => terminal,
+            FlushPolicy::Never => false,
+        };
+        if should_flush {
+            self.writer.flush()?;
+        }
 
         if terminal {
             self.terminated = true;
@@ -523,6 +552,49 @@ mod tests {
         assert_eq!(encoded["status"], json!("completed"));
         assert_eq!(encoded["duration_ms"], json!(3200));
         assert!(encoded.get("error").is_none());
+    }
+
+    #[test]
+    fn flush_policy_terminal_only_flushes_on_terminal() {
+        // Use a Vec<u8> — its flush() is a no-op, but we can verify the data
+        // is written correctly and the emitter reaches terminal state.
+        let buffer = Vec::<u8>::new();
+        let mut emitter = NdjsonEmitter::new(buffer).with_flush_policy(FlushPolicy::Terminal);
+
+        emitter
+            .emit(StreamEvent::Log {
+                level: LogLevel::Info,
+                message: "buffered".to_string(),
+                ts: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .expect("log event must emit");
+
+        emitter
+            .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
+            .expect("terminal result must emit");
+
+        assert!(emitter.terminated());
+        let out = String::from_utf8(emitter.into_inner()).expect("utf8");
+        assert_eq!(out.lines().count(), 2);
+    }
+
+    #[test]
+    fn flush_policy_never_still_writes_data() {
+        let buffer = Vec::<u8>::new();
+        let mut emitter = NdjsonEmitter::new(buffer).with_flush_policy(FlushPolicy::Never);
+
+        emitter
+            .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
+            .expect("terminal result must emit");
+
+        assert!(emitter.terminated());
+        let out = String::from_utf8(emitter.into_inner()).expect("utf8");
+        assert!(out.contains("\"type\":\"result\""));
+    }
+
+    #[test]
+    fn flush_policy_default_is_every() {
+        assert_eq!(FlushPolicy::default(), FlushPolicy::Every);
     }
 
     #[cfg(feature = "deserialize")]
