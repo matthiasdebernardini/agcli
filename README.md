@@ -9,11 +9,18 @@ It is built around the design in [design.md](design.md):
 - context-safe output truncation
 - typed NDJSON streaming with terminal `result`/`error`
 
+## Why terminal envelopes and truncation pointers matter
+
+- Terminal `result` / `error` envelopes give agents a deterministic finish state, so they can branch on structured outcomes instead of fragile text parsing.
+- Structured `error` envelopes support reliable retries, escalation, and fallback actions, while `result` envelopes make successful completion explicit and machine-verifiable.
+- Truncation with file pointers lets CLIs cap large outputs safely while preserving continuity: agents can follow the pointer to full logs or artifacts without overflowing context windows.
+- This improves reliability and debuggability for long-running automation while reducing token pressure in agent loops.
+
 ## Install
 
 ```toml
 [dependencies]
-agcli = "0.3.0"
+agcli = "0.4.0"
 serde_json = "1"
 ```
 
@@ -25,7 +32,7 @@ use serde_json::json;
 
 fn main() {
     let cli = AgentCli::new("ops", "Agent-native operations CLI")
-        .version("0.3.0")
+        .version("0.4.0")
         .command(
             Command::new("status", "Show system health")
                 .usage("ops status")

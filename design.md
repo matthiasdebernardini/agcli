@@ -180,11 +180,13 @@ Every command uses this exact shape.
 ```typescript
 {
   ok: true,
-  command: string,          // the command that was run
-  result: object,           // command-specific payload
+  command: string,              // the command that was run
+  timestamp: number,            // Unix epoch seconds
+  schema_version?: string,      // optional version tag for envelope schema
+  result: object,               // command-specific payload
   next_actions: Array<{
-    command: string,        // command template (POSIX syntax) or literal
-    description: string,    // what it does
+    command: string,            // command template (POSIX syntax) or literal
+    description: string,        // what it does
     params?: Record<string, {
       description?: string,     // what this param means
       value?: string | number,  // pre-filled from current context
@@ -202,13 +204,16 @@ Every command uses this exact shape.
 {
   ok: false,
   command: string,
+  timestamp: number,            // Unix epoch seconds
+  schema_version?: string,      // optional version tag for envelope schema
   error: {
-    message: string,        // what went wrong
-    code: string            // machine-readable error code
+    message: string,            // what went wrong
+    code: string,               // machine-readable error code
+    retryable: boolean          // true if the agent should retry the command
   },
-  fix: string,              // plain-language suggested fix
+  fix: string,                  // plain-language suggested fix
   next_actions: Array<{
-    command: string,        // command template or literal
+    command: string,            // command template or literal
     description: string,
     params?: Record<string, { ... }>  // same schema as success
   }>
@@ -219,6 +224,7 @@ Every command uses this exact shape.
 
 - `joelclaw` - `~/Code/joelhooks/joelclaw/packages/cli/` (Effect CLI, operational surface)
 - `slog` - system log CLI (same envelope patterns)
+- `agcli` - Rust crate implementing all 5 principles as reusable primitives ([GitHub](https://github.com/matthiasdebernardini/agcli), [crates.io](https://crates.io/crates/agcli))
 
 Use these as the current envelope source-of-truth.
 
@@ -244,7 +250,49 @@ const root = Command.make("joelclaw", {}, () => {
 }).pipe(Command.withSubcommands([send, status, logs]))
 ```
 
-### Binary distribution
+### Rust Implementation (agcli)
+
+The `agcli` crate implements all 5 principles as reusable Rust primitives. It provides the envelope types, HATEOAS next_actions with automatic `params` population, NDJSON streaming with terminal event enforcement, and context-safe truncation helpers.
+
+```toml
+[dependencies]
+agcli = "0.4.0"
+serde_json = "1"
+```
+
+```rust
+use agcli::{AgentCli, Command, CommandOutput, NextAction, ActionParam};
+use serde_json::json;
+
+let cli = AgentCli::new("mycli", "My agent-native CLI")
+    .version("1.0.0")
+    .command(
+        Command::new("deploy", "Deploy to environment")
+            .usage("mycli deploy <env> [--tag=<tag>]")
+            .handler(|req, _ctx| {
+                let env = req.arg(0).unwrap_or("staging");
+                Ok(CommandOutput::new(json!({ "deployed": env }))
+                    .next_action(
+                        NextAction::new("mycli status", "Check deployment status"),
+                    ))
+            }),
+    );
+
+let run = cli.run_env();
+println!("{}", run.to_json());
+std::process::exit(run.exit_code());
+```
+
+Build with Cargo:
+
+```bash
+cargo build --release
+cp target/release/mycli ~/.local/bin/
+```
+
+Note: The Redis/infrastructure streaming sections above are joelclaw-specific. agcli provides generic `NdjsonEmitter` primitives that work with any `Write` sink.
+
+### Binary distribution (TypeScript)
 
 Build with Bun, install to `~/.bun/bin/`:
 
@@ -311,8 +359,8 @@ type StreamEvent =
   | { type: "progress"; name: string; percent?: number; message?: string; ts: string }
   | { type: "log"; level: "info" | "warn" | "error"; message: string; ts: string }
   | { type: "event"; name: string; data: unknown; ts: string }
-  | { type: "result"; ok: true; command: string; result: unknown; next_actions: NextAction[] }
-  | { type: "error"; ok: false; command: string; error: { message: string; code: string }; fix: string; next_actions: NextAction[] }
+  | { type: "result"; ok: true; command: string; timestamp: number; schema_version?: string; result: unknown; next_actions: NextAction[] }
+  | { type: "error"; ok: false; command: string; timestamp: number; schema_version?: string; error: { message: string; code: string; retryable: boolean }; fix: string; next_actions: NextAction[] }
 ```
 
 ### Emitting stream events
@@ -417,15 +465,16 @@ Streaming commands hold a Redis connection. They must:
 
 ## Checklist for New Commands
 
-- [ ] Returns JSON envelope (`ok`, `command`, `result`, `next_actions`)
+- [ ] Returns JSON envelope (`ok`, `command`, `timestamp`, `result`, `next_actions`)
 - [ ] `Command.withDescription()` set (shows in `--help`)
-- [ ] Error responses include `fix` field
+- [ ] Error responses include `fix` field and `error.retryable` boolean
+- [ ] `schema_version` set when envelope schema is versioned
 - [ ] Root command lists this command in its tree
 - [ ] Output is context-safe (truncated if potentially large)
 - [ ] `next_actions` are contextual to what just happened
-- [ ] `next_actions` with variable parts use template syntax (`<required>`, `[--flag <value>]`) + `params`
+- [ ] `next_actions` with variable parts use template syntax (`<required>`, `[--flag=<value>]`) + `params`
 - [ ] Context-specific values pre-filled via `params.*.value`
 - [ ] No plain text output anywhere
 - [ ] No ANSI colors or formatting
 - [ ] Works when piped (no TTY detection)
-- [ ] Builds and installs to `~/.bun/bin/`
+- [ ] Builds and installs

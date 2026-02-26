@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::envelope::{Envelope, ErrorEnvelope, NextAction, SuccessEnvelope};
+use crate::envelope::{ActionParam, Envelope, ErrorEnvelope, NextAction, SuccessEnvelope};
 
 /// Maximum recursion depth for command tree traversal.
 const MAX_COMMAND_DEPTH: usize = 32;
@@ -341,6 +341,56 @@ impl CommandError {
         self.next_actions.extend(actions);
         self
     }
+}
+
+/// Build a `NextAction` from a usage string and description.
+///
+/// Parses `<name>` placeholders (required positional) and `[--flag=<name>]`
+/// or `[--flag <name>]` placeholders (optional flag) from the usage string
+/// and auto-populates `params`. If no placeholders are found, the action is
+/// literal (no `params`).
+fn next_action_from_usage(usage: &str, description: impl Into<String>) -> NextAction {
+    let mut action = NextAction::new(usage, description);
+    let bytes = usage.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // Optional flag placeholder: [--flag=<name>] or [--flag <name>]
+        if bytes[i] == b'[' && i + 2 < len && bytes[i + 1] == b'-' && bytes[i + 2] == b'-' {
+            // Find the closing bracket
+            if let Some(close) = usage[i..].find(']') {
+                let bracket_content = &usage[i + 1..i + close]; // strip [ and ]
+                // Look for <name> inside
+                if let Some(angle_start) = bracket_content.find('<')
+                    && let Some(angle_end) = bracket_content[angle_start..].find('>')
+                {
+                    let param_name = &bracket_content[angle_start + 1..angle_start + angle_end];
+                    if !param_name.is_empty() {
+                        action = action.with_param(param_name, ActionParam::new().required(false));
+                    }
+                }
+                i += close + 1;
+                continue;
+            }
+        }
+
+        // Positional placeholder: <name> (not inside [...])
+        if bytes[i] == b'<'
+            && let Some(close) = usage[i..].find('>')
+        {
+            let param_name = &usage[i + 1..i + close];
+            if !param_name.is_empty() && !param_name.contains('.') {
+                action = action.with_param(param_name, ActionParam::new().required(true));
+            }
+            i += close + 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    action
 }
 
 type CommandHandler = dyn Fn(&CommandRequest<'_>, &mut ExecutionContext) -> Result<CommandOutput, CommandError>
@@ -819,7 +869,7 @@ impl AgentCli {
         for command in self.commands.values() {
             let path = [command.name.as_str()];
             let usage = command.usage_or_default(&self.name, &path);
-            actions.push(NextAction::new(usage, command.description.clone()));
+            actions.push(next_action_from_usage(&usage, command.description.clone()));
         }
         actions
     }
@@ -831,7 +881,7 @@ impl AgentCli {
 
         let usage = command.usage_or_default(&self.name, path);
         vec![
-            NextAction::new(usage, "Run this command template"),
+            next_action_from_usage(&usage, "Run this command template"),
             NextAction::new(self.name.clone(), "Inspect the full command tree"),
         ]
     }
@@ -846,7 +896,7 @@ impl AgentCli {
             let mut sub_path: Vec<&str> = path.to_vec();
             sub_path.push(&sub.name);
             let usage = sub.usage_or_default(&self.name, &sub_path);
-            actions.push(NextAction::new(usage, sub.description.clone()));
+            actions.push(next_action_from_usage(&usage, sub.description.clone()));
         }
         actions.push(NextAction::new(
             self.name.clone(),
@@ -1291,5 +1341,71 @@ mod tests {
         Command::new("parent", "Parent")
             .subcommand(Command::new("child", "first"))
             .subcommand(Command::new("child", "second"));
+    }
+
+    // --- next_action_from_usage tests ---
+
+    #[test]
+    fn next_action_from_usage_literal_no_params() {
+        let action = next_action_from_usage("wokhei status", "Check status");
+        assert!(action.params.is_none());
+        assert_eq!(action.command, "wokhei status");
+    }
+
+    #[test]
+    fn next_action_from_usage_positional_placeholder() {
+        let action = next_action_from_usage("wokhei run <run-id>", "Run a job");
+        let params = action.params.as_ref().expect("params should be present");
+        assert_eq!(params.len(), 1);
+        let p = params.get("run-id").expect("run-id param");
+        assert_eq!(p.required, Some(true));
+    }
+
+    #[test]
+    fn next_action_from_usage_optional_flag_placeholder() {
+        let action = next_action_from_usage("wokhei logs [--lines=<lines>]", "View logs");
+        let params = action.params.as_ref().expect("params should be present");
+        assert_eq!(params.len(), 1);
+        let p = params.get("lines").expect("lines param");
+        assert_eq!(p.required, Some(false));
+    }
+
+    #[test]
+    fn next_action_from_usage_mixed_placeholders() {
+        let action = next_action_from_usage(
+            "wokhei send <event> [--data=<data>] [--follow]",
+            "Send event",
+        );
+        let params = action.params.as_ref().expect("params should be present");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params.get("event").unwrap().required, Some(true));
+        assert_eq!(params.get("data").unwrap().required, Some(false));
+        // [--follow] has no <placeholder> so no param entry
+        assert!(params.get("follow").is_none());
+    }
+
+    #[test]
+    fn next_action_from_usage_default_generated_usage() {
+        // The default usage_or_default for commands with no custom usage
+        let action = next_action_from_usage("prog cmd [--flag=<value>] [args...]", "Do something");
+        let params = action.params.as_ref().expect("params should be present");
+        // <value> from [--flag=<value>] should be parsed
+        assert!(params.contains_key("value"));
+        // [args...] has no angle brackets, no param
+    }
+
+    #[test]
+    fn framework_generated_root_actions_include_params() {
+        let cli = AgentCli::new("mycli", "Test CLI").command(
+            Command::new("deploy", "Deploy service").usage("mycli deploy <env> [--tag=<tag>]"),
+        );
+        let actions = cli.root_actions();
+        assert_eq!(actions.len(), 1);
+        let params = actions[0]
+            .params
+            .as_ref()
+            .expect("params should be present");
+        assert_eq!(params.get("env").unwrap().required, Some(true));
+        assert_eq!(params.get("tag").unwrap().required, Some(false));
     }
 }
