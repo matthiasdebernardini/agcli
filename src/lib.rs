@@ -42,3 +42,6 @@ pub use cli::{
 pub use envelope::{ActionParam, Envelope, ErrorBody, ErrorEnvelope, NextAction, SuccessEnvelope};
 pub use stream::{FlushPolicy, LogLevel, NdjsonEmitter, StepStatus, StreamEmitError, StreamEvent};
 pub use truncate::{TruncatedEntries, truncate_lines_with_file};
+
+#[cfg(feature = "jemalloc")]
+pub use tikv_jemallocator::Jemalloc;

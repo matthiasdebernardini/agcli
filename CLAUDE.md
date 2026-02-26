@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-agcli = "0.4.0"
+agcli = "0.6.0"
 serde_json = "1"
 ```
 
@@ -226,3 +226,51 @@ cargo build --release
 - **Retryable errors**: Chain `.retryable(true)` on `CommandError` for transient failures
 - **Truncation**: Use `truncate_lines_with_file()` to cap large outputs and write full content to a temp file
 - **Streaming**: Use `NdjsonEmitter` for temporal operations; terminal `result`/`error` events carry `timestamp` and `schema_version`
+
+## Performance
+
+agcli targets **macOS and Linux only**. The crate ships with optimized release/bench profiles and an optional jemalloc feature. Downstream binaries get maximum runtime performance with these settings:
+
+### Recommended `Cargo.toml` for downstream binaries
+
+```toml
+[dependencies]
+agcli = { version = "0.6.0", features = ["jemalloc"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+```
+
+### jemalloc setup
+
+Enable the `jemalloc` feature and set the global allocator in your binary's `main.rs`:
+
+```rust
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: agcli::Jemalloc = agcli::Jemalloc;
+```
+
+### Build-machine-specific codegen
+
+For maximum throughput on a known deployment target:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+Do **not** bake this into the repo — it breaks cross-compilation and CI portability.
+
+### PGO (Profile-Guided Optimization)
+
+For the last few percent of throughput, use `cargo-pgo`:
+
+```bash
+cargo install cargo-pgo
+cargo pgo build
+# Run representative workload against the instrumented binary
+./target/release/myapp <typical args>
+cargo pgo optimize
+```

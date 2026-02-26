@@ -20,7 +20,7 @@ It is built around the design in [design.md](design.md):
 
 ```toml
 [dependencies]
-agcli = "0.5.0"
+agcli = "0.6.0"
 serde_json = "1"
 ```
 
@@ -47,6 +47,49 @@ fn main() {
     println!("{}", run.to_json());
     std::process::exit(run.exit_code());
 }
+```
+
+## Performance
+
+agcli targets **macOS and Linux only**. The crate ships with optimized release/bench profiles and an optional jemalloc allocator. To maximize runtime performance in a downstream binary:
+
+### Recommended `Cargo.toml`
+
+```toml
+[dependencies]
+agcli = { version = "0.6.0", features = ["jemalloc"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+```
+
+### jemalloc global allocator
+
+In your binary's `main.rs`:
+
+```rust
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: agcli::Jemalloc = agcli::Jemalloc;
+```
+
+### Build-machine-specific codegen
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+Do **not** commit this into the repo — it breaks cross-compilation portability.
+
+### PGO (Profile-Guided Optimization)
+
+```bash
+cargo install cargo-pgo
+cargo pgo build
+./target/release/myapp <typical args>   # run representative workload
+cargo pgo optimize
 ```
 
 ## Wokhei-style example
