@@ -67,12 +67,10 @@ pub fn truncate_lines_with_file(
 }
 
 fn sanitize_prefix(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            out.push(ch);
-        }
-    }
+    let out: String = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect();
     if out.is_empty() {
         "agcli-output".to_string()
     } else {
@@ -110,11 +108,12 @@ fn write_full_output(lines: &[String], prefix: &str) -> io::Result<PathBuf> {
         match opts.open(&path) {
             Ok(file) => {
                 let mut writer = BufWriter::new(file);
-                for (i, line) in lines.iter().enumerate() {
-                    writer.write_all(line.as_bytes())?;
-                    if i + 1 < lines.len() {
+                if let Some((last, rest)) = lines.split_last() {
+                    for line in rest {
+                        writer.write_all(line.as_bytes())?;
                         writer.write_all(b"\n")?;
                     }
+                    writer.write_all(last.as_bytes())?;
                 }
                 writer.flush()?;
                 return Ok(path);

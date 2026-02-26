@@ -94,13 +94,7 @@ impl Serialize for StreamEvent {
                 error,
                 ts,
             } => {
-                let mut count = 4;
-                if duration_ms.is_some() {
-                    count += 1;
-                }
-                if error.is_some() {
-                    count += 1;
-                }
+                let count = 4 + usize::from(duration_ms.is_some()) + usize::from(error.is_some());
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("type", "step")?;
                 map.serialize_entry("name", name)?;
@@ -120,13 +114,7 @@ impl Serialize for StreamEvent {
                 message,
                 ts,
             } => {
-                let mut count = 3;
-                if percent.is_some() {
-                    count += 1;
-                }
-                if message.is_some() {
-                    count += 1;
-                }
+                let count = 3 + usize::from(percent.is_some()) + usize::from(message.is_some());
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("type", "progress")?;
                 map.serialize_entry("name", name)?;
@@ -162,10 +150,7 @@ impl Serialize for StreamEvent {
                 result,
                 next_actions,
             } => {
-                let mut count = 6;
-                if schema_version.is_some() {
-                    count += 1;
-                }
+                let count = 6 + usize::from(schema_version.is_some());
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("type", "result")?;
                 map.serialize_entry("ok", &true)?;
@@ -186,10 +171,7 @@ impl Serialize for StreamEvent {
                 fix,
                 next_actions,
             } => {
-                let mut count = 7;
-                if schema_version.is_some() {
-                    count += 1;
-                }
+                let count = 7 + usize::from(schema_version.is_some());
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("type", "error")?;
                 map.serialize_entry("ok", &false)?;
@@ -208,6 +190,38 @@ impl Serialize for StreamEvent {
 }
 
 #[cfg(feature = "deserialize")]
+fn str_field(v: &Value, key: &str) -> String {
+    v.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[cfg(feature = "deserialize")]
+fn opt_str_field(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+#[cfg(feature = "deserialize")]
+fn u64_field(v: &Value, key: &str, default: u64) -> u64 {
+    v.get(key).and_then(Value::as_u64).unwrap_or(default)
+}
+
+#[cfg(feature = "deserialize")]
+fn value_field(v: &Value, key: &str) -> Value {
+    v.get(key).cloned().unwrap_or(Value::Null)
+}
+
+#[cfg(feature = "deserialize")]
+fn parse_field<T, E>(v: &Value, key: &str, default: Value) -> Result<T, E>
+where
+    T: serde::de::DeserializeOwned,
+    E: serde::de::Error,
+{
+    serde_json::from_value(v.get(key).cloned().unwrap_or(default)).map_err(E::custom)
+}
+
+#[cfg(feature = "deserialize")]
 impl<'de> serde::Deserialize<'de> for StreamEvent {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -221,79 +235,34 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
 
         match type_str {
             "start" => Ok(Self::Start {
-                command: value
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                ts: value
-                    .get("ts")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                command: str_field(&value, "command"),
+                ts: str_field(&value, "ts"),
             }),
             "step" => Ok(Self::Step {
-                name: value
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                status: serde_json::from_value(value.get("status").cloned().unwrap_or(Value::Null))
-                    .map_err(serde::de::Error::custom)?,
+                name: str_field(&value, "name"),
+                status: parse_field(&value, "status", Value::Null)?,
                 duration_ms: value.get("duration_ms").and_then(Value::as_u64),
-                error: value.get("error").and_then(Value::as_str).map(String::from),
-                ts: value
-                    .get("ts")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                error: opt_str_field(&value, "error"),
+                ts: str_field(&value, "ts"),
             }),
             "progress" => Ok(Self::Progress {
-                name: value
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                name: str_field(&value, "name"),
                 percent: value
                     .get("percent")
                     .and_then(Value::as_u64)
                     .and_then(|v| u8::try_from(v).ok()),
-                message: value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(String::from),
-                ts: value
-                    .get("ts")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                message: opt_str_field(&value, "message"),
+                ts: str_field(&value, "ts"),
             }),
             "log" => Ok(Self::Log {
-                level: serde_json::from_value(value.get("level").cloned().unwrap_or(Value::Null))
-                    .map_err(serde::de::Error::custom)?,
-                message: value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                ts: value
-                    .get("ts")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                level: parse_field(&value, "level", Value::Null)?,
+                message: str_field(&value, "message"),
+                ts: str_field(&value, "ts"),
             }),
             "event" => Ok(Self::Event {
-                name: value
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                data: value.get("data").cloned().unwrap_or(Value::Null),
-                ts: value
-                    .get("ts")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                name: str_field(&value, "name"),
+                data: value_field(&value, "data"),
+                ts: str_field(&value, "ts"),
             }),
             "result" => {
                 let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(true);
@@ -303,24 +272,11 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                     ));
                 }
                 Ok(Self::Result {
-                    command: value
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    timestamp: value.get("timestamp").and_then(Value::as_u64).unwrap_or(0),
-                    schema_version: value
-                        .get("schema_version")
-                        .and_then(Value::as_str)
-                        .map(String::from),
-                    result: value.get("result").cloned().unwrap_or(Value::Null),
-                    next_actions: serde_json::from_value(
-                        value
-                            .get("next_actions")
-                            .cloned()
-                            .unwrap_or(Value::Array(vec![])),
-                    )
-                    .map_err(serde::de::Error::custom)?,
+                    command: str_field(&value, "command"),
+                    timestamp: u64_field(&value, "timestamp", 0),
+                    schema_version: opt_str_field(&value, "schema_version"),
+                    result: value_field(&value, "result"),
+                    next_actions: parse_field(&value, "next_actions", Value::Array(vec![]))?,
                 })
             }
             "error" => {
@@ -331,32 +287,12 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                     ));
                 }
                 Ok(Self::Error {
-                    command: value
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    timestamp: value.get("timestamp").and_then(Value::as_u64).unwrap_or(0),
-                    schema_version: value
-                        .get("schema_version")
-                        .and_then(Value::as_str)
-                        .map(String::from),
-                    error: serde_json::from_value(
-                        value.get("error").cloned().unwrap_or(Value::Null),
-                    )
-                    .map_err(serde::de::Error::custom)?,
-                    fix: value
-                        .get("fix")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    next_actions: serde_json::from_value(
-                        value
-                            .get("next_actions")
-                            .cloned()
-                            .unwrap_or(Value::Array(vec![])),
-                    )
-                    .map_err(serde::de::Error::custom)?,
+                    command: str_field(&value, "command"),
+                    timestamp: u64_field(&value, "timestamp", 0),
+                    schema_version: opt_str_field(&value, "schema_version"),
+                    error: parse_field(&value, "error", Value::Null)?,
+                    fix: str_field(&value, "fix"),
+                    next_actions: parse_field(&value, "next_actions", Value::Array(vec![]))?,
                 })
             }
             other => Err(serde::de::Error::custom(format!(

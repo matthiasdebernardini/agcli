@@ -106,26 +106,22 @@ where
     let mut help_requested = false;
     let mut positional_only = false;
 
-    let mut i = 0;
-    while i < tokens.len() {
-        let token = &tokens[i];
-
+    for token in &tokens {
         if positional_only {
             positionals.push(token.clone());
-            i += 1;
             continue;
         }
 
-        if token == "--" {
-            positional_only = true;
-            i += 1;
-            continue;
-        }
-
-        if token == "--help" || token == "-h" {
-            help_requested = true;
-            i += 1;
-            continue;
+        match token.as_str() {
+            "--" => {
+                positional_only = true;
+                continue;
+            }
+            "--help" | "-h" => {
+                help_requested = true;
+                continue;
+            }
+            _ => {}
         }
 
         // Long flags: --key=value or bare --key (bool)
@@ -139,20 +135,17 @@ where
                     return Err(ParseInvocationError::InvalidFlag(token.clone()));
                 }
                 flags.insert(key.to_string(), value.to_string());
-                i += 1;
                 continue;
             }
 
             // Bare --flag is always boolean
             flags.insert(flag.to_string(), "true".to_string());
-            i += 1;
             continue;
         }
 
         // Negative numbers as positionals: -123, -3.14
         if looks_like_negative_number(token) {
             positionals.push(token.clone());
-            i += 1;
             continue;
         }
 
@@ -165,14 +158,12 @@ where
                 && key.chars().count() == 1
             {
                 flags.insert(key.to_string(), value.to_string());
-                i += 1;
                 continue;
             }
 
             if short.chars().count() == 1 {
                 // Single short flag: -x (always bool)
                 flags.insert(short.to_string(), "true".to_string());
-                i += 1;
                 continue;
             }
 
@@ -180,12 +171,10 @@ where
             for ch in short.chars() {
                 flags.insert(ch.to_string(), "true".to_string());
             }
-            i += 1;
             continue;
         }
 
         positionals.push(token.clone());
-        i += 1;
     }
 
     Ok(Invocation {
@@ -657,7 +646,7 @@ impl AgentCli {
             if resolved.remaining.is_empty() {
                 return self.command_tree_execution(&invocation, &resolved.path, command);
             }
-            let path_strs: Vec<&str> = resolved.path.iter().map(String::as_str).collect();
+            let path_strs = path_refs(&resolved.path);
             return self.error_execution(
                 invocation.command_line().to_string(),
                 format!("unknown subcommand: {}", resolved.remaining[0]),
@@ -691,13 +680,11 @@ impl AgentCli {
             positionals: resolved.remaining,
         };
 
-        let path_strs: Vec<&str> = resolved.path.iter().map(String::as_str).collect();
+        let path_strs = path_refs(&resolved.path);
         match handler(&request, context) {
             Ok(output) => {
-                let mut next_actions = output.next_actions;
-                if next_actions.is_empty() {
-                    next_actions = self.default_command_actions(&path_strs, command);
-                }
+                let next_actions =
+                    self.ensure_next_actions(output.next_actions, &path_strs, command);
                 Execution {
                     envelope: self
                         .success_envelope(
@@ -709,10 +696,8 @@ impl AgentCli {
                 }
             }
             Err(error) => {
-                let mut next_actions = error.next_actions;
-                if next_actions.is_empty() {
-                    next_actions = self.default_command_actions(&path_strs, command);
-                }
+                let next_actions =
+                    self.ensure_next_actions(error.next_actions, &path_strs, command);
                 self.error_execution(
                     invocation.into_command_line(),
                     error.message,
@@ -784,7 +769,7 @@ impl AgentCli {
 
         // Reject trailing unknown tokens when the command has subcommands
         if !resolved.remaining.is_empty() && !command.subcommands.is_empty() {
-            let path_strs: Vec<&str> = resolved.path.iter().map(String::as_str).collect();
+            let path_strs = path_refs(&resolved.path);
             return self.error_execution(
                 invocation.command_line().to_string(),
                 format!("unknown subcommand: {}", resolved.remaining[0]),
@@ -837,9 +822,7 @@ impl AgentCli {
         let mut result = Map::new();
 
         // Insert user-provided extras first so core keys always win
-        for (key, value) in &self.root_extra {
-            result.insert(key.clone(), value.clone());
-        }
+        result.extend(self.root_extra.clone());
 
         result.insert(
             "description".to_string(),
@@ -865,13 +848,14 @@ impl AgentCli {
             )];
         }
 
-        let mut actions = Vec::with_capacity(self.commands.len());
-        for command in self.commands.values() {
-            let path = [command.name.as_str()];
-            let usage = command.usage_or_default(&self.name, &path);
-            actions.push(next_action_from_usage(&usage, command.description.clone()));
-        }
-        actions
+        self.commands
+            .values()
+            .map(|command| {
+                let path = [command.name.as_str()];
+                let usage = command.usage_or_default(&self.name, &path);
+                next_action_from_usage(&usage, command.description.clone())
+            })
+            .collect()
     }
 
     fn default_command_actions(&self, path: &[&str], command: &Command) -> Vec<NextAction> {
@@ -886,18 +870,34 @@ impl AgentCli {
         ]
     }
 
+    fn ensure_next_actions(
+        &self,
+        actions: Vec<NextAction>,
+        path: &[&str],
+        command: &Command,
+    ) -> Vec<NextAction> {
+        if actions.is_empty() {
+            self.default_command_actions(path, command)
+        } else {
+            actions
+        }
+    }
+
     fn subcommand_actions(&self, path: &[&str], command: &Command) -> Vec<NextAction> {
         if command.subcommands.is_empty() {
             return self.default_command_actions(path, command);
         }
 
-        let mut actions = Vec::with_capacity(command.subcommands.len() + 1);
-        for sub in command.subcommands.values() {
-            let mut sub_path: Vec<&str> = path.to_vec();
-            sub_path.push(&sub.name);
-            let usage = sub.usage_or_default(&self.name, &sub_path);
-            actions.push(next_action_from_usage(&usage, sub.description.clone()));
-        }
+        let mut actions: Vec<NextAction> = command
+            .subcommands
+            .values()
+            .map(|sub| {
+                let mut sub_path: Vec<&str> = path.to_vec();
+                sub_path.push(&sub.name);
+                let usage = sub.usage_or_default(&self.name, &sub_path);
+                next_action_from_usage(&usage, sub.description.clone())
+            })
+            .collect();
         actions.push(NextAction::new(
             self.name.clone(),
             "Inspect the full command tree",
@@ -969,35 +969,24 @@ impl AgentCli {
             return Vec::new();
         }
         let mut docs = Vec::with_capacity(commands.len());
-        for command in commands.values() {
-            path_buf.push(&command.name);
-            let usage = command.usage_or_default(program, path_buf);
-            let sub_docs =
-                self.command_docs_recursive(program, path_buf, &command.subcommands, depth + 1);
-            docs.push(CommandDoc {
-                name: command.name.clone(),
-                description: command.description.clone(),
-                usage,
-                subcommands: sub_docs,
-            });
-            path_buf.pop();
-        }
+        self.command_docs_into(program, path_buf, commands, &mut docs, depth);
         docs
     }
 
     fn resolve_command<'a>(&'a self, positionals: &'a [String]) -> ResolvedCommand<'a> {
         let mut commands = &self.commands;
-        let mut consumed = 0;
         let mut path = Vec::new();
         let mut current: Option<&Command> = None;
 
-        while consumed < positionals.len() {
-            let token = &positionals[consumed];
+        for (idx, token) in positionals.iter().enumerate() {
             let Some(found) = commands.get(token) else {
-                break;
+                return ResolvedCommand {
+                    command: current,
+                    path,
+                    remaining: &positionals[idx..],
+                };
             };
             path.push(token.clone());
-            consumed += 1;
             current = Some(found);
             commands = &found.subcommands;
         }
@@ -1005,9 +994,13 @@ impl AgentCli {
         ResolvedCommand {
             command: current,
             path,
-            remaining: &positionals[consumed..],
+            remaining: &positionals[positionals.len()..],
         }
     }
+}
+
+fn path_refs(path: &[String]) -> Vec<&str> {
+    path.iter().map(String::as_str).collect()
 }
 
 struct ResolvedCommand<'a> {
