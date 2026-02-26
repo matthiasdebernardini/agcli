@@ -300,6 +300,7 @@ pub struct CommandError {
     pub message: String,
     pub code: String,
     pub fix: String,
+    pub retryable: bool,
     pub next_actions: Vec<NextAction>,
 }
 
@@ -321,8 +322,14 @@ impl CommandError {
             message: message.into(),
             code: code.into(),
             fix: fix.into(),
+            retryable: false,
             next_actions: Vec::new(),
         }
+    }
+
+    pub fn retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
+        self
     }
 
     pub fn next_action(mut self, action: NextAction) -> Self {
@@ -460,6 +467,7 @@ pub struct AgentCli {
     name: String,
     description: String,
     version: Option<String>,
+    schema_version: Option<String>,
     commands: BTreeMap<String, Command>,
     root_extra: Map<String, Value>,
 }
@@ -481,6 +489,7 @@ impl AgentCli {
             name: name.into(),
             description: description.into(),
             version: None,
+            schema_version: None,
             commands: BTreeMap::new(),
             root_extra: Map::new(),
         }
@@ -488,6 +497,11 @@ impl AgentCli {
 
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
+        self
+    }
+
+    pub fn schema_version(mut self, version: impl Into<String>) -> Self {
+        self.schema_version = Some(version.into());
         self
     }
 
@@ -544,6 +558,7 @@ impl AgentCli {
                     error.to_string(),
                     "PARSE_ERROR",
                     "Use valid CLI syntax. Run the root command to inspect command templates.",
+                    false,
                     self.root_actions(),
                 );
             }
@@ -569,6 +584,7 @@ impl AgentCli {
                 format!("unknown command: {unknown}"),
                 "UNKNOWN_COMMAND",
                 "Run the root command and use one of the listed command templates.",
+                false,
                 self.root_actions(),
             );
         }
@@ -581,6 +597,7 @@ impl AgentCli {
                     "unknown command".to_string(),
                     "UNKNOWN_COMMAND",
                     "Run the root command and use one of the listed command templates.",
+                    false,
                     self.root_actions(),
                 );
             }
@@ -599,6 +616,7 @@ impl AgentCli {
                     "Use one of the listed subcommands under `{}`.",
                     resolved.path.join(" ")
                 ),
+                false,
                 self.subcommand_actions(&path_strs, command),
             );
         }
@@ -611,6 +629,7 @@ impl AgentCli {
                     "command has no handler".to_string(),
                     "MISSING_HANDLER",
                     "Attach a handler for this command or route to a subcommand.",
+                    false,
                     self.root_actions(),
                 );
             }
@@ -630,12 +649,13 @@ impl AgentCli {
                     next_actions = self.default_command_actions(&path_strs, command);
                 }
                 Execution {
-                    envelope: SuccessEnvelope::new(
-                        invocation.into_command_line(),
-                        output.result,
-                        next_actions,
-                    )
-                    .into(),
+                    envelope: self
+                        .success_envelope(
+                            invocation.into_command_line(),
+                            output.result,
+                            next_actions,
+                        )
+                        .into(),
                 }
             }
             Err(error) => {
@@ -648,21 +668,36 @@ impl AgentCli {
                     error.message,
                     error.code,
                     error.fix,
+                    error.retryable,
                     next_actions,
                 )
             }
         }
     }
 
+    fn success_envelope(
+        &self,
+        command: impl Into<String>,
+        result: Value,
+        next_actions: Vec<NextAction>,
+    ) -> SuccessEnvelope {
+        let mut envelope = SuccessEnvelope::new(command, result, next_actions);
+        if let Some(ref sv) = self.schema_version {
+            envelope = envelope.schema_version(sv.clone());
+        }
+        envelope
+    }
+
     fn root_execution(&self, invocation: &Invocation) -> Execution {
         let result = self.root_result(invocation.program());
         Execution {
-            envelope: SuccessEnvelope::new(
-                invocation.command_line().to_string(),
-                result,
-                self.root_actions(),
-            )
-            .into(),
+            envelope: self
+                .success_envelope(
+                    invocation.command_line().to_string(),
+                    result,
+                    self.root_actions(),
+                )
+                .into(),
         }
     }
 
@@ -678,6 +713,7 @@ impl AgentCli {
                 format!("unknown command: {}", invocation.positionals()[0]),
                 "UNKNOWN_COMMAND",
                 "Run the root command and inspect the listed templates.",
+                false,
                 self.root_actions(),
             );
         }
@@ -690,6 +726,7 @@ impl AgentCli {
                     "unknown command".to_string(),
                     "UNKNOWN_COMMAND",
                     "Run the root command and inspect the listed templates.",
+                    false,
                     self.root_actions(),
                 );
             }
@@ -706,6 +743,7 @@ impl AgentCli {
                     "Use one of the listed subcommands under `{}`.",
                     resolved.path.join(" ")
                 ),
+                false,
                 self.subcommand_actions(&path_strs, command),
             );
         }
@@ -732,12 +770,13 @@ impl AgentCli {
         });
 
         Execution {
-            envelope: SuccessEnvelope::new(
-                invocation.command_line().to_string(),
-                result,
-                self.subcommand_actions(&path_strs, command),
-            )
-            .into(),
+            envelope: self
+                .success_envelope(
+                    invocation.command_line().to_string(),
+                    result,
+                    self.subcommand_actions(&path_strs, command),
+                )
+                .into(),
         }
     }
 
@@ -822,10 +861,16 @@ impl AgentCli {
         message: impl Into<String>,
         code: impl Into<String>,
         fix: impl Into<String>,
+        retryable: bool,
         next_actions: Vec<NextAction>,
     ) -> Execution {
+        let mut envelope =
+            ErrorEnvelope::new(command, message, code, fix, next_actions).retryable(retryable);
+        if let Some(ref sv) = self.schema_version {
+            envelope = envelope.schema_version(sv.clone());
+        }
         Execution {
-            envelope: ErrorEnvelope::new(command, message, code, fix, next_actions).into(),
+            envelope: envelope.into(),
         }
     }
 

@@ -1,7 +1,15 @@
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Serialize, Serializer};
 use serde_json::Value;
+
+fn epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// HATEOAS action template that tells an agent what to run next.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -99,6 +107,7 @@ impl Default for ActionParam {
 pub struct ErrorBody {
     pub message: String,
     pub code: String,
+    pub retryable: bool,
 }
 
 impl ErrorBody {
@@ -106,7 +115,13 @@ impl ErrorBody {
         Self {
             message: message.into(),
             code: code.into(),
+            retryable: false,
         }
+    }
+
+    pub fn retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
+        self
     }
 }
 
@@ -117,6 +132,8 @@ impl ErrorBody {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SuccessEnvelope {
     pub command: String,
+    pub timestamp: u64,
+    pub schema_version: Option<String>,
     pub result: Value,
     pub next_actions: Vec<NextAction>,
 }
@@ -125,18 +142,30 @@ impl SuccessEnvelope {
     pub fn new(command: impl Into<String>, result: Value, next_actions: Vec<NextAction>) -> Self {
         Self {
             command: command.into(),
+            timestamp: epoch_secs(),
+            schema_version: None,
             result,
             next_actions,
         }
+    }
+
+    pub fn schema_version(mut self, version: impl Into<String>) -> Self {
+        self.schema_version = Some(version.into());
+        self
     }
 }
 
 impl Serialize for SuccessEnvelope {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("SuccessEnvelope", 4)?;
+        let field_count = 5 + usize::from(self.schema_version.is_some());
+        let mut s = serializer.serialize_struct("SuccessEnvelope", field_count)?;
         s.serialize_field("ok", &true)?;
         s.serialize_field("command", &self.command)?;
+        s.serialize_field("timestamp", &self.timestamp)?;
+        if let Some(ref sv) = self.schema_version {
+            s.serialize_field("schema_version", sv)?;
+        }
         s.serialize_field("result", &self.result)?;
         s.serialize_field("next_actions", &self.next_actions)?;
         s.end()
@@ -153,6 +182,10 @@ impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
         struct Raw {
             ok: bool,
             command: String,
+            #[serde(default)]
+            timestamp: u64,
+            #[serde(default)]
+            schema_version: Option<String>,
             result: Value,
             next_actions: Vec<NextAction>,
         }
@@ -164,6 +197,8 @@ impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
         }
         Ok(SuccessEnvelope {
             command: raw.command,
+            timestamp: raw.timestamp,
+            schema_version: raw.schema_version,
             result: raw.result,
             next_actions: raw.next_actions,
         })
@@ -177,6 +212,8 @@ impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ErrorEnvelope {
     pub command: String,
+    pub timestamp: u64,
+    pub schema_version: Option<String>,
     pub error: ErrorBody,
     pub fix: String,
     pub next_actions: Vec<NextAction>,
@@ -192,19 +229,36 @@ impl ErrorEnvelope {
     ) -> Self {
         Self {
             command: command.into(),
+            timestamp: epoch_secs(),
+            schema_version: None,
             error: ErrorBody::new(message, code),
             fix: fix.into(),
             next_actions,
         }
+    }
+
+    pub fn retryable(mut self, retryable: bool) -> Self {
+        self.error.retryable = retryable;
+        self
+    }
+
+    pub fn schema_version(mut self, version: impl Into<String>) -> Self {
+        self.schema_version = Some(version.into());
+        self
     }
 }
 
 impl Serialize for ErrorEnvelope {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("ErrorEnvelope", 5)?;
+        let field_count = 6 + usize::from(self.schema_version.is_some());
+        let mut s = serializer.serialize_struct("ErrorEnvelope", field_count)?;
         s.serialize_field("ok", &false)?;
         s.serialize_field("command", &self.command)?;
+        s.serialize_field("timestamp", &self.timestamp)?;
+        if let Some(ref sv) = self.schema_version {
+            s.serialize_field("schema_version", sv)?;
+        }
         s.serialize_field("error", &self.error)?;
         s.serialize_field("fix", &self.fix)?;
         s.serialize_field("next_actions", &self.next_actions)?;
@@ -222,6 +276,10 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
         struct Raw {
             ok: bool,
             command: String,
+            #[serde(default)]
+            timestamp: u64,
+            #[serde(default)]
+            schema_version: Option<String>,
             error: ErrorBody,
             fix: String,
             next_actions: Vec<NextAction>,
@@ -234,6 +292,8 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
         }
         Ok(ErrorEnvelope {
             command: raw.command,
+            timestamp: raw.timestamp,
+            schema_version: raw.schema_version,
             error: raw.error,
             fix: raw.fix,
             next_actions: raw.next_actions,
@@ -334,13 +394,23 @@ mod tests {
             vec![NextAction::new("wokhei status", "Re-check health")],
         );
 
-        let encoded = serde_json::to_value(envelope).expect("must serialize");
+        let encoded = serde_json::to_value(&envelope).expect("must serialize");
         assert_eq!(encoded["ok"], Value::Bool(true));
         assert_eq!(
             encoded["command"],
             Value::String("wokhei status".to_string())
         );
+        assert!(encoded["timestamp"].is_u64());
         assert!(encoded["next_actions"].is_array());
+        // schema_version omitted when None
+        assert!(encoded.get("schema_version").is_none());
+    }
+
+    #[test]
+    fn success_envelope_with_schema_version() {
+        let envelope = SuccessEnvelope::new("cmd", json!(null), vec![]).schema_version("test.v1");
+        let encoded = serde_json::to_value(&envelope).expect("must serialize");
+        assert_eq!(encoded["schema_version"], json!("test.v1"));
     }
 
     #[test]
@@ -353,16 +423,30 @@ mod tests {
             vec![],
         );
 
-        let encoded = serde_json::to_value(envelope).expect("must serialize");
+        let encoded = serde_json::to_value(&envelope).expect("must serialize");
         assert_eq!(encoded["ok"], Value::Bool(false));
         assert_eq!(
             encoded["error"]["code"],
             Value::String("INVALID_JSON".to_string())
         );
+        assert_eq!(encoded["error"]["retryable"], Value::Bool(false));
+        assert!(encoded["timestamp"].is_u64());
         assert_eq!(
             encoded["fix"],
             Value::String("Use valid JSON input".to_string())
         );
+        // schema_version omitted when None
+        assert!(encoded.get("schema_version").is_none());
+    }
+
+    #[test]
+    fn error_envelope_retryable() {
+        let envelope = ErrorEnvelope::new("cmd", "err", "E", "fix", vec![])
+            .retryable(true)
+            .schema_version("test.v1");
+        let encoded = serde_json::to_value(&envelope).expect("must serialize");
+        assert_eq!(encoded["error"]["retryable"], Value::Bool(true));
+        assert_eq!(encoded["schema_version"], json!("test.v1"));
     }
 
     #[cfg(feature = "deserialize")]
@@ -372,7 +456,8 @@ mod tests {
             "test cmd",
             json!({ "data": 42 }),
             vec![NextAction::new("test cmd", "Run again")],
-        );
+        )
+        .schema_version("test.v1");
         let json = serde_json::to_string(&original).expect("must serialize");
         let decoded: SuccessEnvelope = serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(original, decoded);
@@ -381,7 +466,9 @@ mod tests {
     #[cfg(feature = "deserialize")]
     #[test]
     fn error_envelope_roundtrips() {
-        let original = ErrorEnvelope::new("test cmd", "oops", "ERR", "fix it", vec![]);
+        let original = ErrorEnvelope::new("test cmd", "oops", "ERR", "fix it", vec![])
+            .retryable(true)
+            .schema_version("test.v1");
         let json = serde_json::to_string(&original).expect("must serialize");
         let decoded: ErrorEnvelope = serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(original, decoded);
@@ -390,7 +477,7 @@ mod tests {
     #[cfg(feature = "deserialize")]
     #[test]
     fn success_envelope_rejects_ok_false() {
-        let json = r#"{"ok":false,"command":"test","result":null,"next_actions":[]}"#;
+        let json = r#"{"ok":false,"command":"test","timestamp":0,"result":null,"next_actions":[]}"#;
         let result: Result<SuccessEnvelope, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
@@ -398,7 +485,7 @@ mod tests {
     #[cfg(feature = "deserialize")]
     #[test]
     fn error_envelope_rejects_ok_true() {
-        let json = r#"{"ok":true,"command":"test","error":{"message":"x","code":"X"},"fix":"y","next_actions":[]}"#;
+        let json = r#"{"ok":true,"command":"test","timestamp":0,"error":{"message":"x","code":"X","retryable":false},"fix":"y","next_actions":[]}"#;
         let result: Result<ErrorEnvelope, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
