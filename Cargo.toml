@@ -1,6 +1,6 @@
 [package]
 name = "agcli"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "A tiny, no-bloat foundation crate for building agentic CLIs in Rust."
 license = "MIT"
@@ -23,6 +23,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
 name = "core"

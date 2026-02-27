@@ -4,14 +4,15 @@ use agcli::{
 };
 use serde_json::json;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = AgentCli::new("ops", "Agent-native operations CLI")
         .version(env!("CARGO_PKG_VERSION"))
         .root_field("health", json!({ "server": "ok", "worker": "ok" }))
         .command(
             Command::new("status", "Show system health")
                 .usage("ops status")
-                .handler(|_req, _ctx| {
+                .sync_handler(|_req, _ctx| {
                     Ok(CommandOutput::new(json!({
                         "healthy": true,
                         "queue_depth": 0
@@ -37,7 +38,7 @@ fn main() {
         .command(
             Command::new("logs", "View logs with context-safe truncation")
                 .usage("ops logs <source> [--lines=<lines>] [--follow]")
-                .handler(|req, _ctx| {
+                .sync_handler(|req, _ctx| {
                     let source = req.arg(0).unwrap_or("worker");
                     let lines = req
                         .flag("lines")
@@ -65,7 +66,7 @@ fn main() {
                 }),
         );
 
-    let run = cli.run_env();
+    let run = cli.run_env().await;
     println!("{}", run.to_json());
     std::process::exit(run.exit_code());
 }

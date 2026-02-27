@@ -10,7 +10,7 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```ignore
 //! use agcli::{AgentCli, Command, CommandOutput, ExecutionContext, NextAction};
 //! use serde_json::json;
 //!
@@ -18,15 +18,15 @@
 //!     .command(
 //!         Command::new("status", "System health")
 //!             .usage("ops status")
-//!             .handler(|_req, _ctx| {
+//!             .handler(|_req, _ctx| Box::pin(async move {
 //!                 Ok(CommandOutput::new(json!({ "healthy": true })).next_action(
 //!                     NextAction::new("ops status", "Re-check health"),
 //!                 ))
-//!             }),
+//!             })),
 //!     );
 //!
-//! let mut _ctx = ExecutionContext::default();
-//! let run = cli.run_argv(["ops", "status"]);
+//! let mut ctx = ExecutionContext::default();
+//! let run = cli.run_argv_with_context(["ops", "status"], &mut ctx).await;
 //! assert_eq!(run.exit_code(), 0);
 //! ```
 

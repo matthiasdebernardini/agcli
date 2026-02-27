@@ -18,7 +18,7 @@ fn build_flat_cli(n: usize) -> AgentCli {
         cli = cli.command(
             Command::new(name.clone(), desc)
                 .usage(format!("bench {name} <arg>"))
-                .handler(|req, _ctx| {
+                .sync_handler(|req, _ctx| {
                     let val = req.arg(0).unwrap_or("x");
                     Ok(CommandOutput::new(json!({ "echo": val }))
                         .next_action(NextAction::new("bench", "Inspect root")))
@@ -60,13 +60,16 @@ fn build_nested_cli(breadth: usize, depth: usize) -> AgentCli {
 // ---------------------------------------------------------------------------
 
 fn bench_root_invocation(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("root_invocation");
     for n in [5, 20, 50] {
         let cli = build_flat_cli(n);
         group.bench_with_input(BenchmarkId::new("flat", n), &cli, |b, cli| {
             b.iter(|| {
-                let run = cli.run_argv(["bench"]);
-                assert_eq!(run.exit_code(), 0);
+                rt.block_on(async {
+                    let run = cli.run_argv(["bench"]).await;
+                    assert_eq!(run.exit_code(), 0);
+                });
             });
         });
     }
@@ -75,8 +78,10 @@ fn bench_root_invocation(c: &mut Criterion) {
         let label = format!("nested_{breadth}x{depth}");
         group.bench_with_input(BenchmarkId::new(&label, breadth * depth), &cli, |b, cli| {
             b.iter(|| {
-                let run = cli.run_argv(["bench"]);
-                assert_eq!(run.exit_code(), 0);
+                rt.block_on(async {
+                    let run = cli.run_argv(["bench"]).await;
+                    assert_eq!(run.exit_code(), 0);
+                });
             });
         });
     }
@@ -88,6 +93,7 @@ fn bench_root_invocation(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_command_execution(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("command_execution");
     for n in [5, 20, 50] {
         let cli = build_flat_cli(n);
@@ -97,8 +103,10 @@ fn bench_command_execution(c: &mut Criterion) {
             &(cli, target),
             |b, (cli, t)| {
                 b.iter(|| {
-                    let run = cli.run_argv(["bench", t, "hello"]);
-                    assert_eq!(run.exit_code(), 0);
+                    rt.block_on(async {
+                        let run = cli.run_argv(["bench", t, "hello"]).await;
+                        assert_eq!(run.exit_code(), 0);
+                    });
                 });
             },
         );

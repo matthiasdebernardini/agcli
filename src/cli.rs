@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -382,7 +384,11 @@ fn next_action_from_usage(usage: &str, description: impl Into<String>) -> NextAc
     action
 }
 
-type CommandHandler = dyn Fn(&CommandRequest<'_>, &mut ExecutionContext) -> Result<CommandOutput, CommandError>
+type CommandHandler = dyn for<'a> Fn(
+        &'a CommandRequest<'a>,
+        &'a mut ExecutionContext,
+    )
+        -> Pin<Box<dyn Future<Output = Result<CommandOutput, CommandError>> + Send + 'a>>
     + Send
     + Sync;
 
@@ -429,15 +435,37 @@ impl Command {
         self
     }
 
-    pub fn handler<F>(mut self, handler: F) -> Self
+    /// Attach an async handler. Use with: `.handler(|req, ctx| Box::pin(async move { ... }))`
+    pub fn handler<F>(mut self, f: F) -> Self
     where
-        F: Fn(&CommandRequest<'_>, &mut ExecutionContext) -> Result<CommandOutput, CommandError>
+        F: for<'a> Fn(
+                &'a CommandRequest<'a>,
+                &'a mut ExecutionContext,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<CommandOutput, CommandError>> + Send + 'a>,
+            > + Send
+            + Sync
+            + 'static,
+    {
+        self.handler = Some(Arc::new(f));
+        self
+    }
+
+    /// Attach a synchronous handler (convenience wrapper).
+    pub fn sync_handler<F>(self, f: F) -> Self
+    where
+        F: for<'a> Fn(
+                &'a CommandRequest<'a>,
+                &'a mut ExecutionContext,
+            ) -> Result<CommandOutput, CommandError>
             + Send
             + Sync
             + 'static,
     {
-        self.handler = Some(Arc::new(handler));
-        self
+        self.handler(move |req, ctx| {
+            let result = f(req, ctx);
+            Box::pin(async move { result })
+        })
     }
 
     pub fn subcommand(mut self, command: Command) -> Self {
@@ -559,25 +587,30 @@ impl AgentCli {
         self
     }
 
-    pub fn run_env(&self) -> Execution {
+    pub async fn run_env(&self) -> Execution {
         let mut context = ExecutionContext::default();
         self.run_argv_with_context(std::env::args(), &mut context)
+            .await
     }
 
-    pub fn run_env_with_context(&self, context: &mut ExecutionContext) -> Execution {
-        self.run_argv_with_context(std::env::args(), context)
+    pub async fn run_env_with_context(&self, context: &mut ExecutionContext) -> Execution {
+        self.run_argv_with_context(std::env::args(), context).await
     }
 
-    pub fn run_argv<I, S>(&self, args: I) -> Execution
+    pub async fn run_argv<I, S>(&self, args: I) -> Execution
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         let mut context = ExecutionContext::default();
-        self.run_argv_with_context(args, &mut context)
+        self.run_argv_with_context(args, &mut context).await
     }
 
-    pub fn run_argv_with_context<I, S>(&self, args: I, context: &mut ExecutionContext) -> Execution
+    pub async fn run_argv_with_context<I, S>(
+        &self,
+        args: I,
+        context: &mut ExecutionContext,
+    ) -> Execution
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -681,7 +714,7 @@ impl AgentCli {
         };
 
         let path_strs = path_refs(&resolved.path);
-        match handler(&request, context) {
+        match handler(&request, context).await {
             Ok(output) => {
                 let next_actions =
                     self.ensure_next_actions(output.next_actions, &path_strs, command);
@@ -1028,7 +1061,7 @@ mod tests {
             .command(
                 Command::new("status", "Show relay and key status")
                     .usage("wokhei status")
-                    .handler(|_req, _ctx| {
+                    .sync_handler(|_req, _ctx| {
                         Ok(CommandOutput::new(json!({
                             "healthy": true,
                             "keys_configured": true
@@ -1040,7 +1073,7 @@ mod tests {
                 Command::new("gateway", "Gateway operations").subcommand(
                     Command::new("stream", "Stream gateway events")
                         .usage("wokhei gateway stream [--follow]")
-                        .handler(|_req, _ctx| {
+                        .sync_handler(|_req, _ctx| {
                             Ok(CommandOutput::new(json!({
                                 "stream": "ready"
                             })))
@@ -1069,10 +1102,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn root_returns_self_documenting_json_tree() {
+    #[tokio::test]
+    async fn root_returns_self_documenting_json_tree() {
         let cli = sample_cli();
-        let run = cli.run_argv(["wokhei"]);
+        let run = cli.run_argv(["wokhei"]).await;
 
         let Envelope::Success(envelope) = run.envelope() else {
             panic!("expected success envelope");
@@ -1082,10 +1115,10 @@ mod tests {
         assert_eq!(run.exit_code(), 0);
     }
 
-    #[test]
-    fn command_success_returns_envelope() {
+    #[tokio::test]
+    async fn command_success_returns_envelope() {
         let cli = sample_cli();
-        let run = cli.run_argv(["wokhei", "status"]);
+        let run = cli.run_argv(["wokhei", "status"]).await;
 
         let Envelope::Success(envelope) = run.envelope() else {
             panic!("expected success envelope");
@@ -1094,10 +1127,10 @@ mod tests {
         assert!(!envelope.next_actions.is_empty());
     }
 
-    #[test]
-    fn unknown_command_returns_error_with_fix() {
+    #[tokio::test]
+    async fn unknown_command_returns_error_with_fix() {
         let cli = sample_cli();
-        let run = cli.run_argv(["wokhei", "bogus"]);
+        let run = cli.run_argv(["wokhei", "bogus"]).await;
 
         let Envelope::Error(envelope) = run.envelope() else {
             panic!("expected error envelope");
@@ -1108,10 +1141,10 @@ mod tests {
         assert_eq!(run.exit_code(), 1);
     }
 
-    #[test]
-    fn help_returns_json_not_plain_text() {
+    #[tokio::test]
+    async fn help_returns_json_not_plain_text() {
         let cli = sample_cli();
-        let run = cli.run_argv(["wokhei", "gateway", "--help"]);
+        let run = cli.run_argv(["wokhei", "gateway", "--help"]).await;
 
         let Envelope::Success(envelope) = run.envelope() else {
             panic!("expected success envelope");
@@ -1123,10 +1156,10 @@ mod tests {
         assert!(envelope.result["subcommands"].is_array());
     }
 
-    #[test]
-    fn command_error_uses_handler_code_and_fix() {
+    #[tokio::test]
+    async fn command_error_uses_handler_code_and_fix() {
         let cli = AgentCli::new("wokhei", "Agent-first Nostr list CLI").command(
-            Command::new("publish", "Publish JSON event").handler(|_req, _ctx| {
+            Command::new("publish", "Publish JSON event").sync_handler(|_req, _ctx| {
                 Err(CommandError::new(
                     "invalid event json",
                     "INVALID_EVENT",
@@ -1135,7 +1168,7 @@ mod tests {
             }),
         );
 
-        let run = cli.run_argv(["wokhei", "publish"]);
+        let run = cli.run_argv(["wokhei", "publish"]).await;
         let Envelope::Error(envelope) = run.envelope() else {
             panic!("expected error envelope");
         };
@@ -1283,10 +1316,10 @@ mod tests {
 
     // --- Help with trailing unknown tokens ---
 
-    #[test]
-    fn help_with_trailing_unknown_returns_error() {
+    #[tokio::test]
+    async fn help_with_trailing_unknown_returns_error() {
         let cli = sample_cli();
-        let run = cli.run_argv(["wokhei", "gateway", "bogus", "--help"]);
+        let run = cli.run_argv(["wokhei", "gateway", "bogus", "--help"]).await;
 
         let Envelope::Error(envelope) = run.envelope() else {
             panic!("expected error envelope");
@@ -1296,15 +1329,15 @@ mod tests {
 
     // --- root_field cannot shadow core keys ---
 
-    #[test]
-    fn root_field_cannot_shadow_core_keys() {
+    #[tokio::test]
+    async fn root_field_cannot_shadow_core_keys() {
         let cli = AgentCli::new("test", "Test CLI")
             .version("1.0.0")
             .root_field("description", json!("hacked"))
             .root_field("version", json!("hacked"))
             .root_field("commands", json!("hacked"));
 
-        let run = cli.run_argv(["test"]);
+        let run = cli.run_argv(["test"]).await;
         let Envelope::Success(envelope) = run.envelope() else {
             panic!("expected success envelope");
         };
