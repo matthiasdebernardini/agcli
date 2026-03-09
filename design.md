@@ -436,6 +436,112 @@ Streaming commands hold a Redis connection. They must:
 - Use `connectTimeout` and `commandTimeout` to prevent hangs
 - Clean up the subscription on stream end (success, error, or signal)
 
+## Research-Informed Patterns
+
+The following patterns are informed by "Building AI Coding Agents for the Terminal: Scaffolding, Harness, Context Engineering, and Lessons Learned" (Bui, 2026; arXiv:2603.05344v1). See `research/arxiv-2603.05344v1-findings.md` for the full analysis.
+
+### Context budget awareness
+
+Agent context windows are measured in tokens, not lines. CLI output should be designed with token budgets in mind.
+
+**Thresholds** (from OpenDev findings):
+- Outputs exceeding ~8,000 characters (~2,000 tokens) should be offloaded to a scratch file
+- Include a ~500-character preview in the response so the agent understands the content
+- The agent can read the full output on demand via the file path
+
+agcli's `truncate_lines_with_file()` handles line-based truncation. For character-based truncation, use `truncate_chars_with_file()`:
+
+```rust
+use agcli::truncate_chars_with_file;
+
+let result = truncate_chars_with_file(
+    large_output,
+    8000,   // max chars before truncation
+    500,    // preview chars to keep inline
+    "build-output",
+)?;
+// result.preview: first 500 chars
+// result.full_output: path to temp file (if truncated)
+// result.truncated: bool
+```
+
+### Command mutability tagging
+
+Tag commands as read-only or mutating in the self-documenting tree. This enables agents to construct separate tool schemas for planning vs execution phases - a pattern the OpenDev paper calls "schema-level access control."
+
+When an agent is in planning mode, it should only see read-only commands. When executing, it sees everything. This separation is enforced at the schema level (the mutating tools don't exist in the planner's view), not through runtime permission checks.
+
+```rust
+Command::new("status", "Check system health")
+    .mutates(false)  // read-only, safe for planning
+
+Command::new("deploy", "Deploy to environment")
+    .mutates(true)   // mutating, execution-only
+```
+
+Root command output:
+```json
+{
+  "commands": [
+    { "name": "status", "description": "Check system health", "mutates": false },
+    { "name": "deploy", "description": "Deploy to environment", "mutates": true }
+  ]
+}
+```
+
+### Error recovery budget
+
+Complement `retryable: bool` with a concrete retry budget via `max_retries`. This helps agents implement the error-recovery budget exhaustion pattern - after N retries, the agent should escalate rather than loop.
+
+```json
+{
+  "ok": false,
+  "error": {
+    "message": "Rate limited",
+    "code": "RATE_LIMITED",
+    "retryable": true
+  },
+  "fix": "Wait 30 seconds and retry",
+  "max_retries": 3
+}
+```
+
+### Rollback actions
+
+Mutating commands should include undo `next_actions` when the operation is reversible. This supports the "operation log for rollback" pattern.
+
+```json
+{
+  "ok": true,
+  "command": "mycli deploy staging --tag v2.1",
+  "result": { "deployed": "staging", "previous_tag": "v2.0" },
+  "next_actions": [
+    {
+      "command": "mycli deploy staging --tag <tag>",
+      "description": "Rollback to previous version",
+      "params": {
+        "tag": { "value": "v2.0", "description": "Previous tag (rollback)" }
+      }
+    },
+    {
+      "command": "mycli status",
+      "description": "Check deployment health"
+    }
+  ]
+}
+```
+
+### Progressive degradation
+
+CLIs should degrade gracefully when resources are exhausted, not hard-fail. When truncation kicks in, the response is still useful. When a downstream service is slow, return partial results with a warning. When the agent is near its context limit, the CLI should not make it worse.
+
+| Resource exhausted | Do | Do not |
+|---|---|---|
+| Context window nearing limit | Truncate + file pointer | Dump full output |
+| Network timeout on dependency | Return partial result + `retryable: true` | Hang indefinitely |
+| Too many results | Return first N + total count + pagination next_action | Return all results |
+| Disk full for temp files | Return inline truncated output | Crash |
+
 ## Anti-Patterns
 
 | Do not | Do |
@@ -451,6 +557,11 @@ Streaming commands hold a Redis connection. They must:
 | Exit code as the only error signal | Error in JSON + exit code |
 | Require the agent to read `--help` | Root command self-documents |
 | Subcommand with no `withDescription` | Every command gets a description for `--help` |
+| All commands visible in all modes | Tag commands with `mutates` for planning/execution separation |
+| Retry forever on retryable errors | Include `max_retries` to cap recovery budget |
+| Mutating command with no undo | Include rollback `next_action` when reversible |
+| Hard-fail when resources exhausted | Degrade gracefully (truncate, partial results, retryable) |
+| Token-unaware output sizing | Use ~8,000 char / ~2,000 token threshold for large outputs |
 | Poll in a loop for temporal data | Stream NDJSON via Redis sub (ADR-0058) |
 | Plain text in streaming commands | Every line is a typed JSON object |
 | Hold Redis connections without cleanup | SIGINT handler + connection timeout |
@@ -477,4 +588,8 @@ Streaming commands hold a Redis connection. They must:
 - [ ] No plain text output anywhere
 - [ ] No ANSI colors or formatting
 - [ ] Works when piped (no TTY detection)
+- [ ] Commands tagged with `mutates` (read-only vs mutating)
+- [ ] Large outputs use token-aware truncation (~8,000 char threshold)
+- [ ] Mutating commands include rollback `next_action` when reversible
+- [ ] Retryable errors include `max_retries` where appropriate
 - [ ] Builds and installs
