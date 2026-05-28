@@ -302,7 +302,7 @@ cargo build --release
 cp target/release/mycli ~/.local/bin/
 ```
 
-Note: The Redis/infrastructure streaming sections above are joelclaw-specific. agcli provides generic `NdjsonEmitter` primitives that work with any `Write` sink.
+Note: The Redis/infrastructure streaming sections above are joelclaw-specific. agcli provides generic `NdjsonEmitter` primitives that work with any `tokio::io::AsyncWrite + Unpin` sink. Since v0.8 the emitter is async — `emit`, `emit_result`, and `emit_error` are `async fn`s and require a tokio runtime.
 
 ### Binary distribution (TypeScript)
 
@@ -377,7 +377,9 @@ type StreamEvent =
 
 ### Emitting stream events
 
-Use the `emit()` helper - one JSON line per call, flushed immediately:
+Use the `emit()` helper - one JSON line per call. Flushing is governed by the
+emitter's `FlushPolicy` (default: flush every line; alternatives are
+`Terminal` and `Never`):
 
 ```typescript
 import { emit, emitResult, emitError } from "../stream"
@@ -391,6 +393,54 @@ emit({ type: "step", name: "download", status: "completed", duration_ms: 3200, t
 emitResult("send --follow", { videoId: "abc123" }, [
   { command: "joelclaw run abc123", description: "Inspect the completed run" },
 ])
+```
+
+In Rust (agcli v0.8+) the emitter wraps a `tokio::io::AsyncWrite + Unpin`
+sink and every emit method is `async`. The emitter rejects further events
+once a terminal `result`/`error` line is written, and the flush cadence is
+controlled by `FlushPolicy`:
+
+```rust
+use agcli::{
+    FlushPolicy, NdjsonEmitter, NextAction, StepStatus, StreamEvent, SuccessEnvelope,
+};
+use tokio::io::stdout;
+
+let mut emitter =
+    NdjsonEmitter::new(stdout()).with_flush_policy(FlushPolicy::Every);
+
+emitter
+    .emit(StreamEvent::Start {
+        command: "joelclaw send video/download --follow".into(),
+        ts: "2026-02-19T08:25:00Z".into(),
+    })
+    .await?;
+emitter
+    .emit(StreamEvent::Step {
+        name: "download".into(),
+        status: StepStatus::Started,
+        duration_ms: None,
+        error: None,
+        ts: "2026-02-19T08:25:01Z".into(),
+    })
+    .await?;
+emitter
+    .emit(StreamEvent::Step {
+        name: "download".into(),
+        status: StepStatus::Completed,
+        duration_ms: Some(3200),
+        error: None,
+        ts: "2026-02-19T08:25:04Z".into(),
+    })
+    .await?;
+
+// Terminal envelope — always last.
+let envelope = SuccessEnvelope::new(
+    "send --follow",
+    serde_json::json!({ "video_id": "abc123" }),
+    vec![NextAction::new("joelclaw run abc123", "Inspect the completed run")],
+);
+emitter.emit_result(envelope).await?;
 ```
 
 ### Redis subscription pattern
