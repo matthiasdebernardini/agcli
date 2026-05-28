@@ -17,6 +17,14 @@ repos:
         always_run: true
         priority: 0
 
+      - id: cargo-check
+        name: cargo check
+        language: system
+        entry: cargo check --all-targets
+        pass_filenames: false
+        always_run: true
+        priority: 1
+
       - id: cargo-clippy
         name: cargo clippy
         language: system
@@ -24,3 +32,11 @@ repos:
         pass_filenames: false
         always_run: true
         priority: 1
+
+      - id: ast-grep
+        name: ast-grep (imperative patterns)
+        language: system
+        entry: sg scan
+        pass_filenames: false
+        always_run: true
+        priority: 0
