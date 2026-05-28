@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-agcli = "0.6.0"
+agcli = "0.8.1"
 serde_json = "1"
 ```
 
@@ -235,7 +235,7 @@ agcli targets **macOS and Linux only**. The crate ships with optimized release/b
 
 ```toml
 [dependencies]
-agcli = { version = "0.6.0", features = ["jemalloc"] }
+agcli = { version = "0.8.1", features = ["jemalloc"] }
 
 [profile.release]
 opt-level = 3
