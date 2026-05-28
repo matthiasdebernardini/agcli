@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
@@ -83,11 +83,37 @@ fn looks_like_negative_number(s: &str) -> bool {
     s.starts_with('-') && s.len() >= 2 && s.parse::<f64>().is_ok()
 }
 
-/// Parse argv into an `Invocation`.
+/// Parse argv into an `Invocation` without any boolean-flag schema.
+///
+/// A bare long flag (`--key`) followed by a non-flag token consumes that
+/// token as its value (`--key value` ≡ `--key=value`). This matches the
+/// space-separated form used in HATEOAS templates like `[--flag <value>]`.
+///
+/// If you have a known set of boolean flags (e.g. derived from a command's
+/// usage string), prefer [`parse_invocation_with_bool_flags`] so that
+/// `--bool-flag positional` does **not** silently consume the positional.
 pub fn parse_invocation<I, S>(args: I) -> Result<Invocation, ParseInvocationError>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
+{
+    parse_invocation_with_bool_flags(args, |_| false)
+}
+
+/// Parse argv into an `Invocation`, treating any flag for which `is_bool`
+/// returns `true` as a pure boolean (it never consumes the next token).
+///
+/// Used internally by [`AgentCli::run_argv_with_context`] to honor each
+/// command's usage-string schema. Exposed publicly so callers parsing argv
+/// outside the `AgentCli` runtime can opt in to the same disambiguation.
+pub fn parse_invocation_with_bool_flags<I, S, F>(
+    args: I,
+    is_bool: F,
+) -> Result<Invocation, ParseInvocationError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+    F: Fn(&str) -> bool,
 {
     let mut iter = args.into_iter().map(Into::into);
     let raw_program = iter.next().ok_or(ParseInvocationError::EmptyArgv)?;
@@ -107,30 +133,45 @@ where
     let mut positionals = Vec::new();
     let mut help_requested = false;
     let mut positional_only = false;
+    // A bare `--key` whose value form we don't yet know. If the next token is
+    // a plain value, it becomes the flag's value; otherwise the flag is bool.
+    let mut pending_flag: Option<String> = None;
+
+    let flush_pending = |pending: &mut Option<String>, flags: &mut HashMap<String, String>| {
+        if let Some(key) = pending.take() {
+            flags.insert(key, "true".to_string());
+        }
+    };
 
     for token in &tokens {
         if positional_only {
+            flush_pending(&mut pending_flag, &mut flags);
             positionals.push(token.clone());
             continue;
         }
 
         match token.as_str() {
             "--" => {
+                flush_pending(&mut pending_flag, &mut flags);
                 positional_only = true;
                 continue;
             }
             "--help" | "-h" => {
+                flush_pending(&mut pending_flag, &mut flags);
                 help_requested = true;
                 continue;
             }
             _ => {}
         }
 
-        // Long flags: --key=value or bare --key (bool)
+        // Long flags: --key=value or bare --key
         if let Some(flag) = token.strip_prefix("--") {
             if flag.is_empty() {
                 return Err(ParseInvocationError::InvalidFlag(token.clone()));
             }
+
+            // Starting a new flag flushes any prior pending bare flag.
+            flush_pending(&mut pending_flag, &mut flags);
 
             if let Some((key, value)) = flag.split_once('=') {
                 if key.is_empty() {
@@ -140,19 +181,30 @@ where
                 continue;
             }
 
-            // Bare --flag is always boolean
-            flags.insert(flag.to_string(), "true".to_string());
+            // Bare --flag: known boolean, or candidate for next-token value.
+            if is_bool(flag) {
+                flags.insert(flag.to_string(), "true".to_string());
+            } else {
+                pending_flag = Some(flag.to_string());
+            }
             continue;
         }
 
         // Negative numbers as positionals: -123, -3.14
         if looks_like_negative_number(token) {
-            positionals.push(token.clone());
+            if let Some(key) = pending_flag.take() {
+                flags.insert(key, token.clone());
+            } else {
+                positionals.push(token.clone());
+            }
             continue;
         }
 
         // Short flags: -x, -x=value, or -abc (bundled, all bool)
         if token.starts_with('-') && token.len() > 1 {
+            // Encountering another flag resolves the pending bare flag as bool.
+            flush_pending(&mut pending_flag, &mut flags);
+
             let short = &token[1..];
 
             // Check for -k=value
@@ -164,8 +216,11 @@ where
             }
 
             if short.chars().count() == 1 {
-                // Single short flag: -x (always bool)
-                flags.insert(short.to_string(), "true".to_string());
+                if is_bool(short) {
+                    flags.insert(short.to_string(), "true".to_string());
+                } else {
+                    pending_flag = Some(short.to_string());
+                }
                 continue;
             }
 
@@ -176,8 +231,16 @@ where
             continue;
         }
 
-        positionals.push(token.clone());
+        // Plain positional. If a flag is pending, this token is its value.
+        if let Some(key) = pending_flag.take() {
+            flags.insert(key, token.clone());
+        } else {
+            positionals.push(token.clone());
+        }
     }
+
+    // End of args: any pending bare flag becomes boolean.
+    flush_pending(&mut pending_flag, &mut flags);
 
     Ok(Invocation {
         program,
@@ -451,23 +514,6 @@ impl Command {
         self
     }
 
-    /// Attach a synchronous handler (convenience wrapper).
-    pub fn sync_handler<F>(self, f: F) -> Self
-    where
-        F: for<'a> Fn(
-                &'a CommandRequest<'a>,
-                &'a mut ExecutionContext,
-            ) -> Result<CommandOutput, CommandError>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.handler(move |req, ctx| {
-            let result = f(req, ctx);
-            Box::pin(async move { result })
-        })
-    }
-
     pub fn subcommand(mut self, command: Command) -> Self {
         debug_assert!(
             !self.subcommands.contains_key(&command.name),
@@ -620,21 +666,25 @@ impl AgentCli {
             argv.push(self.name.clone());
         }
 
-        let invocation = match parse_invocation(argv.iter().map(String::as_str)) {
-            Ok(value) => value,
-            Err(error) => {
-                // Defer fallback_command construction to the error path
-                let fallback_command = argv.join(" ");
-                return self.error_execution(
-                    fallback_command,
-                    error.to_string(),
-                    "PARSE_ERROR",
-                    "Use valid CLI syntax. Run the root command to inspect command templates.",
-                    false,
-                    self.root_actions(),
-                );
-            }
-        };
+        let bool_flags = self.bool_flag_set();
+        let invocation =
+            match parse_invocation_with_bool_flags(argv.iter().map(String::as_str), |flag| {
+                bool_flags.contains(flag)
+            }) {
+                Ok(value) => value,
+                Err(error) => {
+                    // Defer fallback_command construction to the error path
+                    let fallback_command = argv.join(" ");
+                    return self.error_execution(
+                        fallback_command,
+                        error.to_string(),
+                        "PARSE_ERROR",
+                        "Use valid CLI syntax. Run the root command to inspect command templates.",
+                        false,
+                        self.root_actions(),
+                    );
+                }
+            };
 
         if invocation.help_requested() {
             return self.help_execution(&invocation);
@@ -1004,6 +1054,21 @@ impl AgentCli {
         docs
     }
 
+    /// Collect every flag name declared as a pure boolean (`[--flag]`) across
+    /// the command tree, including subcommands. Flags declared with a value
+    /// placeholder (`[--flag=<x>]` or `[--flag <x>]`) are intentionally
+    /// excluded — those are the ones that should consume the next token.
+    ///
+    /// The union is used by `parse_invocation_with_bool_flags` to disambiguate
+    /// `--bool-flag positional` so the positional is not silently consumed.
+    fn bool_flag_set(&self) -> HashSet<String> {
+        let mut set = HashSet::new();
+        for command in self.commands.values() {
+            collect_bool_flags(command, &mut set, 0);
+        }
+        set
+    }
+
     fn resolve_command<'a>(&'a self, positionals: &'a [String]) -> ResolvedCommand<'a> {
         let mut commands = &self.commands;
         let mut path = Vec::new();
@@ -1034,6 +1099,53 @@ fn path_refs(path: &[String]) -> Vec<&str> {
     path.iter().map(String::as_str).collect()
 }
 
+fn collect_bool_flags(command: &Command, set: &mut HashSet<String>, depth: usize) {
+    if depth >= MAX_COMMAND_DEPTH {
+        return;
+    }
+    if let Some(usage) = &command.usage {
+        extract_bool_flag_names(usage, set);
+    }
+    for sub in command.subcommands.values() {
+        collect_bool_flags(sub, set, depth + 1);
+    }
+}
+
+/// Pull boolean flag names out of a usage string. Recognizes bracketed
+/// optional flags of the form `[--name]` (and short `[-x]`). Skips any
+/// bracketed flag that carries a `<value>` placeholder or `=` — those are
+/// value flags, not booleans.
+fn extract_bool_flag_names(usage: &str, set: &mut HashSet<String>) {
+    let bytes = usage.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'[' {
+            i += 1;
+            continue;
+        }
+        let Some(close_rel) = usage[i + 1..].find(']') else {
+            break;
+        };
+        let inner = &usage[i + 1..i + 1 + close_rel];
+        i += close_rel + 2;
+        if inner.contains('<') || inner.contains('=') {
+            continue;
+        }
+        if let Some(rest) = inner.strip_prefix("--") {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if !name.is_empty() {
+                set.insert(name.to_string());
+            }
+        } else if let Some(rest) = inner.strip_prefix('-') {
+            // Short single-char or bundled boolean: `[-x]` or `[-abc]`.
+            let token = rest.split_whitespace().next().unwrap_or("");
+            for ch in token.chars() {
+                set.insert(ch.to_string());
+            }
+        }
+    }
+}
+
 struct ResolvedCommand<'a> {
     command: Option<&'a Command>,
     path: Vec<String>,
@@ -1061,22 +1173,29 @@ mod tests {
             .command(
                 Command::new("status", "Show relay and key status")
                     .usage("wokhei status")
-                    .sync_handler(|_req, _ctx| {
-                        Ok(CommandOutput::new(json!({
-                            "healthy": true,
-                            "keys_configured": true
-                        }))
-                        .next_action(NextAction::new("wokhei status", "Re-check current status")))
+                    .handler(|_req, _ctx| {
+                        Box::pin(async move {
+                            Ok(CommandOutput::new(json!({
+                                "healthy": true,
+                                "keys_configured": true
+                            }))
+                            .next_action(NextAction::new(
+                                "wokhei status",
+                                "Re-check current status",
+                            )))
+                        })
                     }),
             )
             .command(
                 Command::new("gateway", "Gateway operations").subcommand(
                     Command::new("stream", "Stream gateway events")
                         .usage("wokhei gateway stream [--follow]")
-                        .sync_handler(|_req, _ctx| {
-                            Ok(CommandOutput::new(json!({
-                                "stream": "ready"
-                            })))
+                        .handler(|_req, _ctx| {
+                            Box::pin(async move {
+                                Ok(CommandOutput::new(json!({
+                                    "stream": "ready"
+                                })))
+                            })
                         }),
                 ),
             )
@@ -1159,12 +1278,14 @@ mod tests {
     #[tokio::test]
     async fn command_error_uses_handler_code_and_fix() {
         let cli = AgentCli::new("wokhei", "Agent-first Nostr list CLI").command(
-            Command::new("publish", "Publish JSON event").sync_handler(|_req, _ctx| {
-                Err(CommandError::new(
-                    "invalid event json",
-                    "INVALID_EVENT",
-                    "Pass valid event JSON and required tags.",
-                ))
+            Command::new("publish", "Publish JSON event").handler(|_req, _ctx| {
+                Box::pin(async move {
+                    Err(CommandError::new(
+                        "invalid event json",
+                        "INVALID_EVENT",
+                        "Pass valid event JSON and required tags.",
+                    ))
+                })
             }),
         );
 
@@ -1261,22 +1382,7 @@ mod tests {
         assert_eq!(&*prompt, "foo bar");
     }
 
-    // --- Strict flag parser tests ---
-
-    #[test]
-    fn bare_long_flag_is_boolean() {
-        let invocation =
-            parse_invocation(["app", "--verbose", "positional"]).expect("should parse");
-        assert_eq!(invocation.flag("verbose"), Some("true"));
-        assert_eq!(invocation.positionals(), &[String::from("positional")]);
-    }
-
-    #[test]
-    fn bare_short_flag_is_boolean() {
-        let invocation = parse_invocation(["app", "-v", "positional"]).expect("should parse");
-        assert_eq!(invocation.flag("v"), Some("true"));
-        assert_eq!(invocation.positionals(), &[String::from("positional")]);
-    }
+    // --- Flag parser tests ---
 
     #[test]
     fn long_flag_equals_carries_value() {
@@ -1293,11 +1399,114 @@ mod tests {
     }
 
     #[test]
-    fn strict_parser_does_not_swallow_commands() {
-        // `--follow status` should NOT consume `status` as the flag value
-        let invocation = parse_invocation(["app", "--follow", "status"]).expect("should parse");
-        assert_eq!(invocation.flag("follow"), Some("true"));
-        assert_eq!(invocation.positionals(), &[String::from("status")]);
+    fn bare_long_flag_consumes_next_token_as_value() {
+        // Without a boolean-flag schema, `--key value` is treated like
+        // `--key=value`. This matches the HATEOAS `[--flag <value>]` form.
+        let invocation = parse_invocation(["app", "--title", "My Title"]).expect("should parse");
+        assert_eq!(invocation.flag("title"), Some("My Title"));
+        assert!(invocation.positionals().is_empty());
+    }
+
+    #[test]
+    fn bare_short_flag_consumes_next_token_as_value() {
+        let invocation = parse_invocation(["app", "-o", "file.txt"]).expect("should parse");
+        assert_eq!(invocation.flag("o"), Some("file.txt"));
+        assert!(invocation.positionals().is_empty());
+    }
+
+    #[test]
+    fn bare_long_flag_at_end_of_args_is_boolean() {
+        let invocation = parse_invocation(["app", "submit", "--no-git"]).expect("should parse");
+        assert_eq!(invocation.flag("no-git"), Some("true"));
+        assert_eq!(invocation.positionals(), &[String::from("submit")]);
+    }
+
+    #[test]
+    fn bare_long_flag_followed_by_flag_is_boolean() {
+        // `--verbose --debug` resolves both as bool — `--debug` starts another flag.
+        let invocation = parse_invocation(["app", "--verbose", "--debug"]).expect("should parse");
+        assert_eq!(invocation.flag("verbose"), Some("true"));
+        assert_eq!(invocation.flag("debug"), Some("true"));
+    }
+
+    #[test]
+    fn schema_aware_bool_flag_does_not_swallow_positional() {
+        // When the caller knows which flags are boolean, `--no-git path` keeps
+        // `path` as a positional instead of consuming it as the flag's value.
+        let bools: HashSet<String> = ["no-git".to_string()].into_iter().collect();
+        let invocation =
+            parse_invocation_with_bool_flags(["app", "submit", "--no-git", "./plan.html"], |f| {
+                bools.contains(f)
+            })
+            .expect("should parse");
+        assert_eq!(invocation.flag("no-git"), Some("true"));
+        assert_eq!(
+            invocation.positionals(),
+            &[String::from("submit"), String::from("./plan.html")]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_argv_honors_usage_string_bool_flags() {
+        // `submit --no-git ./plan.html` must NOT consume `./plan.html` as the
+        // flag value, because the command's usage declares `--no-git` as bool.
+        let cli = AgentCli::new("agplan", "Plan submission tool").command(
+            Command::new("submit", "Submit a plan")
+                .usage("agplan submit [path] [--title=<title>] [--no-git]")
+                .handler(|req, _ctx| {
+                    let path = req.arg(0).unwrap_or("").to_string();
+                    let no_git = req.flag("no-git").is_some();
+                    Box::pin(async move {
+                        Ok(CommandOutput::new(json!({
+                            "path": path,
+                            "no_git": no_git,
+                        })))
+                    })
+                }),
+        );
+
+        let run = cli
+            .run_argv(["agplan", "submit", "--no-git", "./plan.html"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["path"], json!("./plan.html"));
+        assert_eq!(envelope.result["no_git"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn run_argv_supports_space_separated_value_flags() {
+        // `submit ./plan.html --title "My Title"` must capture `My Title` as
+        // the title value, not the string "true".
+        let cli = AgentCli::new("agplan", "Plan submission tool").command(
+            Command::new("submit", "Submit a plan")
+                .usage("agplan submit [path] [--title=<title>]")
+                .handler(|req, _ctx| {
+                    let title = req.flag("title").unwrap_or("").to_string();
+                    Box::pin(async move { Ok(CommandOutput::new(json!({ "title": title }))) })
+                }),
+        );
+
+        let run = cli
+            .run_argv(["agplan", "submit", "./plan.html", "--title", "My Title"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["title"], json!("My Title"));
+    }
+
+    #[test]
+    fn extract_bool_flag_names_basic() {
+        let mut set = HashSet::new();
+        extract_bool_flag_names(
+            "agplan submit [path] [--title=<title>] [--no-git] [--dry-run]",
+            &mut set,
+        );
+        assert!(set.contains("no-git"));
+        assert!(set.contains("dry-run"));
+        assert!(!set.contains("title"));
     }
 
     #[test]

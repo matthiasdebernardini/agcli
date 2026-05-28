@@ -1,7 +1,8 @@
-use std::io::{self, Write};
+use std::io;
 
 use serde::Serialize;
 use serde_json::Value;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::envelope::{ErrorBody, ErrorEnvelope, NextAction, SuccessEnvelope};
 
@@ -383,13 +384,16 @@ pub enum FlushPolicy {
 }
 
 /// Stateful NDJSON event emitter that enforces terminal `result`/`error` semantics.
-pub struct NdjsonEmitter<W: Write> {
+///
+/// Async since v0.8: the writer is `tokio::io::AsyncWrite`, and `emit`,
+/// `emit_result`, and `emit_error` are `async fn`s.
+pub struct NdjsonEmitter<W: AsyncWrite + Unpin> {
     writer: W,
     terminated: bool,
     flush_policy: FlushPolicy,
 }
 
-impl<W: Write> NdjsonEmitter<W> {
+impl<W: AsyncWrite + Unpin> NdjsonEmitter<W> {
     pub fn new(writer: W) -> Self {
         Self {
             writer,
@@ -404,14 +408,17 @@ impl<W: Write> NdjsonEmitter<W> {
         self
     }
 
-    pub fn emit(&mut self, event: StreamEvent) -> Result<(), StreamEmitError> {
+    pub async fn emit(&mut self, event: StreamEvent) -> Result<(), StreamEmitError> {
         if self.terminated {
             return Err(StreamEmitError::AlreadyTerminated);
         }
 
         let terminal = event.is_terminal();
-        serde_json::to_writer(&mut self.writer, &event)?;
-        self.writer.write_all(b"\n")?;
+        // Serialize to a buffer first so a serde failure cannot leave a
+        // partial line on the wire.
+        let mut line = serde_json::to_vec(&event)?;
+        line.push(b'\n');
+        self.writer.write_all(&line).await?;
 
         let should_flush = match self.flush_policy {
             FlushPolicy::Every => true,
@@ -419,7 +426,7 @@ impl<W: Write> NdjsonEmitter<W> {
             FlushPolicy::Never => false,
         };
         if should_flush {
-            self.writer.flush()?;
+            self.writer.flush().await?;
         }
 
         if terminal {
@@ -428,12 +435,12 @@ impl<W: Write> NdjsonEmitter<W> {
         Ok(())
     }
 
-    pub fn emit_result(&mut self, envelope: SuccessEnvelope) -> Result<(), StreamEmitError> {
-        self.emit(StreamEvent::result_from_envelope(envelope))
+    pub async fn emit_result(&mut self, envelope: SuccessEnvelope) -> Result<(), StreamEmitError> {
+        self.emit(StreamEvent::result_from_envelope(envelope)).await
     }
 
-    pub fn emit_error(&mut self, envelope: ErrorEnvelope) -> Result<(), StreamEmitError> {
-        self.emit(StreamEvent::error_from_envelope(envelope))
+    pub async fn emit_error(&mut self, envelope: ErrorEnvelope) -> Result<(), StreamEmitError> {
+        self.emit(StreamEvent::error_from_envelope(envelope)).await
     }
 
     pub fn terminated(&self) -> bool {
@@ -451,8 +458,8 @@ mod tests {
     use crate::envelope::{ErrorEnvelope, SuccessEnvelope};
     use serde_json::json;
 
-    #[test]
-    fn emitter_writes_ndjson_lines() {
+    #[tokio::test]
+    async fn emitter_writes_ndjson_lines() {
         let buffer = Vec::<u8>::new();
         let mut emitter = NdjsonEmitter::new(buffer);
 
@@ -461,6 +468,7 @@ mod tests {
                 command: "wokhei status --follow".to_string(),
                 ts: "2026-02-25T20:00:00Z".to_string(),
             })
+            .await
             .expect("start event must emit");
 
         emitter
@@ -469,6 +477,7 @@ mod tests {
                 json!({ "healthy": true }),
                 vec![],
             ))
+            .await
             .expect("terminal result must emit");
 
         assert!(emitter.terminated());
@@ -478,8 +487,8 @@ mod tests {
         assert!(out.contains("\"type\":\"result\""));
     }
 
-    #[test]
-    fn emitter_rejects_events_after_terminal() {
+    #[tokio::test]
+    async fn emitter_rejects_events_after_terminal() {
         let buffer = Vec::<u8>::new();
         let mut emitter = NdjsonEmitter::new(buffer);
         emitter
@@ -488,6 +497,7 @@ mod tests {
                 json!({ "ok": true }),
                 vec![],
             ))
+            .await
             .expect("terminal result must emit");
 
         let err = emitter
@@ -495,6 +505,7 @@ mod tests {
                 command: "wokhei status".to_string(),
                 ts: "2026-02-25T20:00:00Z".to_string(),
             })
+            .await
             .expect_err("must reject further events");
         assert!(matches!(err, StreamEmitError::AlreadyTerminated));
     }
@@ -554,8 +565,8 @@ mod tests {
         assert!(encoded.get("error").is_none());
     }
 
-    #[test]
-    fn flush_policy_terminal_only_flushes_on_terminal() {
+    #[tokio::test]
+    async fn flush_policy_terminal_only_flushes_on_terminal() {
         // Use a Vec<u8> — its flush() is a no-op, but we can verify the data
         // is written correctly and the emitter reaches terminal state.
         let buffer = Vec::<u8>::new();
@@ -567,10 +578,12 @@ mod tests {
                 message: "buffered".to_string(),
                 ts: "2026-01-01T00:00:00Z".to_string(),
             })
+            .await
             .expect("log event must emit");
 
         emitter
             .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
+            .await
             .expect("terminal result must emit");
 
         assert!(emitter.terminated());
@@ -578,13 +591,14 @@ mod tests {
         assert_eq!(out.lines().count(), 2);
     }
 
-    #[test]
-    fn flush_policy_never_still_writes_data() {
+    #[tokio::test]
+    async fn flush_policy_never_still_writes_data() {
         let buffer = Vec::<u8>::new();
         let mut emitter = NdjsonEmitter::new(buffer).with_flush_policy(FlushPolicy::Never);
 
         emitter
             .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
+            .await
             .expect("terminal result must emit");
 
         assert!(emitter.terminated());

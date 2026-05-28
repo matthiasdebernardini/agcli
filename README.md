@@ -20,9 +20,14 @@ It is built around the design in [design.md](design.md):
 
 ```toml
 [dependencies]
-agcli = "0.6.0"
+agcli = "0.8.0"
 serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+The crate is 100% async (since v0.8). Handlers, the NDJSON emitter, and
+truncation I/O all return `Future`s. Wire up a tokio runtime in your binary —
+the snippet below uses `#[tokio::main]`.
 
 ## Quick start
 
@@ -30,24 +35,43 @@ serde_json = "1"
 use agcli::{AgentCli, Command, CommandOutput, NextAction};
 use serde_json::json;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = AgentCli::new("ops", "Agent-native operations CLI")
-        .version("0.4.0")
+        .version("0.8.0")
         .command(
             Command::new("status", "Show system health")
                 .usage("ops status")
                 .handler(|_req, _ctx| {
-                    Ok(CommandOutput::new(json!({ "healthy": true })).next_action(
-                        NextAction::new("ops status", "Re-check status"),
-                    ))
+                    Box::pin(async move {
+                        Ok(CommandOutput::new(json!({ "healthy": true })).next_action(
+                            NextAction::new("ops status", "Re-check status"),
+                        ))
+                    })
                 }),
         );
 
-    let run = cli.run_env();
+    let run = cli.run_env().await;
     println!("{}", run.to_json());
     std::process::exit(run.exit_code());
 }
 ```
+
+## Flag parsing
+
+`agcli` accepts both `--key=value` and `--key value` (space-separated) for
+value flags. This matches the HATEOAS `[--flag <value>]` template form used
+throughout the crate's docs.
+
+To disambiguate boolean flags from value flags without a schema layer, the
+parser reads each command's `.usage(...)` string at runtime and treats any
+bracketed flag without a `<placeholder>` (e.g. `[--no-git]`, `[--follow]`)
+as a pure boolean. Declared boolean flags will never consume the next token,
+so `mycli submit --no-git ./plan.html` works as expected.
+
+For value flags or undeclared flags, a bare `--key` followed by a non-flag
+token consumes that token as the value (`--key value` ≡ `--key=value`). Use
+`--key=true` or `--` to force a positional after an undeclared boolean.
 
 ## Performance
 
@@ -57,7 +81,7 @@ agcli targets **macOS and Linux only**. The crate ships with optimized release/b
 
 ```toml
 [dependencies]
-agcli = { version = "0.6.0", features = ["jemalloc"] }
+agcli = { version = "0.8.0", features = ["jemalloc"] }
 
 [profile.release]
 opt-level = 3

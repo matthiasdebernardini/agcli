@@ -18,10 +18,12 @@ fn build_flat_cli(n: usize) -> AgentCli {
         cli = cli.command(
             Command::new(name.clone(), desc)
                 .usage(format!("bench {name} <arg>"))
-                .sync_handler(|req, _ctx| {
-                    let val = req.arg(0).unwrap_or("x");
-                    Ok(CommandOutput::new(json!({ "echo": val }))
-                        .next_action(NextAction::new("bench", "Inspect root")))
+                .handler(|req, _ctx| {
+                    let val = req.arg(0).unwrap_or("x").to_string();
+                    Box::pin(async move {
+                        Ok(CommandOutput::new(json!({ "echo": val }))
+                            .next_action(NextAction::new("bench", "Inspect root")))
+                    })
                 }),
         );
     }
@@ -143,13 +145,16 @@ fn bench_parse_invocation(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_truncate(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("truncate_lines_with_file");
 
     // No truncation path
     let small: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
     group.bench_function("no_truncation_10", |b| {
         b.iter(|| {
-            let _ = truncate_lines_with_file(small.clone(), 100, "bench");
+            rt.block_on(async {
+                let _ = truncate_lines_with_file(small.clone(), 100, "bench").await;
+            });
         });
     });
 
@@ -160,10 +165,13 @@ fn bench_truncate(c: &mut Criterion) {
             .collect();
         group.bench_with_input(BenchmarkId::new("truncated", total), &lines, |b, lines| {
             b.iter(|| {
-                let result =
-                    truncate_lines_with_file(lines.clone(), 20, "bench").expect("must work");
-                // Clean up temp file to avoid disk bloat during benchmarks
-                let _ = result.cleanup();
+                rt.block_on(async {
+                    let result = truncate_lines_with_file(lines.clone(), 20, "bench")
+                        .await
+                        .expect("must work");
+                    // Clean up temp file to avoid disk bloat during benchmarks
+                    let _ = result.cleanup().await;
+                });
             });
         });
     }
@@ -175,43 +183,51 @@ fn bench_truncate(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_ndjson_emitter(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("ndjson_emitter");
 
     // Single terminal event
     group.bench_function("single_result", |b| {
         b.iter(|| {
-            let buf = Vec::with_capacity(512);
-            let mut emitter = NdjsonEmitter::new(buf);
-            emitter
-                .emit_result(SuccessEnvelope::new(
-                    "bench cmd",
-                    json!({"ok": true}),
-                    vec![],
-                ))
-                .expect("must emit");
-            let _ = emitter.into_inner();
+            rt.block_on(async {
+                let buf = Vec::with_capacity(512);
+                let mut emitter = NdjsonEmitter::new(buf);
+                emitter
+                    .emit_result(SuccessEnvelope::new(
+                        "bench cmd",
+                        json!({"ok": true}),
+                        vec![],
+                    ))
+                    .await
+                    .expect("must emit");
+                let _ = emitter.into_inner();
+            });
         });
     });
 
     // Multi-event stream (5 progress + terminal)
     group.bench_function("stream_6_events", |b| {
         b.iter(|| {
-            let buf = Vec::with_capacity(2048);
-            let mut emitter = NdjsonEmitter::new(buf);
-            for i in 0..5u8 {
+            rt.block_on(async {
+                let buf = Vec::with_capacity(2048);
+                let mut emitter = NdjsonEmitter::new(buf);
+                for i in 0..5u8 {
+                    emitter
+                        .emit(StreamEvent::Progress {
+                            name: "download".to_string(),
+                            percent: Some(i * 20),
+                            message: None,
+                            ts: "2026-01-01T00:00:00Z".to_string(),
+                        })
+                        .await
+                        .expect("must emit");
+                }
                 emitter
-                    .emit(StreamEvent::Progress {
-                        name: "download".to_string(),
-                        percent: Some(i * 20),
-                        message: None,
-                        ts: "2026-01-01T00:00:00Z".to_string(),
-                    })
+                    .emit_result(SuccessEnvelope::new("bench cmd", json!(null), vec![]))
+                    .await
                     .expect("must emit");
-            }
-            emitter
-                .emit_result(SuccessEnvelope::new("bench cmd", json!(null), vec![]))
-                .expect("must emit");
-            let _ = emitter.into_inner();
+                let _ = emitter.into_inner();
+            });
         });
     });
 
@@ -224,21 +240,25 @@ fn bench_ndjson_emitter(c: &mut Criterion) {
         let label = format!("{policy:?}");
         group.bench_function(BenchmarkId::new("flush_policy_10", label), |b| {
             b.iter(|| {
-                let buf = Vec::with_capacity(4096);
-                let mut emitter = NdjsonEmitter::new(buf).with_flush_policy(policy);
-                for i in 0..9u8 {
+                rt.block_on(async {
+                    let buf = Vec::with_capacity(4096);
+                    let mut emitter = NdjsonEmitter::new(buf).with_flush_policy(policy);
+                    for i in 0..9u8 {
+                        emitter
+                            .emit(StreamEvent::Log {
+                                level: agcli::LogLevel::Info,
+                                message: format!("event {i}"),
+                                ts: "2026-01-01T00:00:00Z".to_string(),
+                            })
+                            .await
+                            .expect("must emit");
+                    }
                     emitter
-                        .emit(StreamEvent::Log {
-                            level: agcli::LogLevel::Info,
-                            message: format!("event {i}"),
-                            ts: "2026-01-01T00:00:00Z".to_string(),
-                        })
+                        .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
+                        .await
                         .expect("must emit");
-                }
-                emitter
-                    .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
-                    .expect("must emit");
-                let _ = emitter.into_inner();
+                    let _ = emitter.into_inner();
+                });
             });
         });
     }

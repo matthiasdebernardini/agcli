@@ -252,36 +252,48 @@ const root = Command.make("joelclaw", {}, () => {
 
 ### Rust Implementation (agcli)
 
-The `agcli` crate implements all 5 principles as reusable Rust primitives. It provides the envelope types, HATEOAS next_actions with automatic `params` population, NDJSON streaming with terminal event enforcement, and context-safe truncation helpers.
+The `agcli` crate implements all 5 principles as reusable Rust primitives. It provides the envelope types, HATEOAS next_actions with automatic `params` population, NDJSON streaming with terminal event enforcement, and context-safe truncation helpers. Since v0.8 the crate is 100% async — handlers, the NDJSON emitter, and truncation I/O all return `Future`s and require a tokio runtime.
 
 ```toml
 [dependencies]
-agcli = "0.5.0"
+agcli = "0.8.0"
 serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ```rust
 use agcli::{AgentCli, Command, CommandOutput, NextAction, ActionParam};
 use serde_json::json;
 
-let cli = AgentCli::new("mycli", "My agent-native CLI")
-    .version("1.0.0")
-    .command(
-        Command::new("deploy", "Deploy to environment")
-            .usage("mycli deploy <env> [--tag=<tag>]")
-            .handler(|req, _ctx| {
-                let env = req.arg(0).unwrap_or("staging");
-                Ok(CommandOutput::new(json!({ "deployed": env }))
-                    .next_action(
-                        NextAction::new("mycli status", "Check deployment status"),
-                    ))
-            }),
-    );
+#[tokio::main]
+async fn main() {
+    let cli = AgentCli::new("mycli", "My agent-native CLI")
+        .version("1.0.0")
+        .command(
+            Command::new("deploy", "Deploy to environment")
+                .usage("mycli deploy <env> [--tag=<tag>]")
+                .handler(|req, _ctx| {
+                    let env = req.arg(0).unwrap_or("staging").to_string();
+                    Box::pin(async move {
+                        Ok(CommandOutput::new(json!({ "deployed": env }))
+                            .next_action(
+                                NextAction::new("mycli status", "Check deployment status"),
+                            ))
+                    })
+                }),
+        );
 
-let run = cli.run_env();
-println!("{}", run.to_json());
-std::process::exit(run.exit_code());
+    let run = cli.run_env().await;
+    println!("{}", run.to_json());
+    std::process::exit(run.exit_code());
+}
 ```
+
+The flag parser accepts both `--key=value` and `--key value` — the bracketed
+`[--flag <value>]` and `[--flag=<value>]` HATEOAS forms are interchangeable.
+Pure-boolean flags should be declared as `[--flag]` (no `<placeholder>`) in
+the command's `.usage(...)`; agcli reads the usage string and prevents the
+parser from greedily consuming the next positional.
 
 Build with Cargo:
 
