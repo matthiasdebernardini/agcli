@@ -192,10 +192,11 @@ where
 
         // Negative numbers as positionals: -123, -3.14
         if looks_like_negative_number(token) {
-            if let Some(key) = pending_flag.take() {
-                flags.insert(key, token.clone());
-            } else {
-                positionals.push(token.clone());
+            match pending_flag.take() {
+                Some(key) => {
+                    flags.insert(key, token.clone());
+                }
+                None => positionals.push(token.clone()),
             }
             continue;
         }
@@ -232,10 +233,11 @@ where
         }
 
         // Plain positional. If a flag is pending, this token is its value.
-        if let Some(key) = pending_flag.take() {
-            flags.insert(key, token.clone());
-        } else {
-            positionals.push(token.clone());
+        match pending_flag.take() {
+            Some(key) => {
+                flags.insert(key, token.clone());
+            }
+            None => positionals.push(token.clone()),
         }
     }
 

@@ -192,10 +192,7 @@ impl Serialize for StreamEvent {
 
 #[cfg(feature = "deserialize")]
 fn str_field(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
+    v.get(key).and_then(Value::as_str).unwrap_or("").to_owned()
 }
 
 #[cfg(feature = "deserialize")]

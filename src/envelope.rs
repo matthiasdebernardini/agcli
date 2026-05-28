@@ -7,7 +7,7 @@ use serde_json::Value;
 fn epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock before UNIX epoch")
         .as_secs()
 }
 
@@ -354,7 +354,7 @@ impl Envelope {
                 "ok": false,
                 "error": format!("serialization failed: {e}")
             }))
-            .unwrap_or_default()
+            .expect("static error envelope always serializes")
         })
     }
 
@@ -364,7 +364,7 @@ impl Envelope {
                 "ok": false,
                 "error": format!("serialization failed: {e}")
             }))
-            .unwrap_or_default()
+            .expect("static error envelope always serializes")
         })
     }
 }

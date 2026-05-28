@@ -82,7 +82,7 @@ fn sanitize_prefix(value: &str) -> String {
 async fn write_full_output(lines: &[String], prefix: &str) -> io::Result<PathBuf> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock before UNIX epoch")
         .as_nanos();
     let pid = process::id();
 
