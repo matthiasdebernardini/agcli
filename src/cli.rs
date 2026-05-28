@@ -666,7 +666,8 @@ impl AgentCli {
             argv.push(self.name.clone());
         }
 
-        let bool_flags = self.bool_flag_set();
+        let preliminary_path = self.preliminary_command_path(&argv);
+        let bool_flags = Self::path_bool_flag_set(&preliminary_path);
         let invocation =
             match parse_invocation_with_bool_flags(argv.iter().map(String::as_str), |flag| {
                 bool_flags.contains(flag)
@@ -1055,16 +1056,59 @@ impl AgentCli {
     }
 
     /// Collect every flag name declared as a pure boolean (`[--flag]`) across
-    /// the command tree, including subcommands. Flags declared with a value
-    /// placeholder (`[--flag=<x>]` or `[--flag <x>]`) are intentionally
-    /// excluded — those are the ones that should consume the next token.
-    ///
-    /// The union is used by `parse_invocation_with_bool_flags` to disambiguate
-    /// `--bool-flag positional` so the positional is not silently consumed.
-    fn bool_flag_set(&self) -> HashSet<String> {
+    /// the entire command tree, including subcommands. Used only as a Pass 1
+    /// heuristic by [`Self::preliminary_command_path`] so that bare bool flags
+    /// in the input don't accidentally consume tokens that might be command
+    /// names. The final flag/positional split honors the resolved command
+    /// path's schema, not this global union — see [`Self::path_bool_flag_set`].
+    fn global_bool_flag_set(&self) -> HashSet<String> {
         let mut set = HashSet::new();
         for command in self.commands.values() {
             collect_bool_flags(command, &mut set, 0);
+        }
+        set
+    }
+
+    /// Pass 1 of command resolution: walk argv with the global bool-flag
+    /// union as a heuristic, then walk the resulting positionals against the
+    /// command tree to find the deepest matching command path.
+    ///
+    /// The result feeds [`Self::path_bool_flag_set`] so the actual parse in
+    /// `run_argv_with_context` only sees bool flags declared by commands on
+    /// the resolved path — never flags declared by unrelated siblings.
+    fn preliminary_command_path<'a>(&'a self, argv: &[String]) -> Vec<&'a Command> {
+        let union_bools = self.global_bool_flag_set();
+        let invocation = match parse_invocation_with_bool_flags(
+            argv.iter().map(String::as_str),
+            |flag| union_bools.contains(flag),
+        ) {
+            Ok(value) => value,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut path = Vec::new();
+        let mut current_cmds = &self.commands;
+        for positional in invocation.positionals() {
+            let Some(cmd) = current_cmds.get(positional) else {
+                break;
+            };
+            path.push(cmd);
+            current_cmds = &cmd.subcommands;
+        }
+        path
+    }
+
+    /// Collect every bool flag declared by any command in `path`. Used to
+    /// disambiguate bare `--flag positional` for the actual parse: a flag is
+    /// bool only if some command on the resolved path declared it bool. Flags
+    /// declared by unrelated commands (siblings, other branches) are ignored
+    /// so the parse honors the invoked command's schema.
+    fn path_bool_flag_set(path: &[&Command]) -> HashSet<String> {
+        let mut set = HashSet::new();
+        for command in path {
+            if let Some(usage) = &command.usage {
+                extract_bool_flag_names(usage, &mut set);
+            }
         }
         set
     }
@@ -1473,6 +1517,84 @@ mod tests {
         };
         assert_eq!(envelope.result["path"], json!("./plan.html"));
         assert_eq!(envelope.result["no_git"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn run_argv_scopes_bool_flags_to_resolved_command() {
+        // Regression: when two sibling commands declare the same flag name
+        // with conflicting semantics — `cmd_a` treats `--format` as bool,
+        // `cmd_b` takes it with a value — invoking `cmd_b --format json`
+        // must parse `json` as the flag's value, not as a positional. A
+        // global-union bool-flag set would incorrectly mark `--format` as
+        // bool everywhere and silently corrupt `cmd_b`'s arguments.
+        let cli = AgentCli::new("app", "Conflicting flag schemas")
+            .command(
+                Command::new("cmd_a", "Bool format")
+                    .usage("app cmd_a [--format]")
+                    .handler(|_req, _ctx| {
+                        Box::pin(async move { Ok(CommandOutput::new(json!({}))) })
+                    }),
+            )
+            .command(
+                Command::new("cmd_b", "Value format")
+                    .usage("app cmd_b [--format=<format>]")
+                    .handler(|req, _ctx| {
+                        let format = req.flag("format").unwrap_or("").to_string();
+                        let positionals: Vec<String> = req.positionals().to_vec();
+                        Box::pin(async move {
+                            Ok(CommandOutput::new(json!({
+                                "format": format,
+                                "positionals": positionals,
+                            })))
+                        })
+                    }),
+            );
+
+        let run = cli.run_argv(["app", "cmd_b", "--format", "json"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope, got: {:?}", run.envelope());
+        };
+        assert_eq!(envelope.result["format"], json!("json"));
+        // `json` belongs to the flag, not to the remaining positionals.
+        assert_eq!(envelope.result["positionals"], json!([] as [String; 0]));
+    }
+
+    #[tokio::test]
+    async fn run_argv_still_honors_bool_flag_when_command_declares_it() {
+        // Counterpart to `run_argv_scopes_bool_flags_to_resolved_command`:
+        // invoking the sibling that *did* declare `--format` as bool must
+        // still treat the next positional as a positional, not a flag value.
+        let cli = AgentCli::new("app", "Conflicting flag schemas")
+            .command(
+                Command::new("cmd_a", "Bool format")
+                    .usage("app cmd_a [path] [--format]")
+                    .handler(|req, _ctx| {
+                        let format = req.flag("format").map(|v| v.to_string());
+                        let path = req.arg(0).unwrap_or("").to_string();
+                        Box::pin(async move {
+                            Ok(CommandOutput::new(json!({
+                                "format": format,
+                                "path": path,
+                            })))
+                        })
+                    }),
+            )
+            .command(
+                Command::new("cmd_b", "Value format")
+                    .usage("app cmd_b [--format=<format>]")
+                    .handler(|_req, _ctx| {
+                        Box::pin(async move { Ok(CommandOutput::new(json!({}))) })
+                    }),
+            );
+
+        let run = cli
+            .run_argv(["app", "cmd_a", "--format", "./payload.json"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope, got: {:?}", run.envelope());
+        };
+        assert_eq!(envelope.result["format"], json!("true"));
+        assert_eq!(envelope.result["path"], json!("./payload.json"));
     }
 
     #[tokio::test]
