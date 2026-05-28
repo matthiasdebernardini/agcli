@@ -1078,13 +1078,13 @@ impl AgentCli {
     /// the resolved path — never flags declared by unrelated siblings.
     fn preliminary_command_path<'a>(&'a self, argv: &[String]) -> Vec<&'a Command> {
         let union_bools = self.global_bool_flag_set();
-        let invocation = match parse_invocation_with_bool_flags(
-            argv.iter().map(String::as_str),
-            |flag| union_bools.contains(flag),
-        ) {
-            Ok(value) => value,
-            Err(_) => return Vec::new(),
-        };
+        let invocation =
+            match parse_invocation_with_bool_flags(argv.iter().map(String::as_str), |flag| {
+                union_bools.contains(flag)
+            }) {
+                Ok(value) => value,
+                Err(_) => return Vec::new(),
+            };
 
         let mut path = Vec::new();
         let mut current_cmds = &self.commands;

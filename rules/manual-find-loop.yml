@@ -20,6 +20,9 @@ constraints:
 ignores:
   - "crates/**/tests/**"
   - "crates/**/benches/**"
+  - "benches/**"
+  - "tests/**"
+  - "examples/**"
   - "tracehealth-api/tests/**"
   - "tracehealth-api/benches/**"
   - "vendor/**"
