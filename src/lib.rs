@@ -33,16 +33,24 @@
 //! }
 //! ```
 
+mod audit;
 mod cli;
+mod doctor;
 mod envelope;
+mod project;
 mod stream;
 mod truncate;
 
+pub use audit::{AuditFinding, AuditReport, AuditSeverity};
 pub use cli::{
     AgentCli, Command, CommandError, CommandOutput, CommandRequest, Execution, ExecutionContext,
     Invocation, ParseInvocationError, parse_invocation, parse_invocation_with_bool_flags,
+    read_stdin,
 };
-pub use envelope::{ActionParam, Envelope, ErrorBody, ErrorEnvelope, NextAction, SuccessEnvelope};
+pub use doctor::{Check, CheckResult};
+pub use envelope::{
+    ActionParam, Envelope, ErrorBody, ErrorEnvelope, ExitCode, NextAction, SuccessEnvelope,
+};
 pub use stream::{FlushPolicy, LogLevel, NdjsonEmitter, StepStatus, StreamEmitError, StreamEvent};
 pub use truncate::{TruncatedEntries, truncate_lines_with_file};
 

@@ -9,10 +9,46 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::envelope::{ActionParam, Envelope, ErrorEnvelope, NextAction, SuccessEnvelope};
+use crate::audit::{AuditReport, AuditSeverity};
+use crate::doctor::Check;
+use crate::envelope::{
+    ActionParam, Envelope, ErrorEnvelope, ExitCode, NextAction, SuccessEnvelope,
+};
+use crate::project;
 
 /// Maximum recursion depth for command tree traversal.
 const MAX_COMMAND_DEPTH: usize = 32;
+
+/// Flags the framework reserves and treats as pure booleans on every command
+/// (when `reserved_flags` is enabled), so an agent can pass them anywhere
+/// without the parser mistaking the next token for their value. `--select`
+/// is intentionally absent: it is a *value* flag and uses the normal
+/// consume-next-token rule.
+const RESERVED_BOOL_FLAGS: &[&str] = &[
+    "json", "dry-run", "compact", "stdin", "quiet", "yes", "no-input", "no-cache", "no-color",
+];
+
+fn is_reserved_bool(flag: &str) -> bool {
+    RESERVED_BOOL_FLAGS.contains(&flag)
+}
+
+/// Split a `--select` value (`"id,name, body"`) into trimmed, non-empty
+/// field names.
+fn parse_select_fields(raw: &str) -> Vec<&str> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Read all of stdin to a string. Pairs with the `--stdin` convention so a
+/// handler can accept piped input: `if req.wants_stdin() { read_stdin().await }`.
+pub async fn read_stdin() -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = String::new();
+    tokio::io::stdin().read_to_string(&mut buf).await?;
+    Ok(buf)
+}
 
 /// Parsed command-line invocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -315,6 +351,59 @@ impl<'a> CommandRequest<'a> {
         }
         Some(Cow::Owned(self.positionals.join(" ")))
     }
+
+    // --- Standard agent-native flag accessors ---
+    //
+    // These read the conventional flag vocabulary so every agcli CLI speaks
+    // the same dialect. The framework already parses the reserved booleans
+    // anywhere on the line (see `RESERVED_BOOL_FLAGS`); these just give the
+    // handler a typed read.
+
+    /// `--dry-run`: preview without mutating.
+    pub fn dry_run(&self) -> bool {
+        self.flag("dry-run").is_some()
+    }
+
+    /// `--quiet`: suppress non-essential output.
+    pub fn quiet(&self) -> bool {
+        self.flag("quiet").is_some()
+    }
+
+    /// `--yes` / `--no-input`: assume yes; never prompt interactively.
+    pub fn assume_yes(&self) -> bool {
+        self.flag("yes").is_some() || self.flag("no-input").is_some()
+    }
+
+    /// `--no-cache`: bypass any local cache.
+    pub fn no_cache(&self) -> bool {
+        self.flag("no-cache").is_some()
+    }
+
+    /// `--no-color`: emit machine-friendly, uncolored output.
+    pub fn no_color(&self) -> bool {
+        self.flag("no-color").is_some()
+    }
+
+    /// `--compact`: caller asked for high-gravity fields only.
+    pub fn compact(&self) -> bool {
+        self.flag("compact").is_some()
+    }
+
+    /// `--stdin`: caller intends to pipe input. Pair with [`read_stdin`].
+    pub fn wants_stdin(&self) -> bool {
+        self.flag("stdin").is_some()
+    }
+
+    /// `--select=a,b,c`: the requested field projection, split and trimmed.
+    /// `None` when the flag is absent; empty entries are dropped.
+    pub fn select(&self) -> Option<Vec<&str>> {
+        self.flag("select").map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+    }
 }
 
 /// Success payload returned from a command handler.
@@ -322,6 +411,13 @@ impl<'a> CommandRequest<'a> {
 pub struct CommandOutput {
     result: Value,
     next_actions: Vec<NextAction>,
+    /// Optional process exit-code override. `None` → [`ExitCode::SUCCESS`].
+    /// Lets a command report a non-zero status while still emitting an
+    /// `ok: true` envelope (e.g. `doctor` reporting an unhealthy system).
+    exit_code: Option<i32>,
+    /// When `--compact` is requested, project to these fields instead of the
+    /// generic null/empty drop. `None` → generic compaction.
+    compact_fields: Option<Vec<String>>,
 }
 
 impl CommandOutput {
@@ -329,6 +425,8 @@ impl CommandOutput {
         Self {
             result,
             next_actions: Vec::new(),
+            exit_code: None,
+            compact_fields: None,
         }
     }
 
@@ -339,6 +437,36 @@ impl CommandOutput {
         Ok(Self::new(serde_json::to_value(value)?))
     }
 
+    /// Build a bounded list result: `{ items, count, total, truncated }`.
+    /// `count == total` and `truncated == false`.
+    pub fn list(items: Vec<Value>) -> Self {
+        let total = items.len();
+        Self::list_truncated(items, total)
+    }
+
+    /// Build a bounded list result where `total` may exceed the returned
+    /// items. When truncated, a `guidance` string nudges the agent to narrow
+    /// the query (the framework also always offers the command template as a
+    /// `next_action`).
+    pub fn list_truncated(items: Vec<Value>, total: usize) -> Self {
+        let count = items.len();
+        let truncated = count < total;
+        let mut result = serde_json::Map::new();
+        result.insert("items".to_string(), Value::Array(items));
+        result.insert("count".to_string(), json!(count));
+        result.insert("total".to_string(), json!(total));
+        result.insert("truncated".to_string(), json!(truncated));
+        if truncated {
+            result.insert(
+                "guidance".to_string(),
+                json!(format!(
+                    "Showing {count} of {total} results. Narrow with --limit, --select, or filter flags."
+                )),
+            );
+        }
+        Self::new(Value::Object(result))
+    }
+
     pub fn next_action(mut self, action: NextAction) -> Self {
         self.next_actions.push(action);
         self
@@ -346,6 +474,24 @@ impl CommandOutput {
 
     pub fn next_actions(mut self, actions: Vec<NextAction>) -> Self {
         self.next_actions.extend(actions);
+        self
+    }
+
+    /// Override the process exit code while still reporting success.
+    pub fn exit_code(mut self, code: i32) -> Self {
+        self.exit_code = Some(code);
+        self
+    }
+
+    /// Declare the high-gravity fields `--compact` should keep for this
+    /// output. Without this, `--compact` falls back to dropping null/empty
+    /// fields generically.
+    pub fn compact_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.compact_fields = Some(fields.into_iter().map(Into::into).collect());
         self
     }
 }
@@ -358,6 +504,10 @@ pub struct CommandError {
     pub fix: String,
     pub retryable: bool,
     pub next_actions: Vec<NextAction>,
+    /// Optional typed process exit code. `None` → [`ExitCode::ERROR`]. Set it
+    /// with [`CommandError::exit_code`] using an [`ExitCode`] constant so an
+    /// agent can branch on the failure class without parsing the message.
+    pub exit_code: Option<i32>,
 }
 
 impl fmt::Display for CommandError {
@@ -380,11 +530,18 @@ impl CommandError {
             fix: fix.into(),
             retryable: false,
             next_actions: Vec::new(),
+            exit_code: None,
         }
     }
 
     pub fn retryable(mut self, retryable: bool) -> Self {
         self.retryable = retryable;
+        self
+    }
+
+    /// Set the typed process exit code (use an [`ExitCode`] constant).
+    pub fn exit_code(mut self, code: i32) -> Self {
+        self.exit_code = Some(code);
         self
     }
 
@@ -585,6 +742,7 @@ pub struct AgentCli {
     schema_version: Option<String>,
     commands: BTreeMap<String, Command>,
     root_extra: Map<String, Value>,
+    reserved_flags: bool,
 }
 
 impl fmt::Debug for AgentCli {
@@ -607,11 +765,24 @@ impl AgentCli {
             schema_version: None,
             commands: BTreeMap::new(),
             root_extra: Map::new(),
+            reserved_flags: true,
         }
     }
 
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
+        self
+    }
+
+    /// Toggle the framework-reserved agent-native flags (`--select`,
+    /// `--compact`, `--quiet`, and the rest of [`RESERVED_BOOL_FLAGS`]).
+    ///
+    /// Enabled by default: every command transparently supports them and the
+    /// framework applies `--select`/`--compact`/`--quiet` to the result.
+    /// Disable to take full manual control of flag parsing and output when a
+    /// command needs one of these names with conflicting semantics.
+    pub fn reserved_flags(mut self, enabled: bool) -> Self {
+        self.reserved_flags = enabled;
         self
     }
 
@@ -633,6 +804,148 @@ impl AgentCli {
     pub fn root_field(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.root_extra.insert(key.into(), value.into());
         self
+    }
+
+    /// Register a built-in `doctor` command that runs `checks` and reports a
+    /// structured health envelope `{ healthy, checks: [...] }`. When any check
+    /// fails the command still returns an `ok: true` envelope (the report
+    /// succeeded) but carries the failing check's exit code so a shell or
+    /// agent sees a non-zero status. See [`Check`] and [`CheckResult`].
+    pub fn doctor(self, checks: Vec<Check>) -> Self {
+        let usage = format!("{} doctor", self.name);
+        let checks = Arc::new(checks);
+        let command = Command::new("doctor", "Run environment health checks")
+            .usage(usage)
+            .handler(move |_req, _ctx| {
+                let checks = Arc::clone(&checks);
+                Box::pin(async move {
+                    let mut entries = Vec::with_capacity(checks.len());
+                    let mut healthy = true;
+                    let mut fail_exit = ExitCode::SUCCESS;
+                    for check in checks.iter() {
+                        let result = check.run().await;
+                        if !result.ok && healthy {
+                            // First failure determines the exit code.
+                            healthy = false;
+                            fail_exit = check.exit_code;
+                        }
+                        let mut entry = Map::new();
+                        entry.insert("name".to_string(), json!(check.name()));
+                        entry.insert("ok".to_string(), json!(result.ok));
+                        if let Some(detail) = result.detail {
+                            entry.insert("detail".to_string(), json!(detail));
+                        }
+                        if let Some(fix) = result.fix {
+                            entry.insert("fix".to_string(), json!(fix));
+                        }
+                        entries.push(Value::Object(entry));
+                    }
+                    let mut output = CommandOutput::new(json!({
+                        "healthy": healthy,
+                        "checks": entries,
+                    }));
+                    if !healthy {
+                        output = output.exit_code(fail_exit);
+                    }
+                    Ok(output)
+                })
+            });
+        self.command(command)
+    }
+
+    /// Statically audit this CLI definition. Validates HATEOAS integrity
+    /// (every declared `next_action` resolves to a real command), surfaces
+    /// dead-end and undocumented commands, and returns a structured
+    /// [`AuditReport`]. Intended for a downstream test:
+    /// `assert!(cli.audit().is_clean())`.
+    pub fn audit(&self) -> AuditReport {
+        let mut report = AuditReport::default();
+        let mut path_buf: Vec<&str> = Vec::new();
+        self.audit_commands(&self.commands, &mut path_buf, &mut report, 0);
+        report
+    }
+
+    fn audit_commands<'a>(
+        &self,
+        commands: &'a BTreeMap<String, Command>,
+        path_buf: &mut Vec<&'a str>,
+        report: &mut AuditReport,
+        depth: usize,
+    ) {
+        if depth >= MAX_COMMAND_DEPTH {
+            return;
+        }
+        for command in commands.values() {
+            path_buf.push(&command.name);
+            let path = path_buf.join(" ");
+
+            if command.handler.is_none() && command.subcommands.is_empty() {
+                report.push(
+                    AuditSeverity::Error,
+                    "DEAD_END_COMMAND",
+                    &path,
+                    "command has neither a handler nor subcommands; invoking it always errors",
+                );
+            }
+            if command.description.trim().is_empty() {
+                report.push(
+                    AuditSeverity::Warning,
+                    "EMPTY_DESCRIPTION",
+                    &path,
+                    "command has an empty description; agents rely on it to choose commands",
+                );
+            }
+            if command.handler.is_some() && command.usage.is_none() {
+                report.push(
+                    AuditSeverity::Warning,
+                    "MISSING_USAGE",
+                    &path,
+                    "handler command has no usage string; a framework default is used instead",
+                );
+            }
+            for action in &command.default_next_actions {
+                if !self.next_action_resolves(&action.command) {
+                    report.push(
+                        AuditSeverity::Error,
+                        "DANGLING_NEXT_ACTION",
+                        &path,
+                        format!(
+                            "default next_action `{}` does not resolve to a known command",
+                            action.command
+                        ),
+                    );
+                }
+            }
+
+            self.audit_commands(&command.subcommands, path_buf, report, depth + 1);
+            path_buf.pop();
+        }
+    }
+
+    /// True if the leading command tokens of a `next_action` template resolve
+    /// to a real command path. Parsing stops at the first placeholder/flag
+    /// token (`<arg>`, `[--flag]`, `-x`, `key=value`). A bare program-name
+    /// reference (or empty) is treated as the valid root affordance.
+    fn next_action_resolves(&self, template: &str) -> bool {
+        let mut tokens = template.split_whitespace().peekable();
+        if tokens.peek() == Some(&self.name.as_str()) {
+            tokens.next();
+        }
+        let mut commands = &self.commands;
+        for token in tokens {
+            if token.starts_with('<')
+                || token.starts_with('[')
+                || token.starts_with('-')
+                || token.contains('=')
+            {
+                break;
+            }
+            match commands.get(token) {
+                Some(found) => commands = &found.subcommands,
+                None => return false,
+            }
+        }
+        true
     }
 
     pub async fn run_env(&self) -> Execution {
@@ -670,9 +983,10 @@ impl AgentCli {
 
         let preliminary_path = self.preliminary_command_path(&argv);
         let bool_flags = Self::path_bool_flag_set(&preliminary_path);
+        let reserved = self.reserved_flags;
         let invocation =
             match parse_invocation_with_bool_flags(argv.iter().map(String::as_str), |flag| {
-                bool_flags.contains(flag)
+                bool_flags.contains(flag) || (reserved && is_reserved_bool(flag))
             }) {
                 Ok(value) => value,
                 Err(error) => {
@@ -769,29 +1083,61 @@ impl AgentCli {
         let path_strs = path_refs(&resolved.path);
         match handler(&request, context).await {
             Ok(output) => {
+                let CommandOutput {
+                    mut result,
+                    next_actions: handler_actions,
+                    exit_code: output_exit,
+                    compact_fields,
+                } = output;
+                let mut next_actions =
+                    self.ensure_next_actions(handler_actions, &path_strs, command);
+
+                // Apply the framework-reserved output flags centrally so every
+                // command supports --select / --compact / --quiet for free.
+                if self.reserved_flags {
+                    if let Some(fields) = invocation.flag("select").map(parse_select_fields)
+                        && !fields.is_empty()
+                    {
+                        result = project::select(&result, &fields);
+                    }
+                    if invocation.flag("compact").is_some() {
+                        result = match &compact_fields {
+                            Some(fields) => {
+                                let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+                                project::select(&result, &refs)
+                            }
+                            None => project::compact(&result),
+                        };
+                    }
+                    if invocation.flag("quiet").is_some() {
+                        next_actions.clear();
+                    }
+                }
+
+                let envelope = self
+                    .success_envelope(invocation.into_command_line(), result, next_actions)
+                    .exit_code(output_exit.unwrap_or(ExitCode::SUCCESS));
+                Execution {
+                    envelope: envelope.into(),
+                }
+            }
+            Err(error) => {
+                let exit = error.exit_code.unwrap_or(ExitCode::ERROR);
                 let next_actions =
-                    self.ensure_next_actions(output.next_actions, &path_strs, command);
+                    self.ensure_next_actions(error.next_actions, &path_strs, command);
                 Execution {
                     envelope: self
-                        .success_envelope(
+                        .build_error_envelope(
                             invocation.into_command_line(),
-                            output.result,
+                            error.message,
+                            error.code,
+                            error.fix,
+                            error.retryable,
+                            exit,
                             next_actions,
                         )
                         .into(),
                 }
-            }
-            Err(error) => {
-                let next_actions =
-                    self.ensure_next_actions(error.next_actions, &path_strs, command);
-                self.error_execution(
-                    invocation.into_command_line(),
-                    error.message,
-                    error.code,
-                    error.fix,
-                    error.retryable,
-                    next_actions,
-                )
             }
         }
     }
@@ -989,6 +1335,11 @@ impl AgentCli {
         actions
     }
 
+    /// Build an error `Execution` for a *framework-raised* error. Every such
+    /// error (parse failure, unknown command/subcommand, missing handler) is
+    /// a usage error, so it carries [`ExitCode::USAGE`]. Handler-raised errors
+    /// do not go through here — they honor the handler's own exit code in the
+    /// `run_argv_with_context` error branch.
     fn error_execution(
         &self,
         command: String,
@@ -998,14 +1349,41 @@ impl AgentCli {
         retryable: bool,
         next_actions: Vec<NextAction>,
     ) -> Execution {
-        let mut envelope =
-            ErrorEnvelope::new(command, message, code, fix, next_actions).retryable(retryable);
+        Execution {
+            envelope: self
+                .build_error_envelope(
+                    command,
+                    message,
+                    code,
+                    fix,
+                    retryable,
+                    ExitCode::USAGE,
+                    next_actions,
+                )
+                .into(),
+        }
+    }
+
+    /// Construct an [`ErrorEnvelope`] with an explicit exit code, applying the
+    /// CLI's `schema_version` if set.
+    #[allow(clippy::too_many_arguments)]
+    fn build_error_envelope(
+        &self,
+        command: String,
+        message: impl Into<String>,
+        code: impl Into<String>,
+        fix: impl Into<String>,
+        retryable: bool,
+        exit_code: i32,
+        next_actions: Vec<NextAction>,
+    ) -> ErrorEnvelope {
+        let mut envelope = ErrorEnvelope::new(command, message, code, fix, next_actions)
+            .retryable(retryable)
+            .exit_code(exit_code);
         if let Some(ref sv) = self.schema_version {
             envelope = envelope.schema_version(sv.clone());
         }
-        Execution {
-            envelope: envelope.into(),
-        }
+        envelope
     }
 
     /// Build command docs using push/pop pattern to avoid quadratic cloning.
@@ -1080,9 +1458,10 @@ impl AgentCli {
     /// the resolved path — never flags declared by unrelated siblings.
     fn preliminary_command_path<'a>(&'a self, argv: &[String]) -> Vec<&'a Command> {
         let union_bools = self.global_bool_flag_set();
+        let reserved = self.reserved_flags;
         let invocation =
             match parse_invocation_with_bool_flags(argv.iter().map(String::as_str), |flag| {
-                union_bools.contains(flag)
+                union_bools.contains(flag) || (reserved && is_reserved_bool(flag))
             }) {
                 Ok(value) => value,
                 Err(_) => return Vec::new(),
@@ -1303,7 +1682,9 @@ mod tests {
         assert_eq!(envelope.error.code, "UNKNOWN_COMMAND");
         assert!(!envelope.fix.is_empty());
         assert!(!envelope.next_actions.is_empty());
-        assert_eq!(run.exit_code(), 1);
+        // Framework usage errors carry the typed USAGE exit code (2), not the
+        // generic error code (1), so agents can distinguish bad invocations.
+        assert_eq!(run.exit_code(), ExitCode::USAGE);
     }
 
     #[tokio::test]
@@ -1764,5 +2145,286 @@ mod tests {
             .expect("params should be present");
         assert_eq!(params.get("env").unwrap().required, Some(true));
         assert_eq!(params.get("tag").unwrap().required, Some(false));
+    }
+
+    // --- Typed exit codes ---
+
+    fn rich_cli() -> AgentCli {
+        AgentCli::new("app", "Rich output CLI").command(
+            Command::new("get", "Get a record")
+                .usage("app get <id>")
+                .handler(|_req, _ctx| {
+                    Box::pin(async move {
+                        Ok(CommandOutput::new(json!({
+                            "id": 1,
+                            "name": "widget",
+                            "note": null,
+                            "tags": [],
+                            "body": "a very long body field"
+                        })))
+                    })
+                }),
+        )
+    }
+
+    #[tokio::test]
+    async fn handler_error_exit_code_is_honored() {
+        let cli = AgentCli::new("app", "x").command(Command::new("find", "find").handler(
+            |_req, _ctx| {
+                Box::pin(async move {
+                    Err(CommandError::new("nope", "NOT_FOUND", "Check the id")
+                        .exit_code(ExitCode::NOT_FOUND))
+                })
+            },
+        ));
+        let run = cli.run_argv(["app", "find"]).await;
+        assert_eq!(run.exit_code(), ExitCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn handler_error_without_exit_code_defaults_to_one() {
+        let cli = AgentCli::new("app", "x").command(Command::new("boom", "boom").handler(
+            |_req, _ctx| Box::pin(async move { Err(CommandError::new("kaboom", "BOOM", "retry")) }),
+        ));
+        let run = cli.run_argv(["app", "boom"]).await;
+        assert_eq!(run.exit_code(), ExitCode::ERROR);
+    }
+
+    #[tokio::test]
+    async fn parse_error_carries_usage_exit_code() {
+        let cli = rich_cli();
+        // A lone `--` is fine; `--=x` is invalid flag syntax → PARSE_ERROR.
+        let run = cli.run_argv(["app", "--=oops"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error envelope");
+        };
+        assert_eq!(envelope.error.code, "PARSE_ERROR");
+        assert_eq!(run.exit_code(), ExitCode::USAGE);
+    }
+
+    // --- Reserved output flags: --select / --compact / --quiet ---
+
+    #[tokio::test]
+    async fn select_projects_result_fields() {
+        let cli = rich_cli();
+        let run = cli
+            .run_argv(["app", "get", "1", "--select", "id,name"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result, json!({ "id": 1, "name": "widget" }));
+    }
+
+    #[tokio::test]
+    async fn compact_drops_null_and_empty_fields() {
+        let cli = rich_cli();
+        let run = cli.run_argv(["app", "get", "1", "--compact"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        // note (null) and tags ([]) are dropped; the rest remain.
+        assert_eq!(
+            envelope.result,
+            json!({ "id": 1, "name": "widget", "body": "a very long body field" })
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_honors_high_gravity_allowlist() {
+        let cli =
+            AgentCli::new("app", "x").command(Command::new("get", "get").handler(|_req, _ctx| {
+                Box::pin(async move {
+                    Ok(
+                        CommandOutput::new(json!({ "id": 1, "name": "x", "body": "huge" }))
+                            .compact_fields(["id", "name"]),
+                    )
+                })
+            }));
+        let run = cli.run_argv(["app", "get", "--compact"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result, json!({ "id": 1, "name": "x" }));
+    }
+
+    #[tokio::test]
+    async fn quiet_drops_next_actions() {
+        let cli = rich_cli();
+        let run = cli.run_argv(["app", "get", "1", "--quiet"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert!(envelope.next_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserved_flags_can_be_disabled() {
+        // With reserved flags off, --select is just an ordinary flag and the
+        // result passes through untouched.
+        let cli = rich_cli().reserved_flags(false);
+        let run = cli.run_argv(["app", "get", "1", "--select", "id"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert!(envelope.result.get("body").is_some());
+    }
+
+    // --- Standard flag accessors ---
+
+    #[tokio::test]
+    async fn standard_flag_accessors_read_convention_flags() {
+        let cli =
+            AgentCli::new("app", "x").command(Command::new("run", "run").handler(|req, _ctx| {
+                let flags = json!({
+                    "dry_run": req.dry_run(),
+                    "assume_yes": req.assume_yes(),
+                    "no_cache": req.no_cache(),
+                    "wants_stdin": req.wants_stdin(),
+                });
+                Box::pin(async move { Ok(CommandOutput::new(flags)) })
+            }));
+        let run = cli
+            .run_argv([
+                "app",
+                "run",
+                "--dry-run",
+                "--no-input",
+                "--no-cache",
+                "--stdin",
+            ])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["dry_run"], json!(true));
+        assert_eq!(envelope.result["assume_yes"], json!(true)); // --no-input aliases --yes
+        assert_eq!(envelope.result["no_cache"], json!(true));
+        assert_eq!(envelope.result["wants_stdin"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn reserved_bool_flag_does_not_swallow_positional() {
+        // `--dry-run` is a framework-reserved bool, so `get --dry-run 1` keeps
+        // `1` as the positional id even though `--dry-run` precedes it.
+        let cli =
+            AgentCli::new("app", "x").command(Command::new("get", "get").handler(|req, _ctx| {
+                let id = req.arg(0).unwrap_or("none").to_string();
+                let dry = req.dry_run();
+                Box::pin(async move { Ok(CommandOutput::new(json!({ "id": id, "dry": dry }))) })
+            }));
+        let run = cli.run_argv(["app", "get", "--dry-run", "1"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result, json!({ "id": "1", "dry": true }));
+    }
+
+    // --- Bounded list output ---
+
+    #[tokio::test]
+    async fn list_truncated_emits_bounded_envelope() {
+        let cli =
+            AgentCli::new("app", "x").command(Command::new("ls", "list").handler(|_req, _ctx| {
+                Box::pin(
+                    async move { Ok(CommandOutput::list_truncated(vec![json!({ "id": 1 })], 50)) },
+                )
+            }));
+        let run = cli.run_argv(["app", "ls"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["count"], json!(1));
+        assert_eq!(envelope.result["total"], json!(50));
+        assert_eq!(envelope.result["truncated"], json!(true));
+        assert!(envelope.result["guidance"].is_string());
+    }
+
+    #[tokio::test]
+    async fn list_full_has_no_guidance() {
+        let items = vec![json!({ "id": 1 }), json!({ "id": 2 })];
+        let cli = AgentCli::new("app", "x").command(Command::new("ls", "list").handler(
+            move |_req, _ctx| {
+                let items = items.clone();
+                Box::pin(async move { Ok(CommandOutput::list(items)) })
+            },
+        ));
+        let run = cli.run_argv(["app", "ls"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["truncated"], json!(false));
+        assert!(envelope.result.get("guidance").is_none());
+    }
+
+    // --- Static audit ---
+
+    #[test]
+    fn audit_clean_cli_is_clean() {
+        let cli = sample_cli();
+        let report = cli.audit();
+        assert!(
+            report.is_clean(),
+            "unexpected findings: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn audit_flags_dangling_next_action() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("a", "Command A")
+                .usage("app a")
+                .handler(|_req, _ctx| Box::pin(async move { Ok(CommandOutput::new(json!({}))) }))
+                .default_next_action(NextAction::new("app nonexistent", "go nowhere")),
+        );
+        let report = cli.audit();
+        assert!(!report.is_clean());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == "DANGLING_NEXT_ACTION")
+        );
+    }
+
+    #[test]
+    fn audit_flags_dead_end_command() {
+        let cli = AgentCli::new("app", "x").command(Command::new("orphan", "no handler, no subs"));
+        let report = cli.audit();
+        assert!(report.findings.iter().any(|f| f.code == "DEAD_END_COMMAND"));
+        assert!(!report.is_clean());
+    }
+
+    // --- Doctor ---
+
+    #[tokio::test]
+    async fn doctor_reports_healthy_when_all_checks_pass() {
+        let cli = AgentCli::new("app", "x").doctor(vec![Check::new("ping", || {
+            Box::pin(async { crate::CheckResult::pass_with("ok") })
+        })]);
+        let run = cli.run_argv(["app", "doctor"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["healthy"], json!(true));
+        assert_eq!(run.exit_code(), ExitCode::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn doctor_failing_check_sets_exit_code() {
+        let cli = AgentCli::new("app", "x").doctor(vec![
+            Check::new("auth", || {
+                Box::pin(async { crate::CheckResult::fail("no token", "Set API_TOKEN") })
+            })
+            .exit_code(ExitCode::AUTH),
+        ]);
+        let run = cli.run_argv(["app", "doctor"]).await;
+        // Still an ok:true envelope — the report succeeded — but exit code 4.
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["healthy"], json!(false));
+        assert_eq!(run.exit_code(), ExitCode::AUTH);
     }
 }

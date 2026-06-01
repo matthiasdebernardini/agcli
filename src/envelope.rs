@@ -11,6 +11,36 @@ fn epoch_secs() -> u64 {
         .as_secs()
 }
 
+/// Typed process exit codes for agent self-correction.
+///
+/// Agents (and shells) branch on the integer exit status without parsing
+/// error text. The taxonomy mirrors the conventions popularized by
+/// agent-native CLI generators: a distinct code per failure class so a
+/// caller can decide whether to retry, re-authenticate, or fix arguments.
+///
+/// These are process exit codes only — they are intentionally *not*
+/// serialized into the JSON envelope, which already conveys semantics via
+/// `ok` and `error.code`. Use them with [`crate::CommandError::exit_code`]
+/// and [`crate::CommandOutput::exit_code`].
+pub struct ExitCode;
+
+impl ExitCode {
+    /// Command succeeded.
+    pub const SUCCESS: i32 = 0;
+    /// Generic, unclassified failure (the default for handler errors).
+    pub const ERROR: i32 = 1;
+    /// Bad invocation: unknown command, bad flag, missing argument.
+    pub const USAGE: i32 = 2;
+    /// A requested resource does not exist.
+    pub const NOT_FOUND: i32 = 3;
+    /// Authentication or authorization failure.
+    pub const AUTH: i32 = 4;
+    /// An upstream/API call failed.
+    pub const API: i32 = 5;
+    /// The caller is being rate limited and should back off.
+    pub const RATE_LIMITED: i32 = 7;
+}
+
 /// HATEOAS action template that tells an agent what to run next.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
@@ -136,6 +166,10 @@ pub struct SuccessEnvelope {
     pub schema_version: Option<String>,
     pub result: Value,
     pub next_actions: Vec<NextAction>,
+    /// Process exit code. Defaults to [`ExitCode::SUCCESS`]. A handler may
+    /// override it (e.g. a `doctor` command reporting an unhealthy system
+    /// while still producing a valid `ok: true` envelope). Not serialized.
+    pub exit_code: i32,
 }
 
 impl SuccessEnvelope {
@@ -146,6 +180,7 @@ impl SuccessEnvelope {
             schema_version: None,
             result,
             next_actions,
+            exit_code: ExitCode::SUCCESS,
         }
     }
 
@@ -153,16 +188,22 @@ impl SuccessEnvelope {
         self.schema_version = Some(version.into());
         self
     }
+
+    pub fn exit_code(mut self, code: i32) -> Self {
+        self.exit_code = code;
+        self
+    }
 }
 
 impl Serialize for SuccessEnvelope {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let field_count = 5 + usize::from(self.schema_version.is_some());
+        let field_count = 6 + usize::from(self.schema_version.is_some());
         let mut s = serializer.serialize_struct("SuccessEnvelope", field_count)?;
         s.serialize_field("ok", &true)?;
         s.serialize_field("command", &self.command)?;
         s.serialize_field("timestamp", &self.timestamp)?;
+        s.serialize_field("exit_code", &self.exit_code)?;
         if let Some(ref sv) = self.schema_version {
             s.serialize_field("schema_version", sv)?;
         }
@@ -185,6 +226,8 @@ impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
             #[serde(default)]
             timestamp: u64,
             #[serde(default)]
+            exit_code: i32,
+            #[serde(default)]
             schema_version: Option<String>,
             result: Value,
             next_actions: Vec<NextAction>,
@@ -201,6 +244,7 @@ impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
             schema_version: raw.schema_version,
             result: raw.result,
             next_actions: raw.next_actions,
+            exit_code: raw.exit_code,
         })
     }
 }
@@ -217,6 +261,9 @@ pub struct ErrorEnvelope {
     pub error: ErrorBody,
     pub fix: String,
     pub next_actions: Vec<NextAction>,
+    /// Process exit code. Defaults to [`ExitCode::ERROR`]. Not serialized —
+    /// the JSON envelope already conveys the failure class via `error.code`.
+    pub exit_code: i32,
 }
 
 impl ErrorEnvelope {
@@ -234,6 +281,7 @@ impl ErrorEnvelope {
             error: ErrorBody::new(message, code),
             fix: fix.into(),
             next_actions,
+            exit_code: ExitCode::ERROR,
         }
     }
 
@@ -246,16 +294,22 @@ impl ErrorEnvelope {
         self.schema_version = Some(version.into());
         self
     }
+
+    pub fn exit_code(mut self, code: i32) -> Self {
+        self.exit_code = code;
+        self
+    }
 }
 
 impl Serialize for ErrorEnvelope {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let field_count = 6 + usize::from(self.schema_version.is_some());
+        let field_count = 7 + usize::from(self.schema_version.is_some());
         let mut s = serializer.serialize_struct("ErrorEnvelope", field_count)?;
         s.serialize_field("ok", &false)?;
         s.serialize_field("command", &self.command)?;
         s.serialize_field("timestamp", &self.timestamp)?;
+        s.serialize_field("exit_code", &self.exit_code)?;
         if let Some(ref sv) = self.schema_version {
             s.serialize_field("schema_version", sv)?;
         }
@@ -272,12 +326,17 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
     where
         D: serde::Deserializer<'de>,
     {
+        fn default_error_exit_code() -> i32 {
+            ExitCode::ERROR
+        }
         #[derive(serde::Deserialize)]
         struct Raw {
             ok: bool,
             command: String,
             #[serde(default)]
             timestamp: u64,
+            #[serde(default = "default_error_exit_code")]
+            exit_code: i32,
             #[serde(default)]
             schema_version: Option<String>,
             error: ErrorBody,
@@ -297,6 +356,7 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
             error: raw.error,
             fix: raw.fix,
             next_actions: raw.next_actions,
+            exit_code: raw.exit_code,
         })
     }
 }
@@ -345,7 +405,10 @@ impl Envelope {
     }
 
     pub fn exit_code(&self) -> i32 {
-        if self.ok() { 0 } else { 1 }
+        match self {
+            Self::Success(value) => value.exit_code,
+            Self::Error(value) => value.exit_code,
+        }
     }
 
     pub fn to_json(&self) -> String {
@@ -402,8 +465,18 @@ mod tests {
         );
         assert!(encoded["timestamp"].is_u64());
         assert!(encoded["next_actions"].is_array());
+        // exit_code is always present; success defaults to 0.
+        assert_eq!(encoded["exit_code"], json!(0));
         // schema_version omitted when None
         assert!(encoded.get("schema_version").is_none());
+    }
+
+    #[test]
+    fn success_envelope_serializes_overridden_exit_code() {
+        let envelope = SuccessEnvelope::new("cmd", json!(null), vec![]).exit_code(4);
+        let encoded = serde_json::to_value(&envelope).expect("must serialize");
+        assert_eq!(encoded["ok"], Value::Bool(true));
+        assert_eq!(encoded["exit_code"], json!(4));
     }
 
     #[test]
@@ -435,8 +508,18 @@ mod tests {
             encoded["fix"],
             Value::String("Use valid JSON input".to_string())
         );
+        // exit_code is always present; errors default to 1.
+        assert_eq!(encoded["exit_code"], json!(1));
         // schema_version omitted when None
         assert!(encoded.get("schema_version").is_none());
+    }
+
+    #[test]
+    fn error_envelope_serializes_typed_exit_code() {
+        let envelope =
+            ErrorEnvelope::new("cmd", "missing", "NOT_FOUND", "check id", vec![]).exit_code(3);
+        let encoded = serde_json::to_value(&envelope).expect("must serialize");
+        assert_eq!(encoded["exit_code"], json!(3));
     }
 
     #[test]
@@ -457,10 +540,12 @@ mod tests {
             json!({ "data": 42 }),
             vec![NextAction::new("test cmd", "Run again")],
         )
-        .schema_version("test.v1");
+        .schema_version("test.v1")
+        .exit_code(2);
         let json = serde_json::to_string(&original).expect("must serialize");
         let decoded: SuccessEnvelope = serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(original, decoded);
+        assert_eq!(decoded.exit_code, 2);
     }
 
     #[cfg(feature = "deserialize")]
@@ -468,10 +553,12 @@ mod tests {
     fn error_envelope_roundtrips() {
         let original = ErrorEnvelope::new("test cmd", "oops", "ERR", "fix it", vec![])
             .retryable(true)
-            .schema_version("test.v1");
+            .schema_version("test.v1")
+            .exit_code(7);
         let json = serde_json::to_string(&original).expect("must serialize");
         let decoded: ErrorEnvelope = serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(original, decoded);
+        assert_eq!(decoded.exit_code, 7);
     }
 
     #[cfg(feature = "deserialize")]

@@ -63,6 +63,7 @@ pub enum StreamEvent {
     Result {
         command: String,
         timestamp: u64,
+        exit_code: i32,
         schema_version: Option<String>,
         result: Value,
         next_actions: Vec<NextAction>,
@@ -70,6 +71,7 @@ pub enum StreamEvent {
     Error {
         command: String,
         timestamp: u64,
+        exit_code: i32,
         schema_version: Option<String>,
         error: ErrorBody,
         fix: String,
@@ -147,16 +149,18 @@ impl Serialize for StreamEvent {
             Self::Result {
                 command,
                 timestamp,
+                exit_code,
                 schema_version,
                 result,
                 next_actions,
             } => {
-                let count = 6 + usize::from(schema_version.is_some());
+                let count = 7 + usize::from(schema_version.is_some());
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("type", "result")?;
                 map.serialize_entry("ok", &true)?;
                 map.serialize_entry("command", command)?;
                 map.serialize_entry("timestamp", timestamp)?;
+                map.serialize_entry("exit_code", exit_code)?;
                 if let Some(sv) = schema_version {
                     map.serialize_entry("schema_version", sv)?;
                 }
@@ -167,17 +171,19 @@ impl Serialize for StreamEvent {
             Self::Error {
                 command,
                 timestamp,
+                exit_code,
                 schema_version,
                 error,
                 fix,
                 next_actions,
             } => {
-                let count = 7 + usize::from(schema_version.is_some());
+                let count = 8 + usize::from(schema_version.is_some());
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("type", "error")?;
                 map.serialize_entry("ok", &false)?;
                 map.serialize_entry("command", command)?;
                 map.serialize_entry("timestamp", timestamp)?;
+                map.serialize_entry("exit_code", exit_code)?;
                 if let Some(sv) = schema_version {
                     map.serialize_entry("schema_version", sv)?;
                 }
@@ -203,6 +209,14 @@ fn opt_str_field(v: &Value, key: &str) -> Option<String> {
 #[cfg(feature = "deserialize")]
 fn u64_field(v: &Value, key: &str, default: u64) -> u64 {
     v.get(key).and_then(Value::as_u64).unwrap_or(default)
+}
+
+#[cfg(feature = "deserialize")]
+fn i32_field(v: &Value, key: &str, default: i32) -> i32 {
+    v.get(key)
+        .and_then(Value::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(default)
 }
 
 #[cfg(feature = "deserialize")]
@@ -272,6 +286,7 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 Ok(Self::Result {
                     command: str_field(&value, "command"),
                     timestamp: u64_field(&value, "timestamp", 0),
+                    exit_code: i32_field(&value, "exit_code", 0),
                     schema_version: opt_str_field(&value, "schema_version"),
                     result: value_field(&value, "result"),
                     next_actions: parse_field(&value, "next_actions", Value::Array(vec![]))?,
@@ -287,6 +302,7 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 Ok(Self::Error {
                     command: str_field(&value, "command"),
                     timestamp: u64_field(&value, "timestamp", 0),
+                    exit_code: i32_field(&value, "exit_code", 1),
                     schema_version: opt_str_field(&value, "schema_version"),
                     error: parse_field(&value, "error", Value::Null)?,
                     fix: str_field(&value, "fix"),
@@ -305,6 +321,7 @@ impl StreamEvent {
         Self::Result {
             command: envelope.command,
             timestamp: envelope.timestamp,
+            exit_code: envelope.exit_code,
             schema_version: envelope.schema_version,
             result: envelope.result,
             next_actions: envelope.next_actions,
@@ -315,6 +332,7 @@ impl StreamEvent {
         Self::Error {
             command: envelope.command,
             timestamp: envelope.timestamp,
+            exit_code: envelope.exit_code,
             schema_version: envelope.schema_version,
             error: envelope.error,
             fix: envelope.fix,

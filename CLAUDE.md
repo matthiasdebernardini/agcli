@@ -160,6 +160,7 @@ cargo build --release
   "ok": true,
   "command": "calc add 3 5",
   "timestamp": 1740000000,
+  "exit_code": 0,
   "result": {
     "operation": "add",
     "a": 3.0,
@@ -194,6 +195,7 @@ cargo build --release
   "ok": false,
   "command": "calc add foo bar",
   "timestamp": 1740000000,
+  "exit_code": 1,
   "error": {
     "message": "argument <a> is not a number",
     "code": "INVALID_NUMBER",
@@ -219,7 +221,8 @@ cargo build --release
 
 ## Key patterns
 
-- **Envelope structure**: Every response has `ok`, `command`, `timestamp`, `result`/`error`, `next_actions`
+- **Envelope structure**: Every response has `ok`, `command`, `timestamp`, `exit_code`, `result`/`error`, `next_actions`
+- **Typed exit codes**: `exit_code` is both the process status and a JSON field. Framework usage errors are `2`; handler errors default to `1` and opt into `ExitCode::{NOT_FOUND, AUTH, API, RATE_LIMITED, …}` via `CommandError::exit_code(...)`
 - **Template vs literal next_actions**: When `params` is present, `command` is a template (agent fills placeholders). When absent, it's literal (run as-is).
 - **Pre-filled values**: Use `ActionParam::new().value(json!(result))` to pre-fill context from the current operation
 - **Error with fix**: `CommandError::new(message, code, fix)` - always tell the agent how to recover

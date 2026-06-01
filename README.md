@@ -6,7 +6,10 @@ It is built around the design in [design.md](design.md):
 - JSON-only envelopes
 - HATEOAS `next_actions`
 - self-documenting root command tree
-- context-safe output truncation
+- typed exit codes for agent self-correction
+- agent-native output flags (`--select`, `--compact`, `--quiet`) on every command
+- context-safe output truncation and bounded list output
+- built-in `doctor` health checks and a static command-tree self-audit
 - typed NDJSON streaming with terminal `result`/`error`
 
 ## Why terminal envelopes and truncation pointers matter
@@ -72,6 +75,84 @@ so `mycli submit --no-git ./plan.html` works as expected.
 For value flags or undeclared flags, a bare `--key` followed by a non-flag
 token consumes that token as the value (`--key value` ≡ `--key=value`). Use
 `--key=true` or `--` to force a positional after an undeclared boolean.
+
+## Agent-native flags
+
+Every command supports a reserved vocabulary of agent-native flags without
+declaring them. The framework applies three of them to the result centrally,
+so any command gets token-economy output for free:
+
+| Flag | Effect |
+|------|--------|
+| `--select=a,b,c` | Project the result to only these fields (top-level keys or `a.b` dot paths; maps over arrays). |
+| `--compact` | Drop `null` and empty fields. A command may instead declare `CommandOutput::compact_fields([...])` to keep an explicit high-gravity allowlist. |
+| `--quiet` | Omit `next_actions` from the envelope. |
+
+The rest are parsed as booleans anywhere on the line and exposed via typed
+accessors on `CommandRequest`, for the handler to act on:
+
+`--dry-run` → `req.dry_run()`, `--yes`/`--no-input` → `req.assume_yes()`,
+`--no-cache` → `req.no_cache()`, `--no-color` → `req.no_color()`,
+`--stdin` → `req.wants_stdin()` (pair with `agcli::read_stdin().await`).
+
+These names are reserved while enabled (the default). If a command needs one
+with conflicting semantics, opt out per-CLI with `AgentCli::reserved_flags(false)`.
+
+```rust
+// `app get 1 --select id,name --compact` → result projected and compacted,
+// even though `get` never declared those flags.
+```
+
+## Typed exit codes
+
+Every envelope carries a typed exit code as a first-class field — both as the
+process exit status (`Execution::exit_code()`) **and** in the JSON
+(`"exit_code": N`) — so an agent can branch on the failure class whether it
+reads `$?` from a shell or parses stdout. Framework usage errors (unknown
+command, bad flag, missing handler) return `2`; handler errors default to `1`
+and opt into a typed code via `CommandError::exit_code(...)`.
+
+| `ExitCode` | Value | Meaning |
+|------------|-------|---------|
+| `SUCCESS` | 0 | Command succeeded |
+| `ERROR` | 1 | Generic failure (default for handler errors) |
+| `USAGE` | 2 | Bad invocation (framework-raised) |
+| `NOT_FOUND` | 3 | Requested resource missing |
+| `AUTH` | 4 | Auth/authorization failure |
+| `API` | 5 | Upstream/API call failed |
+| `RATE_LIMITED` | 7 | Back off and retry later |
+
+```rust
+Err(CommandError::new("no such issue", "NOT_FOUND", "Check the id")
+    .exit_code(agcli::ExitCode::NOT_FOUND))
+```
+
+```json
+{ "ok": false, "command": "app get 9", "timestamp": 1740000000,
+  "exit_code": 3, "error": { "message": "no such issue", "code": "NOT_FOUND",
+  "retryable": false }, "fix": "Check the id", "next_actions": [ ... ] }
+```
+
+## Bounded lists
+
+`CommandOutput::list(items)` and `CommandOutput::list_truncated(items, total)`
+emit a bounded `{ items, count, total, truncated }` result. When truncated,
+a `guidance` field tells the agent how to narrow the query.
+
+## Built-in `doctor` and self-audit
+
+`AgentCli::doctor(checks)` registers a `doctor` command that runs your
+[`Check`]s and reports `{ healthy, checks: [...] }`. A failing check still
+produces an `ok: true` envelope (the report ran) but carries that check's
+exit code (e.g. `ExitCode::AUTH`), so the shell sees a non-zero status.
+
+`AgentCli::audit()` statically validates the command tree and returns an
+`AuditReport`: it flags dangling `next_action` templates (HATEOAS integrity),
+dead-end commands, and missing usage/descriptions. Use it in a test:
+
+```rust
+assert!(cli.audit().is_clean());
+```
 
 ## Performance
 
