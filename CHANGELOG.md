@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.1](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.10.1) - 2026-06-01
+
+Documentation-only release.
+
+### Documentation
+
+- Drop the "Build-machine-specific codegen" (`target-cpu=native`) and PGO
+    tuning notes from the README's Performance section. These were niche
+    build-tuning tips unrelated to the framework; the section now covers only
+    the recommended release profile and allocator guidance.
+
 ## [0.10.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.10.0) - 2026-06-01
 
 Correctness and usability fixes from a multi-agent review (26 findings). These
