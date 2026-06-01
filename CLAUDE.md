@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-agcli = "0.8.1"
+agcli = "0.9.0"
 serde_json = "1"
 ```
 
@@ -232,13 +232,13 @@ cargo build --release
 
 ## Performance
 
-agcli targets **macOS and Linux only**. The crate ships with optimized release/bench profiles and an optional jemalloc feature. Downstream binaries get maximum runtime performance with these settings:
+agcli targets **macOS and Linux only**. The crate ships with optimized release/bench profiles. Downstream binaries get maximum runtime performance with these settings:
 
 ### Recommended `Cargo.toml` for downstream binaries
 
 ```toml
 [dependencies]
-agcli = { version = "0.8.1", features = ["jemalloc"] }
+agcli = "0.9.0"
 
 [profile.release]
 opt-level = 3
@@ -246,14 +246,13 @@ lto = "thin"
 codegen-units = 1
 ```
 
-### jemalloc setup
+### Allocator
 
-Enable the `jemalloc` feature and set the global allocator in your binary's `main.rs`:
+The default system allocator is the right choice for short-lived CLI processes. agcli does not bundle one. If you build a long-running, allocation-heavy CLI and *measure* a win, add `tikv-jemallocator` (or another allocator) directly in your binary:
 
 ```rust
-#[cfg(feature = "jemalloc")]
 #[global_allocator]
-static GLOBAL: agcli::Jemalloc = agcli::Jemalloc;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 ```
 
 ### Build-machine-specific codegen

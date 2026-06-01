@@ -2,6 +2,55 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.9.0) - 2026-06-01
+
+Folds the agent-native CLI strategies from
+[cli-printing-press](https://github.com/mvanhorn/cli-printing-press) into agcli,
+keeping only what a no-bloat framework should own.
+
+### Breaking changes
+
+- **Every envelope now serializes an `exit_code` field.** Both success and
+  error envelopes (and the NDJSON `result`/`error` terminal events) carry a
+  typed `exit_code` — success defaults `0`, errors default `1`. Consumers that
+  asserted an exact envelope key set will see the new field.
+- **Framework usage errors now exit `2` (were `1`).** Unknown command, unknown
+  subcommand, parse failures, and missing-handler errors return
+  `ExitCode::USAGE`. Handler errors without an explicit code still exit `1`.
+- **Removed the optional `jemalloc` feature and the `agcli::Jemalloc`
+  re-export.** jemalloc targets long-running, concurrent, allocation-heavy
+  processes; it does not fit short-lived CLIs and only added a C build step and
+  a platform caveat. The default system allocator is the right choice. A binary
+  that genuinely needs a custom allocator can add `tikv-jemallocator` directly
+  via `#[global_allocator]`.
+
+### Features
+
+- **Typed exit codes.** `ExitCode` taxonomy (`SUCCESS`, `ERROR`, `USAGE`,
+  `NOT_FOUND`, `AUTH`, `API`, `RATE_LIMITED`). Opt in from a handler with
+  `CommandError::exit_code(...)`; `CommandOutput::exit_code(...)` reports a
+  non-zero status while still emitting an `ok: true` envelope.
+- **Reserved agent-native output flags**, applied centrally to every command:
+  `--select=a,b,c` (field projection over objects and arrays), `--compact`
+  (drop null/empty, or a high-gravity allowlist via
+  `CommandOutput::compact_fields`), and `--quiet` (drop `next_actions`). Opt
+  out per-CLI with `AgentCli::reserved_flags(false)`.
+- **Standard flag vocabulary** with typed `CommandRequest` accessors
+  (`dry_run`, `assume_yes`, `no_cache`, `no_color`, `wants_stdin`, `compact`,
+  `select`) and a free `read_stdin()` helper.
+- **Bounded list output**: `CommandOutput::list` / `list_truncated` emit
+  `{ items, count, total, truncated, guidance }`.
+- **Built-in `doctor` scaffold**: `AgentCli::doctor(checks)` runs `Check`s and
+  reports a structured health envelope, surfacing a failing check's typed exit
+  code.
+- **Static self-audit**: `AgentCli::audit()` validates HATEOAS integrity
+  (dangling `next_action` templates), dead-end commands, and missing
+  usage/descriptions, returning an `AuditReport`.
+
+### Miscellaneous
+
+- Enable the `tokio` `io-std` feature for the async `read_stdin()` helper.
+
 ## [0.8.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.8.0) - 2026-05-28
 
 ### Breaking changes

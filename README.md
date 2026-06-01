@@ -23,7 +23,7 @@ It is built around the design in [design.md](design.md):
 
 ```toml
 [dependencies]
-agcli = "0.8.1"
+agcli = "0.9.0"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -156,13 +156,13 @@ assert!(cli.audit().is_clean());
 
 ## Performance
 
-agcli targets **macOS and Linux only**. The crate ships with optimized release/bench profiles and an optional jemalloc allocator. To maximize runtime performance in a downstream binary:
+agcli targets **macOS and Linux only**. The crate ships with optimized release/bench profiles. To maximize runtime performance in a downstream binary:
 
 ### Recommended `Cargo.toml`
 
 ```toml
 [dependencies]
-agcli = { version = "0.8.1", features = ["jemalloc"] }
+agcli = "0.9.0"
 
 [profile.release]
 opt-level = 3
@@ -170,15 +170,10 @@ lto = "thin"
 codegen-units = 1
 ```
 
-### jemalloc global allocator
-
-In your binary's `main.rs`:
-
-```rust
-#[cfg(feature = "jemalloc")]
-#[global_allocator]
-static GLOBAL: agcli::Jemalloc = agcli::Jemalloc;
-```
+The default system allocator is the right choice for short-lived CLI
+processes. If you build a long-running, allocation-heavy CLI and measure a
+win, add `tikv-jemallocator` (or another allocator) directly in your binary
+via `#[global_allocator]` — agcli does not bundle one.
 
 ### Build-machine-specific codegen
 
