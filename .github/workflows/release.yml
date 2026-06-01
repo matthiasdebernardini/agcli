@@ -86,7 +86,25 @@ jobs:
         id: auth
 
       - name: Publish
-        run: cargo publish
+        run: |
+          name=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          # Crates.io sparse-index path for this crate name.
+          len=${#name}
+          if [ "$len" -le 2 ]; then
+            path="$len/$name"
+          elif [ "$len" -eq 3 ]; then
+            path="3/${name:0:1}/$name"
+          else
+            path="${name:0:2}/${name:2:2}/$name"
+          fi
+          # Idempotent: if this version is already on crates.io, skip instead of
+          # failing the run (e.g. after an out-of-band manual publish).
+          if curl -sf "https://index.crates.io/$path" | jq -r '.vers' | grep -qx "$version"; then
+            echo "::notice::$name $version is already on crates.io — skipping publish."
+          else
+            cargo publish
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
