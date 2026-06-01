@@ -23,7 +23,7 @@ It is built around the design in [design.md](design.md):
 
 ```toml
 [dependencies]
-agcli = "0.9.1"
+agcli = "0.10.0"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -98,6 +98,13 @@ accessors on `CommandRequest`, for the handler to act on:
 These names are reserved while enabled (the default). If a command needs one
 with conflicting semantics, opt out per-CLI with `AgentCli::reserved_flags(false)`.
 
+The reserved vocabulary is **discoverable**: the root command tree includes an
+`agent_flags` section describing every flag (so an introspecting agent finds
+the full surface it can drive), and `agcli::reserved_flag_names()` returns the
+same set programmatically. A bare, empty, or no-match `--select` never silently
+wipes the result to `{}` — it returns the full result plus a `select_warning`
+listing the available fields.
+
 ```rust
 // `app get 1 --select id,name --compact` → result projected and compacted,
 // even though `get` never declared those flags.
@@ -162,7 +169,7 @@ agcli targets **macOS and Linux only**. The crate ships with optimized release/b
 
 ```toml
 [dependencies]
-agcli = "0.9.1"
+agcli = "0.10.0"
 
 [profile.release]
 opt-level = 3

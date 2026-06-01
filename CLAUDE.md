@@ -12,126 +12,82 @@
 
 ```toml
 [dependencies]
-agcli = "0.9.1"
+agcli = "0.10.0"
 serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ## Minimal calculator example
 
 A complete, runnable CLI with `add` and `sub` commands:
 
+> This is the canonical getting-started example, kept in sync with the
+> CI-compiled [`examples/calc.rs`](examples/calc.rs). The crate is fully async
+> (since v0.8): handlers return `Box::pin(async move { ... })` and `run_env`
+> is awaited under a tokio runtime.
+
 ```rust
-use agcli::{AgentCli, Command, CommandError, CommandOutput, NextAction, ActionParam};
+use agcli::{ActionParam, AgentCli, Command, CommandOutput, NextAction};
 use serde_json::json;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = AgentCli::new("calc", "Agent-native calculator")
         .version("1.0.0")
         .command(
             Command::new("add", "Add two numbers")
                 .usage("calc add <a> <b>")
                 .handler(|req, _ctx| {
-                    let a: f64 = req.arg(0)
-                        .ok_or_else(|| CommandError::new(
-                            "missing argument <a>",
-                            "MISSING_ARG",
-                            "Provide two numbers: calc add <a> <b>",
-                        ))?
-                        .parse()
-                        .map_err(|_| CommandError::new(
-                            "argument <a> is not a number",
-                            "INVALID_NUMBER",
-                            "Pass a valid number for <a>",
-                        ))?;
-                    let b: f64 = req.arg(1)
-                        .ok_or_else(|| CommandError::new(
-                            "missing argument <b>",
-                            "MISSING_ARG",
-                            "Provide two numbers: calc add <a> <b>",
-                        ))?
-                        .parse()
-                        .map_err(|_| CommandError::new(
-                            "argument <b> is not a number",
-                            "INVALID_NUMBER",
-                            "Pass a valid number for <b>",
-                        ))?;
-
-                    let sum = a + b;
-                    Ok(CommandOutput::new(json!({
-                        "operation": "add",
-                        "a": a,
-                        "b": b,
-                        "result": sum
-                    }))
-                    .next_action(
-                        NextAction::new("calc add <a> <b>", "Add two more numbers")
-                            .with_param("a", ActionParam::new()
-                                .value(json!(sum))
-                                .description("First number (pre-filled with previous result)"))
-                            .with_param("b", ActionParam::new()
-                                .required(true)
-                                .description("Second number")),
-                    )
-                    .next_action(
-                        NextAction::new("calc sub <a> <b>", "Subtract instead")
-                            .with_param("a", ActionParam::new()
-                                .value(json!(sum))
-                                .description("First number (pre-filled with previous result)"))
-                            .with_param("b", ActionParam::new()
-                                .required(true)
-                                .description("Number to subtract")),
-                    ))
+                    // `arg_parse` folds missing/invalid into a typed
+                    // CommandError (MISSING_ARG / INVALID_ARG) with a fix.
+                    // Borrow the request before the `async move` block.
+                    let a = req.arg_parse::<f64>(0, "a");
+                    let b = req.arg_parse::<f64>(1, "b");
+                    Box::pin(async move {
+                        let sum = a? + b?;
+                        Ok(CommandOutput::new(json!({
+                            "operation": "add",
+                            "result": sum
+                        }))
+                        .next_action(
+                            NextAction::new("calc add <a> <b>", "Add two more numbers")
+                                .with_param("a", ActionParam::new()
+                                    .value(json!(sum))
+                                    .description("First number (pre-filled with previous result)"))
+                                .with_param("b", ActionParam::new()
+                                    .required(true)
+                                    .description("Second number")),
+                        )
+                        .next_action(
+                            NextAction::new("calc sub <a> <b>", "Subtract instead")
+                                .with_param("a", ActionParam::new().value(json!(sum)))
+                                .with_param("b", ActionParam::new().required(true)),
+                        ))
+                    })
                 }),
         )
         .command(
             Command::new("sub", "Subtract two numbers")
                 .usage("calc sub <a> <b>")
                 .handler(|req, _ctx| {
-                    let a: f64 = req.arg(0)
-                        .ok_or_else(|| CommandError::new(
-                            "missing argument <a>",
-                            "MISSING_ARG",
-                            "Provide two numbers: calc sub <a> <b>",
-                        ))?
-                        .parse()
-                        .map_err(|_| CommandError::new(
-                            "argument <a> is not a number",
-                            "INVALID_NUMBER",
-                            "Pass a valid number for <a>",
-                        ))?;
-                    let b: f64 = req.arg(1)
-                        .ok_or_else(|| CommandError::new(
-                            "missing argument <b>",
-                            "MISSING_ARG",
-                            "Provide two numbers: calc sub <a> <b>",
-                        ))?
-                        .parse()
-                        .map_err(|_| CommandError::new(
-                            "argument <b> is not a number",
-                            "INVALID_NUMBER",
-                            "Pass a valid number for <b>",
-                        ))?;
-
-                    let diff = a - b;
-                    Ok(CommandOutput::new(json!({
-                        "operation": "sub",
-                        "a": a,
-                        "b": b,
-                        "result": diff
-                    }))
-                    .next_action(
-                        NextAction::new("calc sub <a> <b>", "Subtract two more numbers")
-                            .with_param("a", ActionParam::new()
-                                .value(json!(diff))
-                                .description("First number (pre-filled with previous result)"))
-                            .with_param("b", ActionParam::new()
-                                .required(true)
-                                .description("Number to subtract")),
-                    ))
+                    let a = req.arg_parse::<f64>(0, "a");
+                    let b = req.arg_parse::<f64>(1, "b");
+                    Box::pin(async move {
+                        let diff = a? - b?;
+                        Ok(CommandOutput::new(json!({
+                            "operation": "sub",
+                            "result": diff
+                        }))
+                        .next_action(
+                            NextAction::new("calc sub <a> <b>", "Subtract two more numbers")
+                                .with_param("a", ActionParam::new().value(json!(diff)))
+                                .with_param("b", ActionParam::new().required(true)),
+                        ))
+                    })
                 }),
         );
 
-    let run = cli.run_env();
+    let run = cli.run_env().await;
     println!("{}", run.to_json());
     std::process::exit(run.exit_code());
 }
@@ -140,15 +96,11 @@ fn main() {
 ## Build and run
 
 ```bash
-cargo build --release
-# Root command - self-documenting tree
-./target/release/calc
-# Add
-./target/release/calc add 3 5
-# Subtract
-./target/release/calc sub 10 4
-# Error case
-./target/release/calc add foo bar
+# Run the shipped example directly:
+cargo run --example calc                 # root command — self-documenting tree
+cargo run --example calc -- add 3 5      # Add
+cargo run --example calc -- sub 10 4     # Subtract
+cargo run --example calc -- add foo bar  # Error case (typed-error envelope)
 ```
 
 ## Example JSON output
@@ -163,8 +115,6 @@ cargo build --release
   "exit_code": 0,
   "result": {
     "operation": "add",
-    "a": 3.0,
-    "b": 5.0,
     "result": 8.0
   },
   "next_actions": [
@@ -197,11 +147,11 @@ cargo build --release
   "timestamp": 1740000000,
   "exit_code": 1,
   "error": {
-    "message": "argument <a> is not a number",
-    "code": "INVALID_NUMBER",
+    "message": "argument <a> is not valid: \"foo\"",
+    "code": "INVALID_ARG",
     "retryable": false
   },
-  "fix": "Pass a valid number for <a>",
+  "fix": "Pass a valid value for <a>.",
   "next_actions": [
     {
       "command": "calc add <a> <b>",
@@ -226,9 +176,12 @@ cargo build --release
 - **Template vs literal next_actions**: When `params` is present, `command` is a template (agent fills placeholders). When absent, it's literal (run as-is).
 - **Pre-filled values**: Use `ActionParam::new().value(json!(result))` to pre-fill context from the current operation
 - **Error with fix**: `CommandError::new(message, code, fix)` - always tell the agent how to recover
+- **Typed arg helpers**: `req.require_arg(i, "name")`, `req.arg_parse::<T>(i, "name")`, and `req.flag_parse::<T>("key")` fold missing/parse failures into a `CommandError` with conventional codes (`MISSING_ARG`/`INVALID_ARG`/`INVALID_FLAG`) and a generated `fix` — no hand-rolled boilerplate per argument
 - **Retryable errors**: Chain `.retryable(true)` on `CommandError` for transient failures
-- **Truncation**: Use `truncate_lines_with_file()` to cap large outputs and write full content to a temp file
-- **Streaming**: Use `NdjsonEmitter` for temporal operations; terminal `result`/`error` events carry `timestamp` and `schema_version`
+- **Reserved flags are discoverable**: the root command tree includes an `agent_flags` section (when reserved flags are enabled) listing `--select`/`--compact`/`--quiet`/etc.; `agcli::reserved_flag_names()` returns the same set programmatically
+- **`--select` never silently wipes output**: a bare, empty, or no-match `--select` returns the full result plus a `select_warning` (listing the available fields) instead of an empty `{}` with a misleading `ok: true`
+- **Context protection is opt-in**: the framework does not bound result size by default — call `truncate_lines_with_file()` (or `CommandOutput::list_truncated`) deliberately for large output. The truncated tail is returned inline with a `dropped` count and a `full_output` file pointer; that file persists until the caller calls `TruncatedEntries::cleanup()`
+- **Streaming**: Use `NdjsonEmitter` for temporal operations; terminal `result`/`error` events carry `timestamp` and `schema_version`. The emitter poisons itself on a write/flush error so a retry can't concatenate onto a corrupt NDJSON line
 
 ## Performance
 
@@ -238,7 +191,7 @@ agcli targets **macOS and Linux only**. The crate ships with optimized release/b
 
 ```toml
 [dependencies]
-agcli = "0.9.1"
+agcli = "0.10.0"
 
 [profile.release]
 opt-level = 3

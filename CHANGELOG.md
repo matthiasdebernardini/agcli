@@ -2,6 +2,76 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.10.0) - 2026-06-01
+
+Correctness and usability fixes from a multi-agent review (26 findings). These
+puncture the framework's "JSON always / errors suggest fixes" guarantees at the
+edges. Several change the JSON shape (a new `agent_flags` root section, a
+`dropped` field on `TruncatedEntries`, exit-code masking), so this is a
+**minor** bump (0.9 → 0.10) per the pre-1.0 versioning policy.
+
+### Bug fixes
+
+- **Handler panics no longer break the JSON-always contract.** A panic in
+  handler code (unwrap/expect/index/overflow) was unwinding past the envelope
+  machinery — empty stdout, raw backtrace on stderr, untyped exit `101`. The
+  framework now catches the unwind and emits a structured `HANDLER_PANIC` error
+  envelope (exit `1`). stdout stays valid JSON.
+- **`--select` no longer silently wipes a result to `{}`.** A bare `--select`,
+  an empty value, or a typo'd / no-match field name returned `ok: true` with
+  `result: {}`, discarding the handler's real output. It now returns the full
+  result plus a `select_warning` listing the available fields.
+- **`--select` dot-paths descend element-wise into arrays** (`checks.fix` over
+  `{ checks: [ … ] }`) instead of collapsing to `{}`.
+- **The built-in `doctor` command is exempt from `--select`/`--compact`
+  projection**, so narrowing can never strip the per-check `fix` from an
+  unhealthy report.
+- **NDJSON emitter self-protects on I/O errors.** A write error now poisons the
+  emitter (a retry cannot concatenate onto a partial line) and a terminal event
+  is marked terminated *before* flushing (a flush failure can no longer leave
+  the stream open to a second terminal event).
+- **Exit codes are masked to 0–255**, so the serialized `exit_code` field always
+  equals the process status (`exit(256)` no longer reports JSON `256` with shell
+  status `0`). A `debug_assert` flags out-of-range codes in development.
+- **`doctor` reports the most actionable failing exit code** (a specific typed
+  code wins over generic `ERROR`) regardless of check registration order.
+- **No more clock panics.** `epoch_secs` and the truncation temp-file naming no
+  longer `expect()` on a pre-1970 system clock (they fall back to `0`).
+- **`truncate_lines_with_file` floors `max_lines` to 1**, so an agent-supplied
+  `--lines=0` returns the tail line instead of an empty inline view marked
+  `truncated: true`.
+- **Audit flags dead-link `next_action` templates** that lead with a
+  placeholder/flag and resolve to no command.
+- **`next_action_from_usage`** recognizes short value-flag brackets
+  (`[-v <level>]`) and bare optional positionals (`[<optional>]`) as *optional*
+  params instead of misclassifying them as required positionals.
+- **`Envelope::to_json` serialization fallback** now emits a shape-consistent
+  error envelope (`error` object + `exit_code`) instead of a bare `error` string.
+
+### Features
+
+- **Typed argument helpers on `CommandRequest`**: `require_arg(i, name)`,
+  `arg_parse::<T>(i, name)`, and `flag_parse::<T>(key)` fold missing/parse
+  failures into a `CommandError` with conventional codes (`MISSING_ARG`,
+  `INVALID_ARG`, `INVALID_FLAG`) and a generated `fix`.
+- **Reserved flags are discoverable.** The self-documenting root tree includes
+  an `agent_flags` section, and `agcli::reserved_flag_names()` returns the
+  reserved vocabulary programmatically.
+- **`TruncatedEntries::dropped`** reports how many head lines were elided; the
+  type now documents its tail-of-output and temp-file ownership semantics.
+- **`NdjsonEmitter::poisoned()`** accessor.
+- **CI-compiled `examples/calc.rs`** so the canonical getting-started example
+  can no longer drift from the shipped API.
+
+### Documentation
+
+- Migrate the `CLAUDE.md` "Minimal calculator example" to the real async API
+  (it did not compile against the shipped handler/`run_env` signatures).
+- Fix two rustdoc warnings (broken `CheckResult` link; public docs linking to
+  the private `RESERVED_BOOL_FLAGS`).
+- Document the borrow-then-move handler pattern, the opt-in nature of context
+  protection, and corrected exit-code serialization docs.
+
 ## [0.9.1](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.9.1) - 2026-06-01
 
 Documentation and release-tooling fixes. No code or API changes.
