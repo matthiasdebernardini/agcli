@@ -45,7 +45,7 @@ pub use audit::{AuditFinding, AuditReport, AuditSeverity};
 pub use cli::{
     AgentCli, Command, CommandError, CommandOutput, CommandRequest, Execution, ExecutionContext,
     Invocation, ParseInvocationError, parse_invocation, parse_invocation_with_bool_flags,
-    read_stdin,
+    read_stdin, reserved_flag_names,
 };
 pub use doctor::{Check, CheckResult};
 pub use envelope::{

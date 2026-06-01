@@ -42,10 +42,13 @@ async fn main() {
                 .usage("ops logs <source> [--lines=<lines>] [--follow]")
                 .handler(|req, _ctx| {
                     let source = req.arg(0).unwrap_or("worker").to_string();
+                    // Floor agent-supplied --lines to 1 so `--lines=0` returns
+                    // the tail line rather than an empty inline view.
                     let lines = req
                         .flag("lines")
                         .and_then(|value| value.parse::<usize>().ok())
-                        .unwrap_or(20);
+                        .unwrap_or(20)
+                        .max(1);
 
                     Box::pin(async move {
                         let fake_logs = (0..120)

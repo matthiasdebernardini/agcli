@@ -36,7 +36,10 @@ pub fn select(value: &Value, fields: &[&str]) -> Value {
 }
 
 /// Descend `source` along `path`, inserting the found leaf into `out` while
-/// reconstructing intermediate objects so nesting is preserved.
+/// reconstructing intermediate objects so nesting is preserved. An array
+/// encountered mid-path is descended element-wise — `checks.fix` over
+/// `{ checks: [ {fix}, … ] }` yields `{ checks: [ {fix}, … ] }` — matching the
+/// element-wise convention [`select`] already uses for top-level arrays.
 fn insert_path(source: &Map<String, Value>, path: &[&str], out: &mut Map<String, Value>) {
     let (head, rest) = path.split_first().expect("path is non-empty");
     let Some(found) = source.get(*head) else {
@@ -46,13 +49,36 @@ fn insert_path(source: &Map<String, Value>, path: &[&str], out: &mut Map<String,
         out.insert((*head).to_string(), found.clone());
         return;
     }
-    if let Value::Object(inner) = found {
-        let entry = out
-            .entry((*head).to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Value::Object(target) = entry {
-            insert_path(inner, rest, target);
+    match found {
+        Value::Object(inner) => {
+            let entry = out
+                .entry((*head).to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(target) = entry {
+                insert_path(inner, rest, target);
+            }
         }
+        Value::Array(items) => {
+            // Descend the remaining path into each object element. Merge into an
+            // existing array target so multiple paths into the same array
+            // (`checks.name,checks.fix`) accumulate rather than overwrite.
+            let entry = out
+                .entry((*head).to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Value::Array(target) = entry {
+                if target.len() < items.len() {
+                    target.resize(items.len(), Value::Object(Map::new()));
+                }
+                for (slot, item) in target.iter_mut().zip(items.iter()) {
+                    if let (Value::Object(target_obj), Value::Object(item_obj)) = (slot, item) {
+                        insert_path(item_obj, rest, target_obj);
+                    }
+                }
+            }
+        }
+        // Scalar mid-path: cannot descend. Leave unselected (consistent with a
+        // missing path) rather than emitting a partial/empty entry.
+        _ => {}
     }
 }
 
@@ -133,6 +159,33 @@ mod tests {
     #[test]
     fn select_on_scalar_returns_unchanged() {
         assert_eq!(select(&json!(42), &["id"]), json!(42));
+    }
+
+    #[test]
+    fn select_dot_path_descends_into_array_elementwise() {
+        let value = json!({
+            "healthy": false,
+            "checks": [
+                { "name": "auth", "ok": false, "fix": "Set API_TOKEN" },
+                { "name": "ping", "ok": true }
+            ]
+        });
+        let out = select(&value, &["checks.fix"]);
+        assert_eq!(out, json!({ "checks": [ { "fix": "Set API_TOKEN" }, {} ] }));
+    }
+
+    #[test]
+    fn select_multiple_dot_paths_into_same_array_merge() {
+        let value = json!({
+            "checks": [
+                { "name": "auth", "ok": false, "fix": "Set API_TOKEN" }
+            ]
+        });
+        let out = select(&value, &["checks.name", "checks.fix"]);
+        assert_eq!(
+            out,
+            json!({ "checks": [ { "name": "auth", "fix": "Set API_TOKEN" } ] })
+        );
     }
 
     #[test]

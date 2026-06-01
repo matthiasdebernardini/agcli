@@ -32,6 +32,50 @@ fn is_reserved_bool(flag: &str) -> bool {
     RESERVED_BOOL_FLAGS.contains(&flag)
 }
 
+/// The framework-reserved agent-native flags with their semantics, in the
+/// order they appear in the self-documenting root tree. `--select` is a value
+/// flag; the rest are booleans (see [`RESERVED_BOOL_FLAGS`]).
+const RESERVED_FLAG_DOCS: &[(&str, &str)] = &[
+    (
+        "--select=<a,b,c>",
+        "Project the result to only these fields (top-level keys or `a.b` dot paths; maps over arrays).",
+    ),
+    (
+        "--compact",
+        "Drop null and empty result fields (or keep a command's declared high-gravity allowlist).",
+    ),
+    ("--quiet", "Omit `next_actions` from the envelope."),
+    (
+        "--dry-run",
+        "Preview without mutating; read via `req.dry_run()`.",
+    ),
+    (
+        "--yes / --no-input",
+        "Assume yes; never prompt interactively (`req.assume_yes()`).",
+    ),
+    ("--no-cache", "Bypass any local cache (`req.no_cache()`)."),
+    (
+        "--no-color",
+        "Emit machine-friendly, uncolored output (`req.no_color()`).",
+    ),
+    (
+        "--stdin",
+        "Read piped input; pair with `agcli::read_stdin()` (`req.wants_stdin()`).",
+    ),
+];
+
+/// Every framework-reserved flag name (without the leading `--`), for runtime
+/// discovery. These names are reserved whenever
+/// [`AgentCli::reserved_flags`] is enabled (the default): the framework parses
+/// and acts on them on every command. `select` is a value flag; the others are
+/// parsed as booleans anywhere on the line.
+pub fn reserved_flag_names() -> &'static [&'static str] {
+    &[
+        "select", "json", "dry-run", "compact", "stdin", "quiet", "yes", "no-input", "no-cache",
+        "no-color",
+    ]
+}
+
 /// Split a `--select` value (`"id,name, body"`) into trimmed, non-empty
 /// field names.
 fn parse_select_fields(raw: &str) -> Vec<&str> {
@@ -39,6 +83,69 @@ fn parse_select_fields(raw: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Apply a reserved `--select` value to a handler result, guarding against the
+/// silent-erasure footgun. A bare `--select` (parsed as the sentinel `"true"`),
+/// an empty value, or a typo'd/array-only field name all project a non-empty
+/// object down to `{}`. Rather than discard the handler's real output and
+/// report a misleading `ok: true` with `result: {}`, this returns the original
+/// result annotated with a `select_warning` that names the available fields, so
+/// the agent keeps its data and learns how to correct the select. (An error
+/// envelope is deliberately avoided: the handler already ran — possibly with
+/// side effects — so signalling failure could trigger an unwanted retry.)
+fn apply_select_flag(result: Value, raw: &str) -> Value {
+    let fields = parse_select_fields(raw);
+    if fields.is_empty() {
+        return annotate_select_warning(
+            result,
+            "--select was given no field names. Returning the full result. \
+             Re-run with --select=<field>[,<field>...]."
+                .to_string(),
+        );
+    }
+    let projected = project::select(&result, &fields);
+    let collapsed = matches!(&result, Value::Object(map) if !map.is_empty())
+        && matches!(&projected, Value::Object(map) if map.is_empty());
+    if collapsed {
+        let available = match &result {
+            Value::Object(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
+            _ => String::new(),
+        };
+        return annotate_select_warning(
+            result,
+            format!(
+                "--select={} matched no fields. Available top-level fields: {available}. \
+                 Returning the full result; re-run --select with a valid field name.",
+                fields.join(",")
+            ),
+        );
+    }
+    projected
+}
+
+/// Attach a `select_warning` note to an object result. No-op for non-objects
+/// (arrays/scalars are returned unchanged so the element-wise select semantics
+/// are preserved).
+fn annotate_select_warning(result: Value, warning: String) -> Value {
+    match result {
+        Value::Object(mut map) => {
+            map.insert("select_warning".to_string(), Value::String(warning));
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
+/// Best-effort human-readable message from a caught panic payload.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 /// Read all of stdin to a string. Pairs with the `--stdin` convention so a
@@ -342,6 +449,58 @@ impl<'a> CommandRequest<'a> {
         self.invocation.flag(key)
     }
 
+    // --- Typed argument/flag accessors ---
+    //
+    // Fold the missing/parse boilerplate into a `CommandError` with
+    // conventional codes (`MISSING_ARG`, `INVALID_ARG`, `INVALID_FLAG`) and a
+    // generated `fix`, so every agcli CLI reports argument errors the same way
+    // instead of each author hand-rolling slightly different ones.
+
+    /// Return positional `index`, or a `MISSING_ARG` error naming it.
+    pub fn require_arg(&self, index: usize, name: &str) -> Result<&str, CommandError> {
+        self.arg(index).ok_or_else(|| {
+            CommandError::new(
+                format!("missing argument <{name}>"),
+                "MISSING_ARG",
+                format!("Provide <{name}> as positional argument {index}."),
+            )
+        })
+    }
+
+    /// Parse positional `index` into `T`, erroring with `MISSING_ARG` when
+    /// absent or `INVALID_ARG` when it does not parse.
+    pub fn arg_parse<T>(&self, index: usize, name: &str) -> Result<T, CommandError>
+    where
+        T: std::str::FromStr,
+    {
+        let raw = self.require_arg(index, name)?;
+        raw.parse::<T>().map_err(|_| {
+            CommandError::new(
+                format!("argument <{name}> is not valid: {raw:?}"),
+                "INVALID_ARG",
+                format!("Pass a valid value for <{name}>."),
+            )
+        })
+    }
+
+    /// Parse flag `key` into `T` when present. `Ok(None)` when the flag is
+    /// absent; `INVALID_FLAG` when present but unparseable.
+    pub fn flag_parse<T>(&self, key: &str) -> Result<Option<T>, CommandError>
+    where
+        T: std::str::FromStr,
+    {
+        match self.flag(key) {
+            None => Ok(None),
+            Some(raw) => raw.parse::<T>().map(Some).map_err(|_| {
+                CommandError::new(
+                    format!("flag --{key} is not valid: {raw:?}"),
+                    "INVALID_FLAG",
+                    format!("Pass a valid value for --{key}."),
+                )
+            }),
+        }
+    }
+
     pub fn prompt(&self) -> Option<Cow<'_, str>> {
         if let Some(prompt) = self.flag("prompt") {
             return Some(Cow::Borrowed(prompt));
@@ -539,8 +698,16 @@ impl CommandError {
         self
     }
 
-    /// Set the typed process exit code (use an [`ExitCode`] constant).
+    /// Set the typed process exit code (use an [`ExitCode`] constant). An
+    /// error envelope with `ExitCode::SUCCESS` (0) is contradictory — a shell
+    /// or agent reads it as success — so it is rejected by a `debug_assert` in
+    /// development builds.
     pub fn exit_code(mut self, code: i32) -> Self {
+        debug_assert_ne!(
+            code,
+            ExitCode::SUCCESS,
+            "an error must not carry a success (0) exit code"
+        );
         self.exit_code = Some(code);
         self
     }
@@ -558,10 +725,12 @@ impl CommandError {
 
 /// Build a `NextAction` from a usage string and description.
 ///
-/// Parses `<name>` placeholders (required positional) and `[--flag=<name>]`
-/// or `[--flag <name>]` placeholders (optional flag) from the usage string
-/// and auto-populates `params`. If no placeholders are found, the action is
-/// literal (no `params`).
+/// A bare `<name>` placeholder becomes a **required** positional param. Any
+/// placeholder inside brackets is **optional**: `[--flag=<name>]`,
+/// `[--flag <name>]`, short value flags `[-v <level>]`, and bare optional
+/// positionals `[<optional>]`. Brackets without a `<...>` placeholder
+/// (`[--follow]`, `[args...]`) contribute no param. If no placeholders are
+/// found, the action is literal (no `params`).
 fn next_action_from_usage(usage: &str, description: impl Into<String>) -> NextAction {
     let mut action = NextAction::new(usage, description);
     let bytes = usage.as_bytes();
@@ -569,23 +738,25 @@ fn next_action_from_usage(usage: &str, description: impl Into<String>) -> NextAc
     let mut i = 0;
 
     while i < len {
-        // Optional flag placeholder: [--flag=<name>] or [--flag <name>]
-        if bytes[i] == b'[' && i + 2 < len && bytes[i + 1] == b'-' && bytes[i + 2] == b'-' {
-            // Find the closing bracket
-            if let Some(close) = usage[i..].find(']') {
-                let bracket_content = &usage[i + 1..i + close]; // strip [ and ]
-                // Look for <name> inside
-                if let Some(angle_start) = bracket_content.find('<')
-                    && let Some(angle_end) = bracket_content[angle_start..].find('>')
-                {
-                    let param_name = &bracket_content[angle_start + 1..angle_start + angle_end];
-                    if !param_name.is_empty() {
-                        action = action.with_param(param_name, ActionParam::new().required(false));
-                    }
+        // Any bracketed token is optional: `[--flag=<name>]`, `[--flag <name>]`,
+        // short value flags `[-v <level>]`, and bare optional positionals
+        // `[<optional>]` all map their inner `<name>` placeholder to an optional
+        // param. A bracket without a `<...>` placeholder (e.g. `[--follow]`,
+        // `[args...]`) contributes no param.
+        if bytes[i] == b'['
+            && let Some(close) = usage[i..].find(']')
+        {
+            let bracket_content = &usage[i + 1..i + close]; // strip [ and ]
+            if let Some(angle_start) = bracket_content.find('<')
+                && let Some(angle_end) = bracket_content[angle_start..].find('>')
+            {
+                let param_name = &bracket_content[angle_start + 1..angle_start + angle_end];
+                if !param_name.is_empty() && !param_name.contains('.') {
+                    action = action.with_param(param_name, ActionParam::new().required(false));
                 }
-                i += close + 1;
-                continue;
             }
+            i += close + 1;
+            continue;
         }
 
         // Positional placeholder: <name> (not inside [...])
@@ -623,6 +794,11 @@ pub struct Command {
     handler: Option<Arc<CommandHandler>>,
     default_next_actions: Vec<NextAction>,
     subcommands: BTreeMap<String, Command>,
+    /// When false, the framework-reserved `--select`/`--compact` projection is
+    /// not applied to this command's result. Used by the built-in `doctor`
+    /// command so narrowing can never strip the actionable `fix` strings out of
+    /// an unhealthy report.
+    apply_reserved_projection: bool,
 }
 
 use std::collections::BTreeMap;
@@ -649,6 +825,7 @@ impl Command {
             handler: None,
             default_next_actions: Vec::new(),
             subcommands: BTreeMap::new(),
+            apply_reserved_projection: true,
         }
     }
 
@@ -657,7 +834,25 @@ impl Command {
         self
     }
 
-    /// Attach an async handler. Use with: `.handler(|req, ctx| Box::pin(async move { ... }))`
+    /// Attach an async handler. The closure returns a boxed future:
+    /// `.handler(|req, ctx| Box::pin(async move { ... }))`.
+    ///
+    /// Because the future captures by `move`, read any borrowed request data
+    /// into owned locals *before* the `async move` block — including the typed
+    /// helpers, which borrow `req`:
+    ///
+    /// ```ignore
+    /// .handler(|req, _ctx| {
+    ///     // Borrow first…
+    ///     let source = req.arg(0).unwrap_or("worker").to_string();
+    ///     let lines = req.flag_parse::<usize>("lines");
+    ///     Box::pin(async move {
+    ///         // …then move the owned values into the future.
+    ///         let lines = lines?.unwrap_or(20);
+    ///         Ok(CommandOutput::new(json!({ "source": source, "lines": lines })))
+    ///     })
+    /// })
+    /// ```
     pub fn handler<F>(mut self, f: F) -> Self
     where
         F: for<'a> Fn(
@@ -775,7 +970,8 @@ impl AgentCli {
     }
 
     /// Toggle the framework-reserved agent-native flags (`--select`,
-    /// `--compact`, `--quiet`, and the rest of [`RESERVED_BOOL_FLAGS`]).
+    /// `--compact`, `--quiet`, and the rest — see [`reserved_flag_names`] for
+    /// the full set).
     ///
     /// Enabled by default: every command transparently supports them and the
     /// framework applies `--select`/`--compact`/`--quiet` to the result.
@@ -810,24 +1006,31 @@ impl AgentCli {
     /// structured health envelope `{ healthy, checks: [...] }`. When any check
     /// fails the command still returns an `ok: true` envelope (the report
     /// succeeded) but carries the failing check's exit code so a shell or
-    /// agent sees a non-zero status. See [`Check`] and [`CheckResult`].
+    /// agent sees a non-zero status. See [`Check`] and [`crate::CheckResult`].
     pub fn doctor(self, checks: Vec<Check>) -> Self {
         let usage = format!("{} doctor", self.name);
         let checks = Arc::new(checks);
-        let command = Command::new("doctor", "Run environment health checks")
+        let mut command = Command::new("doctor", "Run environment health checks")
             .usage(usage)
             .handler(move |_req, _ctx| {
                 let checks = Arc::clone(&checks);
                 Box::pin(async move {
                     let mut entries = Vec::with_capacity(checks.len());
                     let mut healthy = true;
-                    let mut fail_exit = ExitCode::SUCCESS;
+                    let mut fail_exit: Option<i32> = None;
                     for check in checks.iter() {
                         let result = check.run().await;
-                        if !result.ok && healthy {
-                            // First failure determines the exit code.
+                        if !result.ok {
                             healthy = false;
-                            fail_exit = check.exit_code;
+                            // Prefer a specific (non-ERROR) exit code over the
+                            // generic ERROR so the shell sees the most
+                            // actionable failure class regardless of the order
+                            // checks were registered in.
+                            fail_exit = Some(match fail_exit {
+                                None => check.exit_code,
+                                Some(prev) if prev == ExitCode::ERROR => check.exit_code,
+                                Some(prev) => prev,
+                            });
                         }
                         let mut entry = Map::new();
                         entry.insert("name".to_string(), json!(check.name()));
@@ -845,11 +1048,14 @@ impl AgentCli {
                         "checks": entries,
                     }));
                     if !healthy {
-                        output = output.exit_code(fail_exit);
+                        output = output.exit_code(fail_exit.unwrap_or(ExitCode::ERROR));
                     }
                     Ok(output)
                 })
             });
+        // Never narrow the doctor report: `--select`/`--compact` must not be
+        // able to strip the per-check `fix` strings from an unhealthy result.
+        command.apply_reserved_projection = false;
         self.command(command)
     }
 
@@ -924,15 +1130,23 @@ impl AgentCli {
 
     /// True if the leading command tokens of a `next_action` template resolve
     /// to a real command path. Parsing stops at the first placeholder/flag
-    /// token (`<arg>`, `[--flag]`, `-x`, `key=value`). A bare program-name
-    /// reference (or empty) is treated as the valid root affordance.
+    /// token (`<arg>`, `[--flag]`, `-x`, `key=value`).
+    ///
+    /// A bare program-name reference (or an empty template) is the valid root
+    /// affordance and resolves. But a template that — after dropping an optional
+    /// leading program name — leads straight into a placeholder/flag matches
+    /// *zero* command tokens and names no runnable command, so it is rejected
+    /// (it would be a dead link for an agent following the trail).
     fn next_action_resolves(&self, template: &str) -> bool {
         let mut tokens = template.split_whitespace().peekable();
         if tokens.peek() == Some(&self.name.as_str()) {
             tokens.next();
         }
         let mut commands = &self.commands;
+        let mut matched_command = false;
+        let mut saw_token = false;
         for token in tokens {
+            saw_token = true;
             if token.starts_with('<')
                 || token.starts_with('[')
                 || token.starts_with('-')
@@ -941,11 +1155,18 @@ impl AgentCli {
                 break;
             }
             match commands.get(token) {
-                Some(found) => commands = &found.subcommands,
+                Some(found) => {
+                    commands = &found.subcommands;
+                    matched_command = true;
+                }
                 None => return false,
             }
         }
-        true
+        // Resolved if it matched a real command, or it's the bare-root
+        // affordance (no tokens after the optional program name). A template
+        // that had tokens but matched no command (leading placeholder/flag) is
+        // a dead link.
+        matched_command || !saw_token
     }
 
     pub async fn run_env(&self) -> Execution {
@@ -1081,8 +1302,31 @@ impl AgentCli {
         };
 
         let path_strs = path_refs(&resolved.path);
-        match handler(&request, context).await {
-            Ok(output) => {
+
+        // Guard the user-supplied handler future against panics. Any
+        // unwrap/expect/index/overflow in agent-written handler code would
+        // otherwise unwind past the envelope machinery, printing nothing to
+        // stdout and exiting 101 — the exact non-JSON failure the framework
+        // exists to prevent. Catch the unwind and synthesize a structured
+        // HANDLER_PANIC envelope so "JSON always" holds even for buggy
+        // handlers. (The default panic hook may still print to stderr; stdout
+        // — what an agent parses — stays valid JSON.)
+        let mut handler_future = handler(&request, context);
+        let handler_result = std::future::poll_fn(|cx| {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler_future.as_mut().poll(cx)
+            })) {
+                Ok(poll) => poll.map(Ok),
+                Err(payload) => std::task::Poll::Ready(Err(payload)),
+            }
+        })
+        .await;
+        // Drop the future to release its borrow of `request`/`invocation`
+        // before the arms consume `invocation`.
+        drop(handler_future);
+
+        match handler_result {
+            Ok(Ok(output)) => {
                 let CommandOutput {
                     mut result,
                     next_actions: handler_actions,
@@ -1095,19 +1339,20 @@ impl AgentCli {
                 // Apply the framework-reserved output flags centrally so every
                 // command supports --select / --compact / --quiet for free.
                 if self.reserved_flags {
-                    if let Some(fields) = invocation.flag("select").map(parse_select_fields)
-                        && !fields.is_empty()
-                    {
-                        result = project::select(&result, &fields);
-                    }
-                    if invocation.flag("compact").is_some() {
-                        result = match &compact_fields {
-                            Some(fields) => {
-                                let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
-                                project::select(&result, &refs)
-                            }
-                            None => project::compact(&result),
-                        };
+                    if command.apply_reserved_projection {
+                        if let Some(raw) = invocation.flag("select") {
+                            result = apply_select_flag(result, raw);
+                        }
+                        if invocation.flag("compact").is_some() {
+                            result = match &compact_fields {
+                                Some(fields) => {
+                                    let refs: Vec<&str> =
+                                        fields.iter().map(String::as_str).collect();
+                                    project::select(&result, &refs)
+                                }
+                                None => project::compact(&result),
+                            };
+                        }
                     }
                     if invocation.flag("quiet").is_some() {
                         next_actions.clear();
@@ -1121,7 +1366,7 @@ impl AgentCli {
                     envelope: envelope.into(),
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 let exit = error.exit_code.unwrap_or(ExitCode::ERROR);
                 let next_actions =
                     self.ensure_next_actions(error.next_actions, &path_strs, command);
@@ -1134,6 +1379,24 @@ impl AgentCli {
                             error.fix,
                             error.retryable,
                             exit,
+                            next_actions,
+                        )
+                        .into(),
+                }
+            }
+            Err(payload) => {
+                let detail = panic_payload_message(payload.as_ref());
+                let next_actions = self.default_command_actions(&path_strs, command);
+                Execution {
+                    envelope: self
+                        .build_error_envelope(
+                            invocation.into_command_line(),
+                            format!("handler panicked: {detail}"),
+                            "HANDLER_PANIC",
+                            "This is a bug in the command handler, not the invocation. \
+                             Inspect the root command tree and report the panic.",
+                            false,
+                            ExitCode::ERROR,
                             next_actions,
                         )
                         .into(),
@@ -1268,6 +1531,17 @@ impl AgentCli {
             serde_json::to_value(docs)
                 .unwrap_or_else(|e| Value::String(format!("serialization failed: {e}"))),
         );
+
+        // Surface the reserved agent-native flags in the self-documenting tree
+        // so an introspecting agent can discover the whole surface it can drive
+        // (these are honored on every command but declared by none).
+        if self.reserved_flags {
+            let flags: Vec<Value> = RESERVED_FLAG_DOCS
+                .iter()
+                .map(|(flag, description)| json!({ "flag": flag, "description": description }))
+                .collect();
+            result.insert("agent_flags".to_string(), Value::Array(flags));
+        }
 
         Value::Object(result)
     }
@@ -2426,5 +2700,237 @@ mod tests {
         };
         assert_eq!(envelope.result["healthy"], json!(false));
         assert_eq!(run.exit_code(), ExitCode::AUTH);
+    }
+
+    #[tokio::test]
+    async fn doctor_prefers_specific_exit_code_over_generic_error() {
+        // A generic-ERROR check registered before a typed check must not mask
+        // the more actionable code: priority picks AUTH over ERROR regardless
+        // of registration order.
+        let cli = AgentCli::new("app", "x").doctor(vec![
+            Check::new("connectivity", || {
+                Box::pin(async { crate::CheckResult::fail("down", "Check the network") })
+            }),
+            Check::new("auth", || {
+                Box::pin(async { crate::CheckResult::fail("no token", "Set API_TOKEN") })
+            })
+            .exit_code(ExitCode::AUTH),
+        ]);
+        let run = cli.run_argv(["app", "doctor"]).await;
+        assert_eq!(run.exit_code(), ExitCode::AUTH);
+    }
+
+    #[tokio::test]
+    async fn doctor_select_does_not_strip_checks_and_fix() {
+        // Reserved projection is exempt for doctor: narrowing must never hide
+        // the per-check `fix` on an unhealthy report.
+        let cli = AgentCli::new("app", "x").doctor(vec![
+            Check::new("auth", || {
+                Box::pin(async { crate::CheckResult::fail("no token", "Set API_TOKEN") })
+            })
+            .exit_code(ExitCode::AUTH),
+        ]);
+        let run = cli.run_argv(["app", "doctor", "--select=healthy"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert!(envelope.result["checks"].is_array());
+        assert_eq!(envelope.result["checks"][0]["fix"], json!("Set API_TOKEN"));
+        assert_eq!(run.exit_code(), ExitCode::AUTH);
+    }
+
+    // --- Handler panic guard ---
+
+    #[tokio::test]
+    async fn handler_panic_returns_json_error_envelope() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("boom", "boom")
+                .usage("app boom")
+                .handler(|_req, _ctx| {
+                    Box::pin(async move {
+                        // Stand in for any unwrap/expect/index panic in handler code.
+                        panic!("simulated handler bug");
+                        #[allow(unreachable_code)]
+                        Ok(CommandOutput::new(json!({})))
+                    })
+                }),
+        );
+        // Silence the default panic hook for this catch_unwind (nextest isolates
+        // each test in its own process, so this does not leak to other tests).
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let run = cli.run_argv(["app", "boom"]).await;
+        std::panic::set_hook(prev);
+
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error envelope, got: {:?}", run.envelope());
+        };
+        assert_eq!(envelope.error.code, "HANDLER_PANIC");
+        assert!(envelope.error.message.contains("handler panicked"));
+        assert!(!envelope.fix.is_empty());
+        assert!(!envelope.next_actions.is_empty());
+        assert_eq!(run.exit_code(), ExitCode::ERROR);
+    }
+
+    // --- --select projection cluster: never silently wipe a result ---
+
+    #[tokio::test]
+    async fn bare_select_keeps_result_and_warns() {
+        // `get 1 --select` (bare, flushed to the "true" sentinel) must not wipe
+        // the result to {}; it returns the full result plus a select_warning.
+        let cli = rich_cli();
+        let run = cli.run_argv(["app", "get", "1", "--select"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["id"], json!(1));
+        assert!(envelope.result["select_warning"].is_string());
+    }
+
+    #[tokio::test]
+    async fn typod_select_keeps_result_and_lists_fields() {
+        let cli = rich_cli();
+        let run = cli.run_argv(["app", "get", "1", "--select=naem"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["name"], json!("widget"));
+        let warning = envelope.result["select_warning"]
+            .as_str()
+            .expect("warning string");
+        assert!(
+            warning.contains("name"),
+            "warning should list fields: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_select_has_no_warning() {
+        let cli = rich_cli();
+        let run = cli.run_argv(["app", "get", "1", "--select=id,name"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result, json!({ "id": 1, "name": "widget" }));
+        assert!(envelope.result.get("select_warning").is_none());
+    }
+
+    // --- Typed argument helpers ---
+
+    #[tokio::test]
+    async fn arg_parse_helpers_fold_missing_and_invalid() {
+        let cli = AgentCli::new("calc", "x").command(
+            Command::new("add", "add")
+                .usage("calc add <a> <b>")
+                .handler(|req, _ctx| {
+                    let a = req.arg_parse::<f64>(0, "a");
+                    let b = req.arg_parse::<f64>(1, "b");
+                    Box::pin(async move {
+                        let sum = a? + b?;
+                        Ok(CommandOutput::new(json!({ "sum": sum })))
+                    })
+                }),
+        );
+        let run = cli.run_argv(["calc", "add", "3", "5"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["sum"], json!(8.0));
+
+        let run = cli.run_argv(["calc", "add", "3"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error envelope");
+        };
+        assert_eq!(envelope.error.code, "MISSING_ARG");
+
+        let run = cli.run_argv(["calc", "add", "x", "5"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error envelope");
+        };
+        assert_eq!(envelope.error.code, "INVALID_ARG");
+    }
+
+    // --- Reserved flags discoverable from the root tree ---
+
+    #[tokio::test]
+    async fn root_tree_lists_agent_flags() {
+        let cli = rich_cli();
+        let run = cli.run_argv(["app"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        let flags = envelope.result["agent_flags"]
+            .as_array()
+            .expect("agent_flags array");
+        assert!(
+            flags
+                .iter()
+                .any(|f| f["flag"].as_str().unwrap_or("").starts_with("--select"))
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_flags_absent_when_reserved_flags_disabled() {
+        let cli = rich_cli().reserved_flags(false);
+        let run = cli.run_argv(["app"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert!(envelope.result.get("agent_flags").is_none());
+    }
+
+    #[test]
+    fn reserved_flag_names_includes_select_and_bools() {
+        let names = reserved_flag_names();
+        assert!(names.contains(&"select"));
+        assert!(names.contains(&"quiet"));
+        assert!(names.contains(&"dry-run"));
+    }
+
+    // --- next_action_from_usage: short value flags & bare optional positionals ---
+
+    #[test]
+    fn next_action_from_usage_short_value_flag_is_optional() {
+        let action = next_action_from_usage("app log [-v <level>] <file>", "Log a file");
+        let params = action.params.as_ref().expect("params should be present");
+        assert_eq!(params.get("level").unwrap().required, Some(false));
+        assert_eq!(params.get("file").unwrap().required, Some(true));
+    }
+
+    #[test]
+    fn next_action_from_usage_bare_optional_positional() {
+        let action = next_action_from_usage("app x [<optional>]", "X");
+        let params = action.params.as_ref().expect("params should be present");
+        assert_eq!(params.get("optional").unwrap().required, Some(false));
+    }
+
+    // --- Audit: leading placeholder/flag next_action is a dead link ---
+
+    #[test]
+    fn audit_flags_next_action_leading_with_placeholder() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("a", "Command A")
+                .usage("app a")
+                .handler(|_req, _ctx| Box::pin(async move { Ok(CommandOutput::new(json!({}))) }))
+                .default_next_action(NextAction::new("<id>", "names no command")),
+        );
+        let report = cli.audit();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == "DANGLING_NEXT_ACTION")
+        );
+    }
+
+    #[test]
+    fn audit_allows_bare_root_next_action() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("a", "Command A")
+                .usage("app a")
+                .handler(|_req, _ctx| Box::pin(async move { Ok(CommandOutput::new(json!({}))) }))
+                .default_next_action(NextAction::new("app", "Inspect the root tree")),
+        );
+        assert!(cli.audit().is_clean(), "{:?}", cli.audit().findings);
     }
 }

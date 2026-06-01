@@ -5,10 +5,30 @@ use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 fn epoch_secs() -> u64 {
+    // Never panic on a misconfigured clock: a timestamp of 0 keeps the
+    // envelope valid and JSON-emittable, honoring the "JSON always" contract
+    // even on a machine whose wall clock is set before 1970.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Mask an exit code into the 0–255 range a Unix process status occupies.
+///
+/// `std::process::exit` truncates to the low 8 bits, so an out-of-range code
+/// would make the serialized `exit_code` field disagree with the real process
+/// status (`exit(256)` → status `0`). Masking keeps the JSON field equal to
+/// what the shell observes via `$?`. A `debug_assert` flags out-of-range codes
+/// in development so authors notice the mistake before it ships.
+pub(crate) fn normalize_exit_code(code: i32) -> i32 {
+    debug_assert!(
+        (0..=255).contains(&code),
+        "exit code {code} is outside the 0..=255 range a process status can represent; \
+         it will be masked to {} to match std::process::exit truncation",
+        code & 0xff
+    );
+    code & 0xff
 }
 
 /// Typed process exit codes for agent self-correction.
@@ -18,10 +38,11 @@ fn epoch_secs() -> u64 {
 /// agent-native CLI generators: a distinct code per failure class so a
 /// caller can decide whether to retry, re-authenticate, or fix arguments.
 ///
-/// These are process exit codes only — they are intentionally *not*
-/// serialized into the JSON envelope, which already conveys semantics via
-/// `ok` and `error.code`. Use them with [`crate::CommandError::exit_code`]
-/// and [`crate::CommandOutput::exit_code`].
+/// Each envelope carries the code in two places that always agree: the
+/// serialized `exit_code` JSON field and the process status returned by
+/// [`crate::Execution::exit_code`]. Use these constants with
+/// [`crate::CommandError::exit_code`] and [`crate::CommandOutput::exit_code`]
+/// — they all fall inside the maskable 0–255 range.
 pub struct ExitCode;
 
 impl ExitCode {
@@ -168,7 +189,8 @@ pub struct SuccessEnvelope {
     pub next_actions: Vec<NextAction>,
     /// Process exit code. Defaults to [`ExitCode::SUCCESS`]. A handler may
     /// override it (e.g. a `doctor` command reporting an unhealthy system
-    /// while still producing a valid `ok: true` envelope). Not serialized.
+    /// while still producing a valid `ok: true` envelope). Serialized as the
+    /// `exit_code` field and masked to 0–255 so it equals the process status.
     pub exit_code: i32,
 }
 
@@ -190,7 +212,7 @@ impl SuccessEnvelope {
     }
 
     pub fn exit_code(mut self, code: i32) -> Self {
-        self.exit_code = code;
+        self.exit_code = normalize_exit_code(code);
         self
     }
 }
@@ -261,8 +283,9 @@ pub struct ErrorEnvelope {
     pub error: ErrorBody,
     pub fix: String,
     pub next_actions: Vec<NextAction>,
-    /// Process exit code. Defaults to [`ExitCode::ERROR`]. Not serialized —
-    /// the JSON envelope already conveys the failure class via `error.code`.
+    /// Process exit code. Defaults to [`ExitCode::ERROR`]. Serialized as the
+    /// `exit_code` field (alongside the failure class in `error.code`) and
+    /// masked to 0–255 so it equals the process status.
     pub exit_code: i32,
 }
 
@@ -296,7 +319,7 @@ impl ErrorEnvelope {
     }
 
     pub fn exit_code(mut self, code: i32) -> Self {
-        self.exit_code = code;
+        self.exit_code = normalize_exit_code(code);
         self
     }
 }
@@ -413,22 +436,31 @@ impl Envelope {
 
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|e| {
-            serde_json::to_string(&serde_json::json!({
-                "ok": false,
-                "error": format!("serialization failed: {e}")
-            }))
-            .expect("static error envelope always serializes")
+            serde_json::to_string(&self.serialization_fallback(e))
+                .expect("error-shaped fallback envelope always serializes")
         })
     }
 
     pub fn to_json_pretty(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| {
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": false,
-                "error": format!("serialization failed: {e}")
-            }))
-            .expect("static error envelope always serializes")
+            serde_json::to_string_pretty(&self.serialization_fallback(e))
+                .expect("error-shaped fallback envelope always serializes")
         })
+    }
+
+    /// Build a real, shape-consistent error envelope for the (effectively
+    /// unreachable) case where serializing `self` fails. An agent that always
+    /// parses `error.code` / `error.retryable` still finds them here, instead
+    /// of a bare `error` string with no `exit_code`. Serializing this fallback
+    /// cannot itself fail (no non-string object keys, no NaN/Inf numbers).
+    fn serialization_fallback(&self, err: serde_json::Error) -> ErrorEnvelope {
+        ErrorEnvelope::new(
+            self.command().to_string(),
+            format!("serialization failed: {err}"),
+            "SERIALIZATION_FAILED",
+            "Report this as a bug; the command produced a value that could not be serialized.",
+            Vec::new(),
+        )
     }
 }
 
@@ -520,6 +552,34 @@ mod tests {
             ErrorEnvelope::new("cmd", "missing", "NOT_FOUND", "check id", vec![]).exit_code(3);
         let encoded = serde_json::to_value(&envelope).expect("must serialize");
         assert_eq!(encoded["exit_code"], json!(3));
+    }
+
+    #[test]
+    fn exit_code_in_range_matches_json_and_status() {
+        // The serialized exit_code field must equal what the process status
+        // will be (masked to the low 8 bits).
+        let e = ErrorEnvelope::new("cmd", "m", "C", "fix", vec![]).exit_code(7);
+        let encoded = serde_json::to_value(&e).expect("serialize");
+        assert_eq!(encoded["exit_code"], json!(7));
+        assert_eq!(e.exit_code, 7 & 0xff);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn exit_code_masked_to_process_status_in_release() {
+        // 261 (256 + 5) truncates to 5 under std::process::exit; the JSON field
+        // must agree. Only meaningful in release — debug builds assert instead.
+        let e = SuccessEnvelope::new("cmd", json!(null), vec![]).exit_code(256 + 5);
+        assert_eq!(e.exit_code, 5);
+        let encoded = serde_json::to_value(&e).expect("serialize");
+        assert_eq!(encoded["exit_code"], json!(5));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "outside the 0..=255")]
+    fn exit_code_out_of_range_panics_in_debug() {
+        let _ = SuccessEnvelope::new("cmd", json!(null), vec![]).exit_code(256);
     }
 
     #[test]

@@ -405,6 +405,10 @@ pub enum FlushPolicy {
 pub struct NdjsonEmitter<W: AsyncWrite + Unpin> {
     writer: W,
     terminated: bool,
+    /// Set when a write/flush error may have left a partial line on the wire.
+    /// A poisoned emitter refuses further events so a retry cannot concatenate
+    /// onto a corrupt line. Distinct from `terminated` (a clean terminal event).
+    poisoned: bool,
     flush_policy: FlushPolicy,
 }
 
@@ -413,6 +417,7 @@ impl<W: AsyncWrite + Unpin> NdjsonEmitter<W> {
         Self {
             writer,
             terminated: false,
+            poisoned: false,
             flush_policy: FlushPolicy::default(),
         }
     }
@@ -424,29 +429,42 @@ impl<W: AsyncWrite + Unpin> NdjsonEmitter<W> {
     }
 
     pub async fn emit(&mut self, event: StreamEvent) -> Result<(), StreamEmitError> {
-        if self.terminated {
+        if self.terminated || self.poisoned {
             return Err(StreamEmitError::AlreadyTerminated);
         }
 
         let terminal = event.is_terminal();
-        // Serialize to a buffer first so a serde failure cannot leave a
-        // partial line on the wire.
+        // Serialize fully into a buffer first so a *serde* failure cannot leave
+        // a partial line on the wire (it returns here with nothing written).
+        // This does NOT protect against I/O failures: write_all can commit a
+        // prefix of the buffer before erroring, so any write error past this
+        // point poisons the emitter (below) to stop compounding corruption.
         let mut line = serde_json::to_vec(&event)?;
         line.push(b'\n');
-        self.writer.write_all(&line).await?;
+        if let Err(e) = self.writer.write_all(&line).await {
+            // A partial line may now be on the wire. Refuse further events so a
+            // retry cannot concatenate onto the broken line.
+            self.poisoned = true;
+            return Err(StreamEmitError::Io(e));
+        }
+
+        // The line and its newline are fully committed. Mark a terminal event
+        // terminated NOW — before the flush — so a flush error cannot leave the
+        // emitter open to a second terminal event.
+        if terminal {
+            self.terminated = true;
+        }
 
         let should_flush = match self.flush_policy {
             FlushPolicy::Every => true,
             FlushPolicy::Terminal => terminal,
             FlushPolicy::Never => false,
         };
-        if should_flush {
-            self.writer.flush().await?;
+        if should_flush && let Err(e) = self.writer.flush().await {
+            self.poisoned = true;
+            return Err(StreamEmitError::Io(e));
         }
 
-        if terminal {
-            self.terminated = true;
-        }
         Ok(())
     }
 
@@ -458,8 +476,17 @@ impl<W: AsyncWrite + Unpin> NdjsonEmitter<W> {
         self.emit(StreamEvent::error_from_envelope(envelope)).await
     }
 
+    /// True once a terminal `result`/`error` line has been written — even if a
+    /// subsequent flush failed (the bytes are already committed). A caller can
+    /// gate further output on this without risking a second terminal event.
     pub fn terminated(&self) -> bool {
         self.terminated
+    }
+
+    /// True if a write or flush error may have left a partial line on the wire.
+    /// A poisoned emitter rejects further events with [`StreamEmitError::AlreadyTerminated`].
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
     }
 
     pub fn into_inner(self) -> W {
@@ -472,6 +499,76 @@ mod tests {
     use super::*;
     use crate::envelope::{ErrorEnvelope, SuccessEnvelope};
     use serde_json::json;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    /// A writer test double that can short-write/error on `poll_write` and/or
+    /// error on `poll_flush`, and records every byte it accepts so a test can
+    /// inspect exactly what reached the wire.
+    struct FailingWriter {
+        wire: Vec<u8>,
+        /// Max bytes accepted per `poll_write` before erroring (`None` = no cap).
+        write_cap: Option<usize>,
+        /// Errors remaining to return from `poll_write` once the cap is hit.
+        write_errors: usize,
+        /// Errors remaining to return from `poll_flush`.
+        flush_errors: usize,
+        flushes: usize,
+    }
+
+    impl FailingWriter {
+        fn write_cap(cap: usize, errors: usize) -> Self {
+            Self {
+                wire: Vec::new(),
+                write_cap: Some(cap),
+                write_errors: errors,
+                flush_errors: 0,
+                flushes: 0,
+            }
+        }
+
+        fn flush_fail(errors: usize) -> Self {
+            Self {
+                wire: Vec::new(),
+                write_cap: None,
+                write_errors: 0,
+                flush_errors: errors,
+                flushes: 0,
+            }
+        }
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let cap = self.write_cap.unwrap_or(buf.len());
+            let take = buf.len().min(cap);
+            // Commit the accepted prefix to the wire (models a partial write).
+            self.wire.extend_from_slice(&buf[..take]);
+            if take < buf.len() && self.write_errors > 0 {
+                self.write_errors -= 1;
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom")));
+            }
+            Poll::Ready(Ok(take))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            if self.flush_errors > 0 {
+                self.flush_errors -= 1;
+                return Poll::Ready(Err(io::Error::other("flush boom")));
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn emitter_writes_ndjson_lines() {
@@ -624,6 +721,106 @@ mod tests {
     #[test]
     fn flush_policy_default_is_every() {
         assert_eq!(FlushPolicy::default(), FlushPolicy::Every);
+    }
+
+    #[tokio::test]
+    async fn write_error_poisons_emitter_and_rejects_retry() {
+        // Cap the writer at 10 bytes then error: the first emit commits a
+        // newline-less fragment and fails. The emitter must poison itself so a
+        // retry cannot concatenate onto the broken line.
+        let writer = FailingWriter::write_cap(10, 1);
+        let mut emitter = NdjsonEmitter::new(writer);
+
+        let first = emitter
+            .emit(StreamEvent::Start {
+                command: "app run".to_string(),
+                ts: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await;
+        assert!(matches!(first, Err(StreamEmitError::Io(_))));
+        assert!(emitter.poisoned());
+        assert!(!emitter.terminated());
+
+        // A retry must be refused rather than appended to the partial line.
+        let retry = emitter
+            .emit(StreamEvent::Start {
+                command: "app run".to_string(),
+                ts: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await;
+        assert!(matches!(retry, Err(StreamEmitError::AlreadyTerminated)));
+
+        // Exactly the accepted prefix is on the wire; nothing was concatenated.
+        let wire = emitter.into_inner().wire;
+        assert_eq!(wire.len(), 10);
+        assert!(!wire.ends_with(b"\n"));
+    }
+
+    #[tokio::test]
+    async fn flush_failure_on_terminal_still_marks_terminated() {
+        // The terminal line is fully written, then flush fails. terminated()
+        // must report true so a caller cannot emit a second terminal event.
+        let writer = FailingWriter::flush_fail(1);
+        let mut emitter = NdjsonEmitter::new(writer);
+
+        let res = emitter
+            .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
+            .await;
+        assert!(matches!(res, Err(StreamEmitError::Io(_))));
+        assert!(emitter.terminated());
+
+        // A second terminal event is rejected.
+        let second = emitter
+            .emit_error(ErrorEnvelope::new("cmd", "x", "X", "fix", vec![]))
+            .await;
+        assert!(matches!(second, Err(StreamEmitError::AlreadyTerminated)));
+
+        // The full terminal line (with newline) did reach the wire.
+        let wire = emitter.into_inner().wire;
+        assert!(wire.ends_with(b"\n"));
+        assert!(String::from_utf8_lossy(&wire).contains("\"type\":\"result\""));
+    }
+
+    #[tokio::test]
+    async fn flush_policy_never_does_not_flush() {
+        // FlushPolicy::Never must not call flush even on a terminal event — a
+        // flush-erroring writer would surface the error if it did.
+        let writer = FailingWriter::flush_fail(10);
+        let mut emitter = NdjsonEmitter::new(writer).with_flush_policy(FlushPolicy::Never);
+        emitter
+            .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
+            .await
+            .expect("Never policy must not flush, so no flush error surfaces");
+        assert!(emitter.terminated());
+        assert_eq!(emitter.into_inner().flushes, 0);
+    }
+
+    #[tokio::test]
+    async fn flush_policy_terminal_flushes_only_on_terminal() {
+        // A non-terminal event must not flush; the terminal event must.
+        let writer = FailingWriter {
+            wire: Vec::new(),
+            write_cap: None,
+            write_errors: 0,
+            flush_errors: 0,
+            flushes: 0,
+        };
+        let mut emitter = NdjsonEmitter::new(writer).with_flush_policy(FlushPolicy::Terminal);
+        emitter
+            .emit(StreamEvent::Log {
+                level: LogLevel::Info,
+                message: "buffered".to_string(),
+                ts: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .expect("log must emit");
+        // No flush yet for the non-terminal log.
+        // (Checked indirectly: a fresh emitter's flush count is observed below.)
+        emitter
+            .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
+            .await
+            .expect("terminal result must emit");
+        assert_eq!(emitter.into_inner().flushes, 1);
     }
 
     #[cfg(feature = "deserialize")]
