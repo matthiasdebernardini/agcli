@@ -192,9 +192,9 @@ cargo pgo build
 cargo pgo optimize
 ```
 
-## Wokhei-style example
+## Full example
 
-See [examples/ops.rs](examples/ops.rs) for a full example with:
-- command tree responses
-- contextual next actions
-- log truncation file pointers
+See [examples/ops.rs](examples/ops.rs) — a runnable `ops` CLI demonstrating:
+- the self-documenting command tree
+- contextual `next_actions`
+- log truncation with file pointers
