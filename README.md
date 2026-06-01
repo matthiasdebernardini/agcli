@@ -182,23 +182,6 @@ processes. If you build a long-running, allocation-heavy CLI and measure a
 win, add `tikv-jemallocator` (or another allocator) directly in your binary
 via `#[global_allocator]` — agcli does not bundle one.
 
-### Build-machine-specific codegen
-
-```bash
-RUSTFLAGS="-C target-cpu=native" cargo build --release
-```
-
-Do **not** commit this into the repo — it breaks cross-compilation portability.
-
-### PGO (Profile-Guided Optimization)
-
-```bash
-cargo install cargo-pgo
-cargo pgo build
-./target/release/myapp <typical args>   # run representative workload
-cargo pgo optimize
-```
-
 ## Full example
 
 See [examples/ops.rs](examples/ops.rs) — a runnable `ops` CLI demonstrating:
