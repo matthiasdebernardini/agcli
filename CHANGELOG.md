@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.9.1) - 2026-06-01
+
+Documentation and release-tooling fixes. No code or API changes.
+
+### Documentation
+
+- Rename the confusing "Wokhei-style example" README heading to "Full example"
+  (the section points at the `ops` example, not a `wokhei` one).
+- Document the tag-driven release process in `CLAUDE.md`.
+
+### CI
+
+- Make the release workflow's publish step idempotent: it now skips cleanly
+  when the crate version is already on crates.io instead of failing the run.
+
 ## [0.9.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.9.0) - 2026-06-01
 
 Folds the agent-native CLI strategies from
