@@ -1239,11 +1239,12 @@ impl AgentCli {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "<missing>".to_string());
+            let valid: Vec<&str> = self.commands.keys().map(String::as_str).collect();
             return self.error_execution(
                 invocation.command_line().to_string(),
                 format!("unknown command: {unknown}"),
                 "UNKNOWN_COMMAND",
-                "Run the root command and use one of the listed command templates.",
+                unknown_command_fix("command", &unknown, &valid),
                 false,
                 self.root_actions(),
             );
@@ -1268,14 +1269,12 @@ impl AgentCli {
                 return self.command_tree_execution(&invocation, &resolved.path, command);
             }
             let path_strs = path_refs(&resolved.path);
+            let valid: Vec<&str> = command.subcommands.keys().map(String::as_str).collect();
             return self.error_execution(
                 invocation.command_line().to_string(),
                 format!("unknown subcommand: {}", resolved.remaining[0]),
                 "UNKNOWN_SUBCOMMAND",
-                format!(
-                    "Use one of the listed subcommands under `{}`.",
-                    resolved.path.join(" ")
-                ),
+                unknown_command_fix("subcommand", &resolved.remaining[0], &valid),
                 false,
                 self.subcommand_actions(&path_strs, command),
             );
@@ -1438,11 +1437,13 @@ impl AgentCli {
 
         let resolved = self.resolve_command(invocation.positionals());
         if resolved.path.is_empty() {
+            let unknown = invocation.positionals()[0].clone();
+            let valid: Vec<&str> = self.commands.keys().map(String::as_str).collect();
             return self.error_execution(
                 invocation.command_line().to_string(),
-                format!("unknown command: {}", invocation.positionals()[0]),
+                format!("unknown command: {unknown}"),
                 "UNKNOWN_COMMAND",
-                "Run the root command and inspect the listed templates.",
+                unknown_command_fix("command", &unknown, &valid),
                 false,
                 self.root_actions(),
             );
@@ -1465,14 +1466,12 @@ impl AgentCli {
         // Reject trailing unknown tokens when the command has subcommands
         if !resolved.remaining.is_empty() && !command.subcommands.is_empty() {
             let path_strs = path_refs(&resolved.path);
+            let valid: Vec<&str> = command.subcommands.keys().map(String::as_str).collect();
             return self.error_execution(
                 invocation.command_line().to_string(),
                 format!("unknown subcommand: {}", resolved.remaining[0]),
                 "UNKNOWN_SUBCOMMAND",
-                format!(
-                    "Use one of the listed subcommands under `{}`.",
-                    resolved.path.join(" ")
-                ),
+                unknown_command_fix("subcommand", &resolved.remaining[0], &valid),
                 false,
                 self.subcommand_actions(&path_strs, command),
             );
@@ -1796,6 +1795,64 @@ impl AgentCli {
 
 fn path_refs(path: &[String]) -> Vec<&str> {
     path.iter().map(String::as_str).collect()
+}
+
+/// Corrective `fix` text for an unknown command/subcommand error.
+///
+/// Lists every valid name inline so a *semantic* miss — e.g. guessing `list`
+/// when the verb is `history`, which no edit-distance check would ever relate —
+/// is corrected on the first read instead of triggering another blind guess.
+/// When the bad token also looks like a typo of a real name, a nearest-match
+/// nudge is prefixed. `next_actions` already carry the full templates; this puts
+/// the names where the agent reads first.
+fn unknown_command_fix(scope: &str, bad: &str, valid: &[&str]) -> String {
+    if valid.is_empty() {
+        return format!("Run the root command to inspect the available {scope}s.");
+    }
+    use std::fmt::Write as _;
+    let mut fix = String::new();
+    if let Some(near) = nearest_name(bad, valid) {
+        let _ = write!(&mut fix, "Did you mean `{near}`? ");
+    }
+    let _ = write!(&mut fix, "Valid {scope}s: {}.", valid.join(", "));
+    fix
+}
+
+/// Closest candidate by case-insensitive Levenshtein distance, gated so only a
+/// plausible typo is offered: edit distance ≤ 2 and strictly less than the
+/// candidate's length (so an unrelated short word can't match by coincidence).
+fn nearest_name(bad: &str, valid: &[&str]) -> Option<String> {
+    let bad_lower = bad.to_lowercase();
+    valid
+        .iter()
+        .map(|cand| (*cand, levenshtein(&bad_lower, &cand.to_lowercase())))
+        .filter(|(cand, dist)| *dist <= 2 && *dist < cand.chars().count().max(1))
+        .min_by_key(|(_, dist)| *dist)
+        .map(|(cand, _)| cand.to_string())
+}
+
+/// Classic single-row-DP Levenshtein edit distance. Inputs are command names
+/// (a handful of chars), so the per-call allocation is negligible.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
 }
 
 fn collect_bool_flags(command: &Command, set: &mut HashSet<String>, depth: usize) {
@@ -2313,6 +2370,68 @@ mod tests {
             panic!("expected error envelope");
         };
         assert_eq!(envelope.error.code, "UNKNOWN_SUBCOMMAND");
+    }
+
+    // --- did-you-mean / inline-valid-names on unknown command|subcommand ---
+
+    #[tokio::test]
+    async fn unknown_subcommand_fix_inlines_valid_names() {
+        let cli = sample_cli();
+        // `list` is a semantic miss (no edit-distance relation to `stream`), so
+        // no nudge — but the valid subcommand must be inlined so the agent
+        // corrects in one read instead of guessing again.
+        let run = cli.run_argv(["wokhei", "gateway", "list"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error envelope");
+        };
+        assert_eq!(envelope.error.code, "UNKNOWN_SUBCOMMAND");
+        assert!(
+            envelope.fix.contains("Valid subcommands: stream."),
+            "fix should inline valid subcommands, got: {}",
+            envelope.fix
+        );
+        assert!(!envelope.fix.contains("Did you mean"));
+    }
+
+    #[tokio::test]
+    async fn unknown_subcommand_fix_suggests_typo() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "gateway", "streem"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error envelope");
+        };
+        assert_eq!(envelope.error.code, "UNKNOWN_SUBCOMMAND");
+        assert!(
+            envelope.fix.contains("Did you mean `stream`?"),
+            "fix should nudge the nearest name, got: {}",
+            envelope.fix
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_command_fix_inlines_valid_names() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "bogus"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error envelope");
+        };
+        assert_eq!(envelope.error.code, "UNKNOWN_COMMAND");
+        assert!(envelope.fix.contains("Valid commands:"));
+        assert!(envelope.fix.contains("gateway"));
+        assert!(envelope.fix.contains("status"));
+    }
+
+    #[test]
+    fn nearest_name_gates_unrelated_words() {
+        // typo within distance 2 → suggested
+        assert_eq!(
+            nearest_name("streem", &["stream", "status"]),
+            Some("stream".to_string())
+        );
+        // semantic miss, far from any real name → no suggestion
+        assert_eq!(nearest_name("list", &["stream", "status"]), None);
+        // empty candidate set → no suggestion
+        assert_eq!(nearest_name("x", &[]), None);
     }
 
     // --- root_field cannot shadow core keys ---
