@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.2](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.10.2) - 2026-06-09
+
+Usability release: unknown-command/subcommand errors now self-correct. No schema
+change (the `fix` field already existed), so this is a **patch** bump.
+
+### Improvements
+
+- **Unknown-command and unknown-subcommand `fix` text now inlines every valid
+    name** instead of a generic "inspect the listed templates" pointer. A
+    *semantic* miss — e.g. guessing `list` when the verb is `history`, which no
+    edit-distance check would ever relate — is corrected on the first read
+    instead of triggering another blind guess.
+- **A "Did you mean `<name>`?" nudge is prefixed when the bad token looks like a
+    typo** of a real name (case-insensitive Levenshtein distance ≤ 2, gated below
+    the candidate's length so an unrelated short word can't match by
+    coincidence).
+
 ## [0.10.1](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.10.1) - 2026-06-01
 
 Documentation-only release.

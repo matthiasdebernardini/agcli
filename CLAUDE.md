@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-agcli = "0.10.1"
+agcli = "0.10.2"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -191,7 +191,7 @@ agcli targets **macOS and Linux only**. The crate ships with optimized release/b
 
 ```toml
 [dependencies]
-agcli = "0.10.1"
+agcli = "0.10.2"
 
 [profile.release]
 opt-level = 3
