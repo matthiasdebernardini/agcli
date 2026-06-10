@@ -23,7 +23,7 @@ It is built around the design in [design.md](design.md):
 
 ```toml
 [dependencies]
-agcli = "0.10.2"
+agcli = "0.11.0"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -135,7 +135,7 @@ Err(CommandError::new("no such issue", "NOT_FOUND", "Check the id")
 ```
 
 ```json
-{ "ok": false, "command": "app get 9", "timestamp": 1740000000,
+{ "ok": false, "command": "app get 9", "timestamp": "2025-02-19T21:20:00Z",
   "exit_code": 3, "error": { "message": "no such issue", "code": "NOT_FOUND",
   "retryable": false }, "fix": "Check the id", "next_actions": [ ... ] }
 ```
@@ -169,7 +169,7 @@ agcli targets **macOS and Linux only**. The crate ships with optimized release/b
 
 ```toml
 [dependencies]
-agcli = "0.10.2"
+agcli = "0.11.0"
 
 [profile.release]
 opt-level = 3

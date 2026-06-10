@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.11.0) - 2026-06-10
+
+Schema release: the envelope `timestamp` becomes human-readable. Pre-1.0 schema
+changes are a **minor** bump.
+
+### Breaking changes
+
+- **`timestamp` is now an RFC 3339 UTC string** (`"2026-06-10T14:42:17Z"`)
+    instead of Unix epoch seconds, in both response envelopes and NDJSON
+    terminal `result`/`error` events. An epoch integer is unreadable to humans
+    and to LLM agents alike; the formatted string means every agcli response
+    tells the agent the current date and time directly — no conversion, no
+    custom hooks. Consumers parsing `timestamp` as a number must update.
+    The Rust API is unchanged: `SuccessEnvelope::timestamp` /
+    `ErrorEnvelope::timestamp` remain `u64` epoch seconds (sortable,
+    arithmetic-friendly); only the JSON serialization formats it.
+
+### Improvements
+
+- The formatter is hand-rolled (Howard Hinnant's civil-from-days algorithm),
+    so the dependency set stays serde/serde_json/tokio. Epoch 0 — the
+    never-panic fallback for a pre-1970 wall clock — renders as
+    `1970-01-01T00:00:00Z`, preserving the "JSON always" contract.
+- Under the `deserialize` feature, `timestamp` is read tolerantly: the new
+    RFC 3339 string, a legacy pre-0.11 epoch integer, or anything unparseable
+    (which folds to 0, matching the missing-field default).
+- Non-terminal stream events' caller-supplied `ts` is now documented as
+    RFC 3339 UTC to match the terminal events.
+
 ## [0.10.2](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.10.2) - 2026-06-09
 
 Usability release: unknown-command/subcommand errors now self-correct. No schema

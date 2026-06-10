@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-agcli = "0.10.2"
+agcli = "0.11.0"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -111,7 +111,7 @@ cargo run --example calc -- add foo bar  # Error case (typed-error envelope)
 {
   "ok": true,
   "command": "calc add 3 5",
-  "timestamp": 1740000000,
+  "timestamp": "2025-02-19T21:20:00Z",
   "exit_code": 0,
   "result": {
     "operation": "add",
@@ -144,7 +144,7 @@ cargo run --example calc -- add foo bar  # Error case (typed-error envelope)
 {
   "ok": false,
   "command": "calc add foo bar",
-  "timestamp": 1740000000,
+  "timestamp": "2025-02-19T21:20:00Z",
   "exit_code": 1,
   "error": {
     "message": "argument <a> is not valid: \"foo\"",
@@ -171,7 +171,7 @@ cargo run --example calc -- add foo bar  # Error case (typed-error envelope)
 
 ## Key patterns
 
-- **Envelope structure**: Every response has `ok`, `command`, `timestamp`, `exit_code`, `result`/`error`, `next_actions`
+- **Envelope structure**: Every response has `ok`, `command`, `timestamp` (RFC 3339 UTC string, e.g. `"2026-06-10T14:42:17Z"` — agents always know the current time), `exit_code`, `result`/`error`, `next_actions`
 - **Typed exit codes**: `exit_code` is both the process status and a JSON field. Framework usage errors are `2`; handler errors default to `1` and opt into `ExitCode::{NOT_FOUND, AUTH, API, RATE_LIMITED, …}` via `CommandError::exit_code(...)`
 - **Template vs literal next_actions**: When `params` is present, `command` is a template (agent fills placeholders). When absent, it's literal (run as-is).
 - **Pre-filled values**: Use `ActionParam::new().value(json!(result))` to pre-fill context from the current operation
@@ -191,7 +191,7 @@ agcli targets **macOS and Linux only**. The crate ships with optimized release/b
 
 ```toml
 [dependencies]
-agcli = "0.10.2"
+agcli = "0.11.0"
 
 [profile.release]
 opt-level = 3
