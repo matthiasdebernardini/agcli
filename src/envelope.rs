@@ -14,6 +14,95 @@ fn epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Format epoch seconds as an RFC 3339 UTC timestamp (`2026-06-10T14:42:17Z`).
+///
+/// Hand-rolled (Howard Hinnant's civil-from-days algorithm) so the dependency
+/// set stays serde/serde_json/tokio. Envelopes serialize `timestamp` through
+/// this so agents read the current date directly instead of epoch seconds.
+pub(crate) fn rfc3339_utc(epoch: u64) -> String {
+    let secs_of_day = epoch % 86_400;
+    let (hh, mm, ss) = (
+        secs_of_day / 3_600,
+        secs_of_day % 3_600 / 60,
+        secs_of_day % 60,
+    );
+
+    // epoch is unsigned, so plain division suffices: no pre-1970 date can
+    // reach here (epoch_secs clamps a misconfigured clock to 0).
+    let z = epoch / 86_400 + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Parse exactly the shape [`rfc3339_utc`] emits (`YYYY-MM-DDTHH:MM:SSZ`)
+/// back to epoch seconds. Returns `None` for anything else, including
+/// pre-1970 dates and non-UTC offsets.
+#[cfg(any(feature = "deserialize", test))]
+pub(crate) fn parse_rfc3339_utc(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| s[range].parse::<u64>().ok();
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+
+    // Hinnant's days_from_civil, the inverse of rfc3339_utc above.
+    let y = year - u64::from(month <= 2);
+    let era = y / 400;
+    let yoe = y % 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
+}
+
+/// Accept `timestamp` as either the RFC 3339 string current envelopes emit or
+/// the legacy epoch integer (pre-0.11 captures). Unparseable values fold to 0
+/// — the same lenient default as a missing field.
+#[cfg(feature = "deserialize")]
+pub(crate) fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Epoch(u64),
+        Rfc3339(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Repr::deserialize(deserializer)? {
+        Repr::Epoch(n) => n,
+        Repr::Rfc3339(s) => parse_rfc3339_utc(&s).unwrap_or(0),
+        Repr::Other(_) => 0,
+    })
+}
+
 /// Mask an exit code into the 0–255 range a Unix process status occupies.
 ///
 /// `std::process::exit` truncates to the low 8 bits, so an out-of-range code
@@ -224,7 +313,7 @@ impl Serialize for SuccessEnvelope {
         let mut s = serializer.serialize_struct("SuccessEnvelope", field_count)?;
         s.serialize_field("ok", &true)?;
         s.serialize_field("command", &self.command)?;
-        s.serialize_field("timestamp", &self.timestamp)?;
+        s.serialize_field("timestamp", &rfc3339_utc(self.timestamp))?;
         s.serialize_field("exit_code", &self.exit_code)?;
         if let Some(ref sv) = self.schema_version {
             s.serialize_field("schema_version", sv)?;
@@ -245,7 +334,7 @@ impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
         struct Raw {
             ok: bool,
             command: String,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "deserialize_timestamp")]
             timestamp: u64,
             #[serde(default)]
             exit_code: i32,
@@ -331,7 +420,7 @@ impl Serialize for ErrorEnvelope {
         let mut s = serializer.serialize_struct("ErrorEnvelope", field_count)?;
         s.serialize_field("ok", &false)?;
         s.serialize_field("command", &self.command)?;
-        s.serialize_field("timestamp", &self.timestamp)?;
+        s.serialize_field("timestamp", &rfc3339_utc(self.timestamp))?;
         s.serialize_field("exit_code", &self.exit_code)?;
         if let Some(ref sv) = self.schema_version {
             s.serialize_field("schema_version", sv)?;
@@ -356,7 +445,7 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
         struct Raw {
             ok: bool,
             command: String,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "deserialize_timestamp")]
             timestamp: u64,
             #[serde(default = "default_error_exit_code")]
             exit_code: i32,
@@ -495,7 +584,13 @@ mod tests {
             encoded["command"],
             Value::String("wokhei status".to_string())
         );
-        assert!(encoded["timestamp"].is_u64());
+        let ts = encoded["timestamp"]
+            .as_str()
+            .expect("timestamp is a string");
+        assert!(
+            parse_rfc3339_utc(ts).is_some(),
+            "timestamp must be RFC 3339 UTC: {ts}"
+        );
         assert!(encoded["next_actions"].is_array());
         // exit_code is always present; success defaults to 0.
         assert_eq!(encoded["exit_code"], json!(0));
@@ -535,7 +630,13 @@ mod tests {
             Value::String("INVALID_JSON".to_string())
         );
         assert_eq!(encoded["error"]["retryable"], Value::Bool(false));
-        assert!(encoded["timestamp"].is_u64());
+        let ts = encoded["timestamp"]
+            .as_str()
+            .expect("timestamp is a string");
+        assert!(
+            parse_rfc3339_utc(ts).is_some(),
+            "timestamp must be RFC 3339 UTC: {ts}"
+        );
         assert_eq!(
             encoded["fix"],
             Value::String("Use valid JSON input".to_string())
@@ -635,6 +736,71 @@ mod tests {
         let json = r#"{"ok":true,"command":"test","timestamp":0,"error":{"message":"x","code":"X","retryable":false},"fix":"y","next_actions":[]}"#;
         let result: Result<ErrorEnvelope, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rfc3339_utc_formats_known_epochs() {
+        // Edge cases: epoch 0 (misconfigured-clock fallback), leap day,
+        // year boundary, and a post-2038 value (no 32-bit rollover).
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_767_225_599), "2025-12-31T23:59:59Z");
+        assert_eq!(rfc3339_utc(1_767_225_600), "2026-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(4_102_444_800), "2100-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_utc_roundtrips_through_parser() {
+        for epoch in [
+            0,
+            1,
+            86_399,
+            86_400,
+            951_782_400,   // 2000-02-29 (divisible-by-400 leap year)
+            1_709_164_800, // 2024-02-29
+            1_740_000_000,
+            1_767_225_599,
+            2_147_483_648, // past the 32-bit signed rollover
+            4_102_444_800, // 2100
+        ] {
+            let formatted = rfc3339_utc(epoch);
+            assert_eq!(
+                parse_rfc3339_utc(&formatted),
+                Some(epoch),
+                "round-trip failed for {epoch} ({formatted})"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rfc3339_utc_rejects_malformed_input() {
+        for bad in [
+            "",
+            "1740000000",
+            "2026-06-10",
+            "2026-06-10T14:42:17",       // missing Z
+            "2026-06-10T14:42:17+02:00", // non-UTC offset
+            "2026-13-01T00:00:00Z",      // month 13
+            "2026-06-10T24:00:00Z",      // hour 24
+            "1969-12-31T23:59:59Z",      // pre-epoch
+            "not a timestamp at allZ",
+        ] {
+            assert_eq!(parse_rfc3339_utc(bad), None, "must reject {bad:?}");
+        }
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn envelope_accepts_legacy_epoch_timestamp() {
+        // Pre-0.11 captures carry timestamp as epoch seconds.
+        let json =
+            r#"{"ok":true,"command":"cmd","timestamp":1740000000,"result":null,"next_actions":[]}"#;
+        let decoded: SuccessEnvelope = serde_json::from_str(json).expect("must deserialize");
+        assert_eq!(decoded.timestamp, 1_740_000_000);
+
+        let json = r#"{"ok":false,"command":"cmd","timestamp":"2025-02-19T21:20:00Z","error":{"message":"x","code":"X","retryable":false},"fix":"y","next_actions":[]}"#;
+        let decoded: ErrorEnvelope = serde_json::from_str(json).expect("must deserialize");
+        assert_eq!(decoded.timestamp, 1_740_000_000);
     }
 
     #[cfg(feature = "deserialize")]

@@ -181,7 +181,7 @@ Every command uses this exact shape.
 {
   ok: true,
   command: string,              // the command that was run
-  timestamp: number,            // Unix epoch seconds
+  timestamp: string,            // RFC 3339 UTC ("2026-06-10T14:42:17Z")
   schema_version?: string,      // optional version tag for envelope schema
   result: object,               // command-specific payload
   next_actions: Array<{
@@ -204,7 +204,7 @@ Every command uses this exact shape.
 {
   ok: false,
   command: string,
-  timestamp: number,            // Unix epoch seconds
+  timestamp: string,            // RFC 3339 UTC ("2026-06-10T14:42:17Z")
   schema_version?: string,      // optional version tag for envelope schema
   error: {
     message: string,            // what went wrong
@@ -371,8 +371,8 @@ type StreamEvent =
   | { type: "progress"; name: string; percent?: number; message?: string; ts: string }
   | { type: "log"; level: "info" | "warn" | "error"; message: string; ts: string }
   | { type: "event"; name: string; data: unknown; ts: string }
-  | { type: "result"; ok: true; command: string; timestamp: number; schema_version?: string; result: unknown; next_actions: NextAction[] }
-  | { type: "error"; ok: false; command: string; timestamp: number; schema_version?: string; error: { message: string; code: string; retryable: boolean }; fix: string; next_actions: NextAction[] }
+  | { type: "result"; ok: true; command: string; timestamp: string; schema_version?: string; result: unknown; next_actions: NextAction[] }
+  | { type: "error"; ok: false; command: string; timestamp: string; schema_version?: string; error: { message: string; code: string; retryable: boolean }; fix: string; next_actions: NextAction[] }
 ```
 
 ### Emitting stream events

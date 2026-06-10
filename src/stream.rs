@@ -29,8 +29,11 @@ pub enum LogLevel {
 /// Typed NDJSON stream event.
 ///
 /// Terminal variants (`Result`, `Error`) use custom serialization to inject
-/// `ok` as a fixed boolean and always include `timestamp`. The `ok` field
-/// cannot be set incorrectly — it is derived from the variant.
+/// `ok` as a fixed boolean and always include `timestamp` (emitted as an
+/// RFC 3339 UTC string). The `ok` field cannot be set incorrectly — it is
+/// derived from the variant. The `ts` on non-terminal variants is
+/// caller-supplied; use RFC 3339 UTC (`2026-06-10T14:42:17Z`) to match the
+/// terminal events.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamEvent {
     Start {
@@ -159,7 +162,7 @@ impl Serialize for StreamEvent {
                 map.serialize_entry("type", "result")?;
                 map.serialize_entry("ok", &true)?;
                 map.serialize_entry("command", command)?;
-                map.serialize_entry("timestamp", timestamp)?;
+                map.serialize_entry("timestamp", &crate::envelope::rfc3339_utc(*timestamp))?;
                 map.serialize_entry("exit_code", exit_code)?;
                 if let Some(sv) = schema_version {
                     map.serialize_entry("schema_version", sv)?;
@@ -182,7 +185,7 @@ impl Serialize for StreamEvent {
                 map.serialize_entry("type", "error")?;
                 map.serialize_entry("ok", &false)?;
                 map.serialize_entry("command", command)?;
-                map.serialize_entry("timestamp", timestamp)?;
+                map.serialize_entry("timestamp", &crate::envelope::rfc3339_utc(*timestamp))?;
                 map.serialize_entry("exit_code", exit_code)?;
                 if let Some(sv) = schema_version {
                     map.serialize_entry("schema_version", sv)?;
@@ -206,9 +209,15 @@ fn opt_str_field(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+/// Read a `timestamp` that may be the RFC 3339 string current emitters write
+/// or the legacy epoch integer (pre-0.11 captures).
 #[cfg(feature = "deserialize")]
-fn u64_field(v: &Value, key: &str, default: u64) -> u64 {
-    v.get(key).and_then(Value::as_u64).unwrap_or(default)
+fn timestamp_field(v: &Value, key: &str, default: u64) -> u64 {
+    match v.get(key) {
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(default),
+        Some(Value::String(s)) => crate::envelope::parse_rfc3339_utc(s).unwrap_or(default),
+        _ => default,
+    }
 }
 
 #[cfg(feature = "deserialize")]
@@ -285,7 +294,7 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 }
                 Ok(Self::Result {
                     command: str_field(&value, "command"),
-                    timestamp: u64_field(&value, "timestamp", 0),
+                    timestamp: timestamp_field(&value, "timestamp", 0),
                     exit_code: i32_field(&value, "exit_code", 0),
                     schema_version: opt_str_field(&value, "schema_version"),
                     result: value_field(&value, "result"),
@@ -301,7 +310,7 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 }
                 Ok(Self::Error {
                     command: str_field(&value, "command"),
-                    timestamp: u64_field(&value, "timestamp", 0),
+                    timestamp: timestamp_field(&value, "timestamp", 0),
                     exit_code: i32_field(&value, "exit_code", 1),
                     schema_version: opt_str_field(&value, "schema_version"),
                     error: parse_field(&value, "error", Value::Null)?,
@@ -631,7 +640,10 @@ mod tests {
         let encoded = serde_json::to_value(&event).expect("must serialize");
         assert_eq!(encoded["type"], json!("result"));
         assert_eq!(encoded["ok"], json!(true));
-        assert!(encoded["timestamp"].is_u64());
+        let ts = encoded["timestamp"]
+            .as_str()
+            .expect("timestamp is a string");
+        assert!(ts.ends_with('Z'), "timestamp must be RFC 3339 UTC: {ts}");
         assert_eq!(encoded["schema_version"], json!("v1.0"));
         assert_eq!(encoded["result"]["healthy"], json!(true));
     }
@@ -647,7 +659,10 @@ mod tests {
         let encoded = serde_json::to_value(&event).expect("must serialize");
         assert_eq!(encoded["type"], json!("error"));
         assert_eq!(encoded["ok"], json!(false));
-        assert!(encoded["timestamp"].is_u64());
+        let ts = encoded["timestamp"]
+            .as_str()
+            .expect("timestamp is a string");
+        assert!(ts.ends_with('Z'), "timestamp must be RFC 3339 UTC: {ts}");
         assert_eq!(encoded["schema_version"], json!("v2.0"));
         assert_eq!(encoded["error"]["retryable"], json!(true));
     }
@@ -844,6 +859,21 @@ mod tests {
         let json = serde_json::to_string(&event).expect("must serialize");
         let decoded: StreamEvent = serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(event, decoded);
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn stream_result_accepts_legacy_epoch_timestamp() {
+        // Pre-0.11 captures carry timestamp as epoch seconds.
+        let json = r#"{"type":"result","ok":true,"command":"cmd","timestamp":1740000000,"exit_code":0,"result":null,"next_actions":[]}"#;
+        let decoded: StreamEvent = serde_json::from_str(json).expect("must deserialize");
+        assert!(matches!(
+            decoded,
+            StreamEvent::Result {
+                timestamp: 1_740_000_000,
+                ..
+            }
+        ));
     }
 
     #[cfg(feature = "deserialize")]
