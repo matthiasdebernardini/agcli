@@ -1,6 +1,6 @@
 [package]
 name = "agcli"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 description = "A tiny, no-bloat foundation crate for building agentic CLIs in Rust."
 license = "MIT"
