@@ -5,6 +5,14 @@ use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 fn epoch_secs() -> u64 {
+    // SOURCE_DATE_EPOCH (the reproducible-builds convention) pins the envelope
+    // timestamp so two runs of the same command can be byte-compared.
+    if let Some(pinned) = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return pinned;
+    }
     // Never panic on a misconfigured clock: a timestamp of 0 keeps the
     // envelope valid and JSON-emittable, honoring the "JSON always" contract
     // even on a machine whose wall clock is set before 1970.

@@ -1,12 +1,13 @@
 [package]
 name = "agcli"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 description = "A tiny, no-bloat foundation crate for building agentic CLIs in Rust."
 license = "MIT"
 repository = "https://github.com/matthiasdebernardini/agcli"
 homepage = "https://github.com/matthiasdebernardini/agcli"
 readme = "README.md"
+exclude = ["agent_ergonomics_audit/", "*.html"]
 keywords = ["cli", "agent", "json", "framework"]
 categories = ["command-line-interface"]
 

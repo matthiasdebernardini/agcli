@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.12.0) - 2026-06-11
+
+Agent-ergonomics release, driven by an empirical audit of aghealth: two of the
+fixes close P0 contract violations (silent unknown flags; `--dry-run` advertised
+on commands that mutate anyway). Behavior changes are a **minor** bump pre-1.0.
+
+### Breaking changes
+
+- **Unknown flags are rejected** (when `reserved_flags` is on, the default).
+    Any flag not declared in the resolved command path's usage strings — and not
+    a framework-reserved flag — returns a structured `UNKNOWN_FLAG` error (exit
+    `USAGE`) with a Levenshtein "Did you mean `--limit`?" hint and the full
+    declared-flag list. Previously a typo'd flag was silently dropped and the
+    command ran with defaults: exit 0, wrong behavior, nothing to learn from.
+    Opt out per command with `Command::allow_unknown_flags()`; commands without
+    a usage string are exempt (no schema to validate against).
+- **`--dry-run` is refused unless the command declares support.** The reserved
+    `--dry-run` flag promises "preview without mutating" on every command, but
+    the framework cannot know whether a handler honors it. Handlers that read
+    `req.dry_run()` must now declare it with `Command::handles_dry_run()`;
+    passing `--dry-run` to an unmarked command returns `DRY_RUN_UNSUPPORTED`
+    (exit `USAGE`, "Nothing was changed…") instead of silently running — and
+    possibly mutating — under a flag that promises a preview.
+- **Typed accessor errors now exit `USAGE` (2).** `require_arg`, `arg_parse`,
+    and `flag_parse` raised `MISSING_ARG`/`INVALID_ARG`/`INVALID_FLAG` with the
+    default exit 1, while conventional CLI helpers used exit 2 for the same
+    error class. They now carry `ExitCode::USAGE` so the exit-code dictionary
+    is consistent regardless of which layer raised the error.
+
+### Added
+
+- **`<tool> help [command...]` alias** — routes through the same path as
+    `--help`/`-h`. It is the first thing many agents guess; it used to be
+    `UNKNOWN_COMMAND`.
+- **Bare `--version` / `-V`** returns `{name, version}` instead of dumping the
+    entire command tree.
+- **`exit_codes` dictionary in the root help envelope**, so an agent can branch
+    on `$?` without parsing error text.
+- **`select_warning` on partial `--select` misses.** A multi-field select with
+    one typo'd field used to silently drop the typo; the projection now carries
+    a warning naming the unmatched field(s) and the available ones. (Total-miss
+    selects already warned.)
+- **Group/leaf help `subcommands` is populated again.** A buffer mix-up
+    serialized the (empty) path scratch buffer instead of the built docs, so
+    `result.subcommands` was always `[]`; `next_actions` masked the bug.
+- **`SOURCE_DATE_EPOCH` pins the envelope timestamp** (reproducible-builds
+    convention), making same-command runs byte-comparable.
+
 ## [0.11.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.11.0) - 2026-06-10
 
 Schema release: the envelope `timestamp` becomes human-readable. Pre-1.0 schema

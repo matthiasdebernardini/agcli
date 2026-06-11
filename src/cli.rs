@@ -26,6 +26,7 @@ const MAX_COMMAND_DEPTH: usize = 32;
 /// consume-next-token rule.
 const RESERVED_BOOL_FLAGS: &[&str] = &[
     "json", "dry-run", "compact", "stdin", "quiet", "yes", "no-input", "no-cache", "no-color",
+    "version",
 ];
 
 fn is_reserved_bool(flag: &str) -> bool {
@@ -72,7 +73,7 @@ const RESERVED_FLAG_DOCS: &[(&str, &str)] = &[
 pub fn reserved_flag_names() -> &'static [&'static str] {
     &[
         "select", "json", "dry-run", "compact", "stdin", "quiet", "yes", "no-input", "no-cache",
-        "no-color",
+        "no-color", "version",
     ]
 }
 
@@ -120,6 +121,33 @@ fn apply_select_flag(result: Value, raw: &str) -> Value {
                 fields.join(",")
             ),
         );
+    }
+    // Partial miss: some fields matched, others didn't. Without this, a typo'd
+    // field in a multi-field select is silently dropped and the agent never
+    // learns the spelling. Keep the (useful) projection, but name the misses.
+    if let Value::Object(map) = &result {
+        let missed: Vec<&&str> = fields
+            .iter()
+            .filter(|field| {
+                matches!(project::select(&result, std::slice::from_ref(*field)),
+                         Value::Object(m) if m.is_empty())
+            })
+            .collect();
+        if !missed.is_empty() {
+            let available = map.keys().cloned().collect::<Vec<_>>().join(", ");
+            let missed_list = missed
+                .iter()
+                .map(|s| (**s).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return annotate_select_warning(
+                projected,
+                format!(
+                    "--select field(s) matched nothing and were dropped: {missed_list}. \
+                     Available top-level fields: {available}."
+                ),
+            );
+        }
     }
     projected
 }
@@ -464,6 +492,7 @@ impl<'a> CommandRequest<'a> {
                 "MISSING_ARG",
                 format!("Provide <{name}> as positional argument {index}."),
             )
+            .exit_code(ExitCode::USAGE)
         })
     }
 
@@ -480,6 +509,7 @@ impl<'a> CommandRequest<'a> {
                 "INVALID_ARG",
                 format!("Pass a valid value for <{name}>."),
             )
+            .exit_code(ExitCode::USAGE)
         })
     }
 
@@ -497,6 +527,7 @@ impl<'a> CommandRequest<'a> {
                     "INVALID_FLAG",
                     format!("Pass a valid value for --{key}."),
                 )
+                .exit_code(ExitCode::USAGE)
             }),
         }
     }
@@ -799,6 +830,15 @@ pub struct Command {
     /// command so narrowing can never strip the actionable `fix` strings out of
     /// an unhealthy report.
     apply_reserved_projection: bool,
+    /// True when the handler reads `req.dry_run()` and implements a real
+    /// preview. The reserved `--dry-run` flag is advertised on every command,
+    /// so a handler that ignores it would mutate while the caller believes it
+    /// is previewing; the framework refuses to run unmarked handlers under
+    /// `--dry-run` (see `DRY_RUN_UNSUPPORTED`).
+    handles_dry_run: bool,
+    /// Opt out of unknown-flag rejection for this command (e.g. a passthrough
+    /// command forwarding arbitrary flags to another program).
+    allow_unknown_flags: bool,
 }
 
 use std::collections::BTreeMap;
@@ -826,7 +866,26 @@ impl Command {
             default_next_actions: Vec::new(),
             subcommands: BTreeMap::new(),
             apply_reserved_projection: true,
+            handles_dry_run: false,
+            allow_unknown_flags: false,
         }
+    }
+
+    /// Declare that this command's handler reads `req.dry_run()` and
+    /// implements a real no-mutation preview. Without this marker the
+    /// framework refuses to run the handler when `--dry-run` is passed,
+    /// returning a structured `DRY_RUN_UNSUPPORTED` error instead of
+    /// silently mutating under a flag that promises a preview.
+    pub fn handles_dry_run(mut self) -> Self {
+        self.handles_dry_run = true;
+        self
+    }
+
+    /// Opt this command out of unknown-flag rejection (for passthrough-style
+    /// commands that forward arbitrary flags elsewhere).
+    pub fn allow_unknown_flags(mut self) -> Self {
+        self.allow_unknown_flags = true;
+        self
     }
 
     pub fn usage(mut self, usage: impl Into<String>) -> Self {
@@ -1225,7 +1284,20 @@ impl AgentCli {
             };
 
         if invocation.help_requested() {
-            return self.help_execution(&invocation);
+            return self.help_execution(&invocation, invocation.positionals());
+        }
+
+        // `<tool> help [command...]` — the alias every agent guesses first.
+        if invocation.positionals().first().map(String::as_str) == Some("help") {
+            return self.help_execution(&invocation, &invocation.positionals()[1..]);
+        }
+
+        // Bare `--version` / `-V` answers with just the version instead of
+        // dumping the entire command tree.
+        if invocation.positionals().is_empty()
+            && (invocation.flag("version").is_some() || invocation.flag("V").is_some())
+        {
+            return self.version_execution(&invocation);
         }
 
         if invocation.positionals().is_empty() {
@@ -1294,13 +1366,111 @@ impl AgentCli {
             }
         };
 
+        let path_strs = path_refs(&resolved.path);
+        let path_cmds = self.path_command_refs(&resolved.path);
+
+        // Reject flags the resolved command never declared. Without this, a
+        // typo'd flag (`--lmit 3`) is silently dropped and the command runs
+        // with defaults — exit 0, wrong behavior, nothing for the agent to
+        // learn from. Validation only applies when the leaf command declares
+        // a usage string (the flag schema source of truth) and no command on
+        // the path opted out via `allow_unknown_flags()`.
+        let validate_flags = self.reserved_flags
+            && command.usage.is_some()
+            && !path_cmds.iter().any(|c| c.allow_unknown_flags);
+        if validate_flags {
+            let mut declared = HashSet::new();
+            for cmd in &path_cmds {
+                if let Some(usage) = &cmd.usage {
+                    extract_all_flag_names(usage, &mut declared);
+                }
+            }
+            let allowed = |flag: &str| {
+                declared.contains(flag)
+                    || flag == "help"
+                    || flag == "h"
+                    || flag == "V"
+                    || (self.reserved_flags && reserved_flag_names().contains(&flag))
+            };
+            let mut unknown: Vec<&String> =
+                invocation.flags().keys().filter(|f| !allowed(f)).collect();
+            unknown.sort();
+            if let Some(first_unknown) = unknown.first() {
+                let candidates: Vec<&str> = declared.iter().map(String::as_str).collect();
+                let mut fix = String::new();
+                use std::fmt::Write as _;
+                if let Some(near) = nearest_name(first_unknown, &candidates) {
+                    let _ = write!(&mut fix, "Did you mean `--{near}`? ");
+                }
+                if candidates.is_empty() {
+                    let _ = write!(
+                        &mut fix,
+                        "`{}` takes no flags of its own.",
+                        path_strs.join(" ")
+                    );
+                } else {
+                    let mut names: Vec<&str> = candidates.clone();
+                    names.sort_unstable();
+                    let _ = write!(
+                        &mut fix,
+                        "Valid flags for `{}`: {}.",
+                        path_strs.join(" "),
+                        names
+                            .iter()
+                            .map(|n| format!("--{n}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                if self.reserved_flags {
+                    let _ = write!(
+                        &mut fix,
+                        " Reserved agent flags (--select, --compact, --quiet, --dry-run, --yes, \
+                         --no-input, --no-cache, --no-color, --stdin, --json, --version) are \
+                         accepted on every command."
+                    );
+                }
+                let unknown_list = unknown
+                    .iter()
+                    .map(|f| format!("--{f}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return self.error_execution(
+                    invocation.command_line().to_string(),
+                    format!("unknown flag(s): {unknown_list}"),
+                    "UNKNOWN_FLAG",
+                    fix,
+                    false,
+                    self.default_command_actions(&path_strs, command),
+                );
+            }
+        }
+
+        // `--dry-run` promises "preview without mutating" on every command.
+        // Running a handler that never reads `req.dry_run()` would mutate
+        // under that promise, so refuse unless the command declared support.
+        if self.reserved_flags
+            && invocation.flag("dry-run").is_some()
+            && !path_cmds.iter().any(|c| c.handles_dry_run)
+        {
+            return self.error_execution(
+                invocation.command_line().to_string(),
+                format!("`{}` does not support --dry-run", path_strs.join(" ")),
+                "DRY_RUN_UNSUPPORTED",
+                "Nothing was changed. This command has no preview mode: run it without \
+                 --dry-run to execute it, or inspect current state first with a read \
+                 command from next_actions."
+                    .to_string(),
+                false,
+                self.default_command_actions(&path_strs, command),
+            );
+        }
+
         let request = CommandRequest {
             invocation: &invocation,
             command_path: &resolved.path,
             positionals: resolved.remaining,
         };
-
-        let path_strs = path_refs(&resolved.path);
 
         // Guard the user-supplied handler future against panics. Any
         // unwrap/expect/index/overflow in agent-written handler code would
@@ -1417,6 +1587,27 @@ impl AgentCli {
         envelope
     }
 
+    /// Answer a bare `--version` / `-V` with just `{name, version}` instead of
+    /// the full command tree.
+    fn version_execution(&self, invocation: &Invocation) -> Execution {
+        let result = json!({
+            "name": self.name,
+            "version": self.version.clone().unwrap_or_else(|| "unknown".to_string()),
+        });
+        Execution {
+            envelope: self
+                .success_envelope(
+                    invocation.command_line().to_string(),
+                    result,
+                    vec![NextAction::new(
+                        self.name.clone(),
+                        "Inspect the full command tree",
+                    )],
+                )
+                .into(),
+        }
+    }
+
     fn root_execution(&self, invocation: &Invocation) -> Execution {
         let result = self.root_result(invocation.program());
         Execution {
@@ -1430,14 +1621,17 @@ impl AgentCli {
         }
     }
 
-    fn help_execution(&self, invocation: &Invocation) -> Execution {
-        if invocation.positionals().is_empty() {
+    /// Render help for `targets` (a command path, possibly empty for root
+    /// help). Reached via `--help`/`-h` anywhere on the line and via the
+    /// `<tool> help [command...]` alias.
+    fn help_execution(&self, invocation: &Invocation, targets: &[String]) -> Execution {
+        if targets.is_empty() {
             return self.root_execution(invocation);
         }
 
-        let resolved = self.resolve_command(invocation.positionals());
+        let resolved = self.resolve_command(targets);
         if resolved.path.is_empty() {
-            let unknown = invocation.positionals()[0].clone();
+            let unknown = targets[0].clone();
             let valid: Vec<&str> = self.commands.keys().map(String::as_str).collect();
             return self.error_execution(
                 invocation.command_line().to_string(),
@@ -1488,9 +1682,17 @@ impl AgentCli {
     ) -> Execution {
         let path_strs: Vec<&str> = path.iter().map(String::as_str).collect();
         let usage = command.usage_or_default(invocation.program(), &path_strs);
-        let mut buf = Vec::new();
-        self.command_docs_recursive(invocation.program(), &mut buf, &command.subcommands, 0);
-        let subcommands = buf;
+        // Seed the path buffer with the resolved path so default usages render
+        // the full `program group sub` form, and serialize the *returned* docs
+        // (a prior version serialized the scratch path buffer, which is empty
+        // again by the time the recursion unwinds — `subcommands` was always []).
+        let mut path_buf: Vec<&str> = path_strs.clone();
+        let subcommands = self.command_docs_recursive(
+            invocation.program(),
+            &mut path_buf,
+            &command.subcommands,
+            0,
+        );
         let result = json!({
             "name": command.name(),
             "description": command.description(),
@@ -1541,6 +1743,21 @@ impl AgentCli {
                 .collect();
             result.insert("agent_flags".to_string(), Value::Array(flags));
         }
+
+        // Publish the exit-code dictionary so an agent can branch on `$?`
+        // without parsing error text (see [`ExitCode`]).
+        result.insert(
+            "exit_codes".to_string(),
+            json!({
+                "0": "success",
+                "1": "error (unclassified failure)",
+                "2": "usage (unknown command/subcommand/flag, bad or missing argument, unsupported --dry-run)",
+                "3": "not_found (a requested resource does not exist)",
+                "4": "auth (authentication or authorization failure)",
+                "5": "api (an upstream call failed)",
+                "7": "rate_limited (back off and retry)"
+            }),
+        );
 
         Value::Object(result)
     }
@@ -1767,6 +1984,21 @@ impl AgentCli {
         set
     }
 
+    /// The `Command` references along an already-resolved path (used to union
+    /// declared flags and check `handles_dry_run` / `allow_unknown_flags`).
+    fn path_command_refs(&self, path: &[String]) -> Vec<&Command> {
+        let mut commands = &self.commands;
+        let mut out = Vec::with_capacity(path.len());
+        for name in path {
+            let Some(found) = commands.get(name) else {
+                break;
+            };
+            out.push(found);
+            commands = &found.subcommands;
+        }
+        out
+    }
+
     fn resolve_command<'a>(&'a self, positionals: &'a [String]) -> ResolvedCommand<'a> {
         let mut commands = &self.commands;
         let mut path = Vec::new();
@@ -1864,6 +2096,28 @@ fn collect_bool_flags(command: &Command, set: &mut HashSet<String>, depth: usize
     }
     for sub in command.subcommands.values() {
         collect_bool_flags(sub, set, depth + 1);
+    }
+}
+
+/// Pull *every* flag name out of a usage string — value flags (`--flag <v>`,
+/// `--flag=<v>`, bracketed or not) as well as booleans (`[--flag]`, `[-x]`).
+/// This is the declared-flag schema used to reject unknown flags, so it is
+/// deliberately permissive about surrounding syntax: any `--name` token in the
+/// template counts as declared.
+fn extract_all_flag_names(usage: &str, set: &mut HashSet<String>) {
+    // Bracketed booleans, including short flags (`[-x]`, `[-abc]`).
+    extract_bool_flag_names(usage, set);
+    // Long flags anywhere in the template.
+    for raw in usage.split(|c: char| c.is_whitespace() || c == '[' || c == ']') {
+        if let Some(rest) = raw.strip_prefix("--") {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                set.insert(name);
+            }
+        }
     }
 }
 
@@ -2667,16 +2921,19 @@ mod tests {
 
     #[tokio::test]
     async fn standard_flag_accessors_read_convention_flags() {
-        let cli =
-            AgentCli::new("app", "x").command(Command::new("run", "run").handler(|req, _ctx| {
-                let flags = json!({
-                    "dry_run": req.dry_run(),
-                    "assume_yes": req.assume_yes(),
-                    "no_cache": req.no_cache(),
-                    "wants_stdin": req.wants_stdin(),
-                });
-                Box::pin(async move { Ok(CommandOutput::new(flags)) })
-            }));
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("run", "run")
+                .handles_dry_run()
+                .handler(|req, _ctx| {
+                    let flags = json!({
+                        "dry_run": req.dry_run(),
+                        "assume_yes": req.assume_yes(),
+                        "no_cache": req.no_cache(),
+                        "wants_stdin": req.wants_stdin(),
+                    });
+                    Box::pin(async move { Ok(CommandOutput::new(flags)) })
+                }),
+        );
         let run = cli
             .run_argv([
                 "app",
@@ -2700,17 +2957,206 @@ mod tests {
     async fn reserved_bool_flag_does_not_swallow_positional() {
         // `--dry-run` is a framework-reserved bool, so `get --dry-run 1` keeps
         // `1` as the positional id even though `--dry-run` precedes it.
-        let cli =
-            AgentCli::new("app", "x").command(Command::new("get", "get").handler(|req, _ctx| {
-                let id = req.arg(0).unwrap_or("none").to_string();
-                let dry = req.dry_run();
-                Box::pin(async move { Ok(CommandOutput::new(json!({ "id": id, "dry": dry }))) })
-            }));
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("get", "get")
+                .handles_dry_run()
+                .handler(|req, _ctx| {
+                    let id = req.arg(0).unwrap_or("none").to_string();
+                    let dry = req.dry_run();
+                    Box::pin(async move { Ok(CommandOutput::new(json!({ "id": id, "dry": dry }))) })
+                }),
+        );
         let run = cli.run_argv(["app", "get", "--dry-run", "1"]).await;
         let Envelope::Success(envelope) = run.envelope() else {
             panic!("expected success envelope");
         };
         assert_eq!(envelope.result, json!({ "id": "1", "dry": true }));
+    }
+
+    // --- Unknown-flag rejection ---
+
+    #[tokio::test]
+    async fn unknown_flag_is_rejected_with_did_you_mean() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("search", "search")
+                .usage("app search <query> [--limit <n>]")
+                .handler(|_req, _ctx| {
+                    Box::pin(async move { Ok(CommandOutput::new(json!({ "count": 0 }))) })
+                }),
+        );
+        let run = cli
+            .run_argv(["app", "search", "apple", "--lmit", "3"])
+            .await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error envelope, got: {}", run.to_json());
+        };
+        assert_eq!(envelope.error.code, "UNKNOWN_FLAG");
+        assert_eq!(envelope.exit_code, ExitCode::USAGE);
+        assert!(
+            envelope.fix.contains("--limit"),
+            "fix must suggest the near-miss: {}",
+            envelope.fix
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_flags_pass_unknown_flag_validation() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("search", "search")
+                .usage("app search <query> [--limit <n>]")
+                .handler(|_req, _ctx| {
+                    Box::pin(async move { Ok(CommandOutput::new(json!({ "count": 0 }))) })
+                }),
+        );
+        let run = cli
+            .run_argv([
+                "app",
+                "search",
+                "apple",
+                "--limit",
+                "3",
+                "--quiet",
+                "--no-color",
+            ])
+            .await;
+        assert!(run.envelope().ok(), "reserved flags must not be rejected");
+    }
+
+    #[tokio::test]
+    async fn allow_unknown_flags_opts_out_of_rejection() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("passthrough", "fwd")
+                .usage("app passthrough [--whatever <v>]")
+                .allow_unknown_flags()
+                .handler(|_req, _ctx| Box::pin(async move { Ok(CommandOutput::new(json!(null))) })),
+        );
+        let run = cli
+            .run_argv(["app", "passthrough", "--totally-unknown", "x"])
+            .await;
+        assert!(run.envelope().ok());
+    }
+
+    #[tokio::test]
+    async fn usage_less_command_skips_unknown_flag_validation() {
+        let cli = AgentCli::new("app", "x")
+            .command(Command::new("free", "freeform").handler(|_req, _ctx| {
+                Box::pin(async move { Ok(CommandOutput::new(json!(null))) })
+            }));
+        let run = cli.run_argv(["app", "free", "--anything", "goes"]).await;
+        assert!(run.envelope().ok());
+    }
+
+    // --- Dry-run gate ---
+
+    #[tokio::test]
+    async fn dry_run_refused_on_unmarked_command() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("delete", "delete a row")
+                .usage("app delete <id>")
+                .handler(|_req, _ctx| {
+                    Box::pin(async move { panic!("handler must not run under refused --dry-run") })
+                }),
+        );
+        let run = cli.run_argv(["app", "delete", "1", "--dry-run"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected DRY_RUN_UNSUPPORTED error, got: {}", run.to_json());
+        };
+        assert_eq!(envelope.error.code, "DRY_RUN_UNSUPPORTED");
+        assert_eq!(envelope.exit_code, ExitCode::USAGE);
+        assert!(envelope.fix.contains("Nothing was changed"));
+    }
+
+    // --- help alias + --version ---
+
+    #[tokio::test]
+    async fn help_alias_routes_to_command_help() {
+        let cli = rich_cli();
+        let run = cli.run_argv(["app", "help", "get"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope, got: {}", run.to_json());
+        };
+        assert_eq!(envelope.result["name"], json!("get"));
+        assert_eq!(envelope.result["usage"], json!("app get <id>"));
+    }
+
+    #[tokio::test]
+    async fn bare_help_alias_shows_root() {
+        let cli = rich_cli();
+        let run = cli.run_argv(["app", "help"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert!(envelope.result.get("commands").is_some());
+    }
+
+    #[tokio::test]
+    async fn bare_version_flag_returns_version_only() {
+        let cli = rich_cli().version("9.9.9");
+        let run = cli.run_argv(["app", "--version"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(
+            envelope.result,
+            json!({ "name": "app", "version": "9.9.9" })
+        );
+    }
+
+    // --- group help carries real subcommand docs ---
+
+    #[tokio::test]
+    async fn group_help_lists_subcommand_docs() {
+        let cli =
+            AgentCli::new("app", "x").command(Command::new("food", "food group").subcommand(
+                Command::new("search", "search foods").usage("app food search <query>"),
+            ));
+        let run = cli.run_argv(["app", "food"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        let subs = envelope.result["subcommands"]
+            .as_array()
+            .expect("subcommands array");
+        assert_eq!(subs.len(), 1, "subcommands must not be empty: {subs:?}");
+        assert_eq!(subs[0]["name"], json!("search"));
+    }
+
+    // --- select partial-miss warning ---
+
+    #[tokio::test]
+    async fn select_partial_miss_warns_about_dropped_fields() {
+        let cli = rich_cli();
+        let run = cli
+            .run_argv(["app", "get", "1", "--select", "id,nonexistnt"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["id"], json!(1));
+        let warning = envelope.result["select_warning"]
+            .as_str()
+            .expect("select_warning present");
+        assert!(
+            warning.contains("nonexistnt"),
+            "warning names the miss: {warning}"
+        );
+    }
+
+    // --- root help publishes exit-code dictionary ---
+
+    #[tokio::test]
+    async fn root_help_includes_exit_code_dictionary() {
+        let cli = rich_cli();
+        let run = cli.run_argv(["app"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(
+            envelope.result["exit_codes"]["2"]
+                .as_str()
+                .map(|s| s.starts_with("usage")),
+            Some(true)
+        );
     }
 
     // --- Bounded list output ---
