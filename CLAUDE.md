@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-agcli = "0.11.0"
+agcli = "0.12.0"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -145,7 +145,7 @@ cargo run --example calc -- add foo bar  # Error case (typed-error envelope)
   "ok": false,
   "command": "calc add foo bar",
   "timestamp": "2025-02-19T21:20:00Z",
-  "exit_code": 1,
+  "exit_code": 2,
   "error": {
     "message": "argument <a> is not valid: \"foo\"",
     "code": "INVALID_ARG",
@@ -191,7 +191,7 @@ agcli targets **macOS and Linux only**. The crate ships with optimized release/b
 
 ```toml
 [dependencies]
-agcli = "0.11.0"
+agcli = "0.12.0"
 
 [profile.release]
 opt-level = 3
