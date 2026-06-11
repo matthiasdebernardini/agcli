@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>agcli agent-ergonomics pass 1 + bug-hunt — plan</title>
+</head>
+<body>
+<h1>agcli: agent-ergonomics pass 1 + multi-pass bug hunt — implementation plan</h1>
+
+<section>
+<h2>⚠️ Concurrency warning (read first)</h2>
+<p><strong>Another Claude session is actively committing to this repo.</strong> During this audit, commit <code>690b7da</code> ("feat: agent-ergonomics hardening — unknown-flag rejection, dry-run gate, help/version, exit-code consistency", +532/−29) landed on <code>master</code>. The bug-hunting agent literally watched the diff grow while reviewing. Several recommendations from my audit were shipped by that session before I could propose them (unknown-flag rejection, dry-run gate, <code>help &lt;cmd&gt;</code> alias, <code>--version</code>, exit_codes dictionary in root help, SOURCE_DATE_EPOCH pin, select_warning).</p>
+<p><strong>Decision needed:</strong> should I proceed on <code>master</code> while that session is live (risking conflicting edits to <code>src/cli.rs</code>), or wait until it's done? Everything below was re-verified against the new HEAD <code>690b7da</code>, so the plan is current — but if the other session keeps going, we'll trip over each other in <code>src/cli.rs</code>.</p>
+</section>
+
+<section>
+<h2>Goal</h2>
+<p>Apply the two selected skills — the agent-ergonomics maximization pass (full mode) and the multi-pass bug hunt — to the <code>agcli</code> crate. The audit phases are done (workspace at <code>agent_ergonomics_audit/</code>, read-only). This plan covers the apply phase: fix confirmed bugs in the just-landed hardening work, close the remaining ergonomics gaps, and pin everything with regression tests.</p>
+</section>
+
+<section>
+<h2>Audit summary</h2>
+<p>The runtime contract is unusually strong: across 30+ probe invocations, stdout was always exactly one line of valid JSON, stderr was always 0 bytes, exit codes were disciplined (0 success / 2 usage errors), and error envelopes carry inline valid names + did-you-mean. Weakest dimensions: <strong>regression_resistance</strong> (usage strings double as the flag-parser schema with no audit check and no golden-envelope tests), <strong>intent_inference</strong> (arity silence), and <strong>composability</strong> (error-code dictionary not runtime-discoverable). Intent corpus: 13 inferred-and-acted, 9 useful-hint, 4 silent-fail, 0 useless-error.</p>
+
+<pre class="mermaid">
+flowchart TD
+    A[Audit pass 1<br/>26-invocation intent corpus + 11-dim scoring + 3-pass bug hunt] --> B{Findings at HEAD 690b7da}
+    B --> C[P0: bugs in just-landed hardening<br/>R1 short value flags rejected<br/>R2 exit-code panic escapes guard]
+    B --> D[P1: silent-fail closures<br/>R3 extra-positional arity<br/>R4 flag typo nudge<br/>R5 root output flags<br/>R6 bare version<br/>R7 dry-run=false<br/>R8 non-finite floats]
+    B --> E[P2: contract + regression<br/>R9 error_codes export<br/>R10 golden envelope tests<br/>R11 audit usage-string checks<br/>R12 SOURCE_DATE_EPOCH edges]
+    C --> F[Per-rec commits on master<br/>+ regression test each]
+    D --> F
+    E --> F
+    F --> G[Re-score + nextest + clippy<br/>handoff in agent_ergonomics_audit/]
+</pre>
+</section>
+
+<section>
+<h2>Proposed changes (ranked, one commit each)</h2>
+
+<h3>P0 — bugs in the hardening that just landed (fix first)</h3>
+<ul>
+  <li><strong>R1 — Short value flags are rejected as UNKNOWN_FLAG.</strong> <code>extract_all_flag_names</code> (src/cli.rs:2107) collects long flags and bracketed short <em>booleans</em>, but skips short <em>value</em> flags like <code>[-n &lt;count&gt;]</code> — so the framework rejects its own advertised usage, and renders the error as <code>--n</code>. Fix: collect <code>-x</code> from bracketed value-flag forms; format single-char unknowns with one dash. Repro: a CLI with usage <code>"t log [-n &lt;count&gt;]"</code> rejects <code>t log -n 5</code>.</li>
+  <li><strong>R2 — Out-of-range handler exit code panics outside the panic guard.</strong> <code>normalize_exit_code</code>'s debug_assert (src/envelope.rs:121) fires in the framework's post-handler path, after <code>catch_unwind</code> — producing zero JSON on stdout and exit 101, exactly what the guard exists to prevent. Fix: clamp/validate inside <code>CommandOutput::exit_code</code> / <code>CommandError::exit_code</code> (inside the guarded handler context) and never assert in the post-handler path.</li>
+</ul>
+
+<h3>P1 — remaining silent-fail / pedagogy gaps (re-verified open at HEAD)</h3>
+<ul>
+  <li><strong>R3 — Arity validation: reject extra positionals.</strong> <code>calc add 1 2 3</code> exits 0 and drops the third arg. For a mutating CLI (<code>tool delete &lt;id&gt; &lt;oops&gt;</code>) this is dangerous. Count <code>&lt;...&gt;</code> placeholders in the leaf usage string (the scanner already exists for <code>next_action_from_usage</code>); when extra args are present and usage lacks <code>...</code>, return <code>EXTRA_ARG</code> at USAGE exit with the unexpected token named. Opt-out for variadic commands.</li>
+  <li><strong>R4 — Did-you-mean for typo'd flags must include reserved flags.</strong> <code>--selct</code> gets the generic reserved-flag list but no "did you mean <code>--select</code>" nudge — candidates (src/cli.rs:1402) come from declared flags only. ~3-line fix; also sort candidates before tie-break so the suggestion is deterministic (it's currently HashSet-ordered).</li>
+  <li><strong>R5 — Honor <code>--select</code>/<code>--quiet</code>/<code>--compact</code> on root/help/version paths.</strong> The root tree advertises these on "every command", but root/help/version bypass the projection block. <code>calc --quiet</code> still emits next_actions. Factor the projection into a helper applied on all paths — the root tree of a large CLI is precisely where agents want <code>--select=commands</code>.</li>
+  <li><strong>R6 — Alias bare <code>version</code> positional</strong> to the <code>--version</code> envelope (like the existing <code>help</code> alias), unless the user defined a <code>version</code> command.</li>
+  <li><strong>R7 — <code>--dry-run=false</code> currently enables the flag</strong> (presence-tested). Treat <code>=false</code>/<code>=0</code> as off for reserved booleans, or reject the <code>=value</code> form with a teaching error.</li>
+  <li><strong>R8 — Non-finite float guard.</strong> <code>calc add 1e308 1e308</code> → <code>ok:true, result:null</code> (serde_json folds inf/NaN to null). Make <code>arg_parse::&lt;f64&gt;</code> reject non-finite parses as INVALID_ARG (Rust's FromStr accepts "inf"/"NaN"), and fix the calc example to guard overflow. Closes the last observed ok-true-with-corrupt-result path.</li>
+</ul>
+
+<h3>P2 — contract export + regression resistance</h3>
+<ul>
+  <li><strong>R9 — Runtime-discoverable error-code dictionary.</strong> The exit_codes dictionary just landed in root help; add the conventional error codes (MISSING_ARG, INVALID_ARG, UNKNOWN_FLAG, DRY_RUN_UNSUPPORTED, HANDLER_PANIC, …) alongside it so agents can build retry/branch policy from one root call.</li>
+  <li><strong>R10 — Golden-envelope snapshot tests.</strong> ~15 canonical invocations run under <code>SOURCE_DATE_EPOCH=0</code> asserting exact output bytes (success, each error code, select warnings, help, version, root). The envelope is hand-serialized; nothing currently pins the bytes. Doubles as a living spec.</li>
+  <li><strong>R11 — <code>cli.audit()</code> checks the usage-string/parser coupling.</strong> Usage strings ARE the flag schema; a malformed bracket silently changes parsing today. Add findings: unbalanced brackets, usage/program mismatch, reserved flag redeclared.</li>
+  <li><strong>R12 — SOURCE_DATE_EPOCH edge cases + tests.</strong> Clamp huge values to 9999-12-31 (current output of year-584-billion timestamps can't round-trip through the crate's own parser); per the reproducible-builds spec, malformed values should clamp to 0 rather than silently falling back to the wall clock. The env-var path currently has zero test coverage.</li>
+</ul>
+
+<h3>Deferred (filed in handoff, not this pass)</h3>
+<ul>
+  <li>Typed param declaration on <code>Command</code> (replaces stringly-typed usage schema; populates <code>ActionParam.type/description</code>) — substantial API design, deserves its own plan.</li>
+  <li><code>handler_fn</code> owned-request adapter to kill the <code>Box::pin</code> + borrow-before-move tax — API design discussion first.</li>
+  <li><code>list_truncated</code> guidance names <code>--limit</code>, which isn't reserved — make guidance parametric or reserve <code>--limit</code>.</li>
+  <li>Minor: <code>select_warning</code> key could clobber a real result field; impossible-date leniency in <code>parse_rfc3339_utc</code>; truncation temp-file accumulation (documented design).</li>
+</ul>
+</section>
+
+<section>
+<h2>Files touched</h2>
+<ul>
+  <li><code>src/cli.rs</code> — R1, R3, R4, R5, R6, R7, R9, R11 (⚠️ same file the concurrent session is editing)</li>
+  <li><code>src/envelope.rs</code> — R2, R12</li>
+  <li><code>examples/calc.rs</code> — R8 (overflow guard)</li>
+  <li><code>tests/golden_envelopes.rs</code> (new) — R10</li>
+  <li><code>agent_ergonomics_audit/</code> — scorecard, corpus, recommendations, regression tests, handoff (workspace already scaffolded, in-tree per skill policy)</li>
+  <li><code>CHANGELOG.md</code> — one section for the batch</li>
+</ul>
+</section>
+
+<section>
+<h2>Test plan</h2>
+<ul>
+  <li>Each R-commit lands with a unit/golden test that fails on the pre-fix code.</li>
+  <li><code>cargo nextest run --workspace</code> green (137 tests passing at HEAD today), <code>cargo clippy --all-targets</code> clean.</li>
+  <li>Re-run the 26-entry intent corpus post-apply; target: 0 silent_fail (currently 4).</li>
+  <li>Determinism re-check: <code>SOURCE_DATE_EPOCH=0</code> byte-identical runs.</li>
+</ul>
+</section>
+
+<section>
+<h2>Risks / open questions</h2>
+<ul>
+  <li><strong>Blocking:</strong> the concurrent session. Proceed now, or wait for it to finish? (R1/R2 fix bugs in <em>its</em> commit — coordinating matters.)</li>
+  <li>R3 (arity) and R7 (=false) are behavior changes to released semantics — pre-1.0 they'd be a minor bump (0.11 → 0.12) per the repo's versioning rule. Confirm you're happy batching them into 0.12.0.</li>
+  <li>R5 changes root-tree output when projection flags are passed — schema-stable otherwise.</li>
+  <li>No release/tag in this pass unless you ask; commits land on <code>master</code> only.</li>
+</ul>
+</section>
+</body>
+</html>

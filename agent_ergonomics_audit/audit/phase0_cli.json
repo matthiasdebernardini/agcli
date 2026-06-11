@@ -1,0 +1,17 @@
+{
+  "target_path": "/Users/md/Projects/agcli",
+  "discovered_at": "2026-06-11T21:56:55Z",
+  "languages": [
+    "rust"
+  ],
+  "binaries": [
+    "agcli"
+  ],
+  "env_var_prefix": "",
+  "existing_surfaces": {
+    "robot_mode": false,
+    "capabilities": false,
+    "robot_docs": false
+  },
+  "recommended_mode": "full"
+}

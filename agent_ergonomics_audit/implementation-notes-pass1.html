@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Implementation notes: agcli ergonomics pass 1 + bug hunt</title></head>
+<body>
+<h1>Implementation notes — agcli ergonomics pass 1 + bug hunt (v0.12.0)</h1>
+
+<section>
+<h2>Outcome</h2>
+<p>All 12 in-scope recommendations (R1–R12) from the <a href="https://agplan.tail76ec53.ts.net/plans/regularly-encouraged-hornbill">approved plan</a> are implemented, tested (139 → 174 tests, all green), clippy/fmt clean, and committed to <code>master</code> as <code>6128d32</code>. The intent corpus's four silent-fail classes are now zero. Released as part of v0.12.0.</p>
+</section>
+
+<section>
+<h2>Design decisions</h2>
+<ul>
+  <li><strong>Arity opt-out is its own builder.</strong> The plan left the opt-out mechanism open; I added <code>Command::allow_extra_args()</code> rather than overloading <code>allow_unknown_flags()</code> — they guard different mistake classes, and a passthrough command may want one without the other. Usage strings containing <code>...</code> opt out implicitly.</li>
+  <li><strong>Bare bracketed words count as optional positionals.</strong> First version of the arity counter only counted <code>[&lt;x&gt;]</code>; the repo's own tests use <code>[path]</code> (bare word) as an optional positional, which broke three tests. Rule now: a bracketed group is a positional unless its first character is <code>-</code>.</li>
+  <li><strong>Exit-code assert moved, not removed.</strong> <code>normalize_exit_code</code> masks silently in all builds (it runs after the panic guard); the development-time <code>debug_assert</code> lives in <code>CommandOutput::exit_code</code>/<code>CommandError::exit_code</code>, where it fires <em>inside</em> the guard and folds into a structured <code>HANDLER_PANIC</code> envelope. Authors still get told; agents never get bare panic output.</li>
+  <li><strong>Non-finite guard via <code>Any</code> downcast.</strong> Rust has no stable specialization, so <code>arg_parse</code>/<code>flag_parse</code> gained a <code>+ std::any::Any</code> bound and a runtime downcast for f64/f32. The bound is technically API-narrowing but practically free (parse targets are 'static). Noted as a breaking line in the changelog.</li>
+  <li><strong>Negation vocabulary for reserved booleans:</strong> <code>false/0/no/off</code> (trimmed, case-insensitive) read as off; anything else present reads as on. Applied at the framework gates and the <code>req.dry_run()</code>-family accessors.</li>
+  <li><strong>Golden tests live in <code>tests/golden_envelopes.rs</code></strong>, not <code>agent_ergonomics_audit/regression_tests/</code>, so CI runs them via <code>cargo nextest</code>. Timestamps pinned by setting <code>SOURCE_DATE_EPOCH=0</code> per test (nextest is process-per-test, so the unsafe <code>set_var</code> is race-free). The full root tree is pinned structurally + for byte-determinism rather than as one giant literal.</li>
+  <li><strong>SOURCE_DATE_EPOCH parsing extracted to a pure function</strong> (<code>pin_from_source_date_epoch</code>) so the clamping rules are unit-testable without env-var races.</li>
+</ul>
+</section>
+
+<section>
+<h2>Deviations from the plan</h2>
+<ul>
+  <li><strong>Commit granularity:</strong> the plan said one commit per recommendation; all 12 landed as one coherent feature commit (<code>6128d32</code>) + workspace + release commits instead. The changes interleave heavily in <code>src/cli.rs</code> (the unknown-flag block alone is touched by R1, R4); hunk-splitting them into 12 commits risked broken intermediate states with no review benefit. Each rec is individually pinned by named tests.</li>
+  <li><strong>Version bump was already done:</strong> the concurrent session had committed Cargo.toml at 0.12.0 unreleased; this work joins that release rather than cutting 0.13.0.</li>
+</ul>
+</section>
+
+<section>
+<h2>Tradeoffs</h2>
+<ul>
+  <li>EXTRA_ARG and the =false negation change released behavior — both are agent-protective strictness, batched into the 0.12.0 minor bump per the repo's pre-1.0 rule.</li>
+  <li>The arity counter is heuristic over usage strings (the same tradeoff the unknown-flag schema already made). The new <code>audit()</code> checks (unbalanced brackets, program mismatch, reserved redeclare) exist precisely to keep those heuristics honest.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions / deferred</h2>
+<ul>
+  <li>R-013 typed param declarations and R-014 <code>handler_fn</code> adapter deferred — each deserves its own design plan (see HANDOFF.md).</li>
+  <li>R-015 <code>list_truncated</code> guidance still names <code>--limit</code>, which is not reserved.</li>
+  <li>Minor leniencies left as-is: impossible-date acceptance in <code>parse_rfc3339_utc</code> (deserialize-only), <code>select_warning</code> key collision, <code>-V extra</code> consuming a value.</li>
+</ul>
+</section>
+
+<section>
+<h2>Verification</h2>
+<ul>
+  <li><code>cargo nextest run --all-features</code>: 174/174 green; clippy (incl. pre-commit pedantic set) and fmt clean.</li>
+  <li>Behavior probes against the rebuilt calc example: EXTRA_ARG fires; <code>--selct</code> nudges <code>--select</code>; root honors <code>--quiet</code>/<code>--select=commands</code>; <code>calc version</code> answers; <code>--dry-run=false</code> runs; <code>inf</code> → INVALID_ARG; <code>1e308+1e308</code> → OVERFLOW.</li>
+  <li>Stdout/stderr split re-verified (envelope on stdout, 0 bytes stderr, exit 2); <code>SOURCE_DATE_EPOCH=0</code> runs byte-identical; clamps verified for huge/garbage/negative pins.</li>
+</ul>
+</section>
+</body>
+</html>
