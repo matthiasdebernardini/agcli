@@ -10,8 +10,23 @@
 //! cargo run --example calc -- add foo bar   # typed-error envelope
 //! ```
 
-use agcli::{ActionParam, AgentCli, Command, CommandOutput, NextAction};
+use agcli::{ActionParam, AgentCli, Command, CommandError, CommandOutput, ExitCode, NextAction};
 use serde_json::json;
+
+/// `serde_json` renders non-finite floats as `null`, which would corrupt the
+/// result while still reporting `ok: true` — so overflow is a typed error.
+fn finite(value: f64, operation: &str) -> Result<f64, CommandError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(CommandError::new(
+            format!("{operation} overflowed the f64 range"),
+            "OVERFLOW",
+            "Use smaller operands; f64 arithmetic saturates to infinity past ~1.8e308.",
+        )
+        .exit_code(ExitCode::USAGE))
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -26,7 +41,7 @@ async fn main() {
                     let a = req.arg_parse::<f64>(0, "a");
                     let b = req.arg_parse::<f64>(1, "b");
                     Box::pin(async move {
-                        let sum = a? + b?;
+                        let sum = finite(a? + b?, "add")?;
                         Ok(CommandOutput::new(json!({
                             "operation": "add",
                             "result": sum,
@@ -61,7 +76,7 @@ async fn main() {
                     let a = req.arg_parse::<f64>(0, "a");
                     let b = req.arg_parse::<f64>(1, "b");
                     Box::pin(async move {
-                        let diff = a? - b?;
+                        let diff = finite(a? - b?, "sub")?;
                         Ok(CommandOutput::new(json!({
                             "operation": "sub",
                             "result": diff,

@@ -4,14 +4,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
+/// Latest epoch second representable as a four-digit-year RFC 3339 timestamp
+/// (9999-12-31T23:59:59Z). Larger pins would emit a string the crate's own
+/// [`parse_rfc3339_utc`] rejects, breaking round-trips of our own output.
+const MAX_RFC3339_EPOCH: u64 = 253_402_300_799;
+
 fn epoch_secs() -> u64 {
     // SOURCE_DATE_EPOCH (the reproducible-builds convention) pins the envelope
-    // timestamp so two runs of the same command can be byte-compared.
-    if let Some(pinned) = std::env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        return pinned;
+    // timestamp so two runs of the same command can be byte-compared. Per the
+    // spec a malformed value must not fall back to the wall clock — that would
+    // silently defeat the pin — so it clamps to 0; negative values clamp to 0;
+    // values past the four-digit-year ceiling clamp to MAX_RFC3339_EPOCH.
+    if let Ok(raw) = std::env::var("SOURCE_DATE_EPOCH") {
+        return pin_from_source_date_epoch(&raw);
     }
     // Never panic on a misconfigured clock: a timestamp of 0 keeps the
     // envelope valid and JSON-emittable, honoring the "JSON always" contract
@@ -20,6 +25,19 @@ fn epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Resolve a `SOURCE_DATE_EPOCH` value to a usable epoch second. Malformed
+/// and negative values clamp to 0 (never the wall clock — that would silently
+/// defeat the pin); oversized values clamp to [`MAX_RFC3339_EPOCH`].
+fn pin_from_source_date_epoch(raw: &str) -> u64 {
+    match raw.trim().parse::<i128>() {
+        Ok(n) if n < 0 => 0,
+        Ok(n) => u64::try_from(n)
+            .unwrap_or(MAX_RFC3339_EPOCH)
+            .min(MAX_RFC3339_EPOCH),
+        Err(_) => 0,
+    }
 }
 
 /// Format epoch seconds as an RFC 3339 UTC timestamp (`2026-06-10T14:42:17Z`).
@@ -116,15 +134,17 @@ where
 /// `std::process::exit` truncates to the low 8 bits, so an out-of-range code
 /// would make the serialized `exit_code` field disagree with the real process
 /// status (`exit(256)` → status `0`). Masking keeps the JSON field equal to
-/// what the shell observes via `$?`. A `debug_assert` flags out-of-range codes
-/// in development so authors notice the mistake before it ships.
+/// what the shell observes via `$?`.
+///
+/// This masks silently: it runs in the framework's post-handler path, *after*
+/// the handler panic guard, so an assertion here would unwind past the
+/// envelope machinery and print nothing to stdout — the exact non-JSON
+/// failure the framework exists to prevent. The development-time
+/// `debug_assert` for out-of-range codes lives in
+/// [`crate::CommandOutput::exit_code`] / [`crate::CommandError::exit_code`]
+/// instead, where a panic is caught and folded into a `HANDLER_PANIC`
+/// envelope.
 pub(crate) fn normalize_exit_code(code: i32) -> i32 {
-    debug_assert!(
-        (0..=255).contains(&code),
-        "exit code {code} is outside the 0..=255 range a process status can represent; \
-         it will be masked to {} to match std::process::exit truncation",
-        code & 0xff
-    );
     code & 0xff
 }
 
@@ -579,6 +599,35 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn source_date_epoch_pin_parses_and_clamps() {
+        // Normal value passes through.
+        assert_eq!(pin_from_source_date_epoch("1700000000"), 1_700_000_000);
+        assert_eq!(pin_from_source_date_epoch(" 0 "), 0);
+        // Malformed and negative values clamp to 0 per the
+        // reproducible-builds convention — never the wall clock.
+        assert_eq!(pin_from_source_date_epoch("not-a-number"), 0);
+        assert_eq!(pin_from_source_date_epoch(""), 0);
+        assert_eq!(pin_from_source_date_epoch("-5"), 0);
+        // Values past the four-digit-year ceiling clamp so the emitted
+        // timestamp stays parseable by our own parser.
+        assert_eq!(
+            pin_from_source_date_epoch("18446744073709551615"),
+            MAX_RFC3339_EPOCH
+        );
+        assert_eq!(
+            pin_from_source_date_epoch("999999999999999999999999"),
+            MAX_RFC3339_EPOCH
+        );
+    }
+
+    #[test]
+    fn max_rfc3339_epoch_round_trips_through_own_parser() {
+        let rendered = rfc3339_utc(MAX_RFC3339_EPOCH);
+        assert_eq!(rendered, "9999-12-31T23:59:59Z");
+        assert_eq!(parse_rfc3339_utc(&rendered), Some(MAX_RFC3339_EPOCH));
+    }
+
+    #[test]
     fn success_envelope_serializes_required_fields() {
         let envelope = SuccessEnvelope::new(
             "wokhei status",
@@ -673,22 +722,17 @@ mod tests {
         assert_eq!(e.exit_code, 7 & 0xff);
     }
 
-    #[cfg(not(debug_assertions))]
     #[test]
-    fn exit_code_masked_to_process_status_in_release() {
+    fn exit_code_masked_to_process_status() {
         // 261 (256 + 5) truncates to 5 under std::process::exit; the JSON field
-        // must agree. Only meaningful in release — debug builds assert instead.
+        // must agree. This setter runs in the framework's post-handler path
+        // (outside the handler panic guard), so it masks silently in every
+        // build — the development-time assert lives on the handler-side
+        // setters (`CommandOutput::exit_code` / `CommandError::exit_code`).
         let e = SuccessEnvelope::new("cmd", json!(null), vec![]).exit_code(256 + 5);
         assert_eq!(e.exit_code, 5);
         let encoded = serde_json::to_value(&e).expect("serialize");
         assert_eq!(encoded["exit_code"], json!(5));
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "outside the 0..=255")]
-    fn exit_code_out_of_range_panics_in_debug() {
-        let _ = SuccessEnvelope::new("cmd", json!(null), vec![]).exit_code(256);
     }
 
     #[test]

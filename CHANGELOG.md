@@ -31,8 +31,73 @@ on commands that mutate anyway). Behavior changes are a **minor** bump pre-1.0.
     error class. They now carry `ExitCode::USAGE` so the exit-code dictionary
     is consistent regardless of which layer raised the error.
 
+- **Extra positional arguments are rejected** (when `reserved_flags` is on).
+    The framework counts the `<...>` placeholders in the leaf usage string and
+    refuses surplus positionals with `EXTRA_ARG` (exit `USAGE`), naming the
+    unexpected token(s) and the usage template. Previously `calc add 1 2 3`
+    silently dropped the `3` and exited 0 — for a mutating CLI
+    (`tool delete <id>` with two ids) that silence is dangerous. Variadic
+    usages (`...`) opt out implicitly; opt out per command with
+    `Command::allow_extra_args()`.
+- **Non-finite floats are rejected by the typed accessors.** `f64::from_str`
+    happily parses `"inf"`/`"NaN"`, and serde_json then serializes them as
+    `null` — `ok: true` with a corrupted result. `arg_parse`/`flag_parse` now
+    return `INVALID_ARG`/`INVALID_FLAG` ("is not finite") instead. Their `T`
+    bound gains `+ std::any::Any` (practically every parse target already
+    satisfies it).
+- **Explicit negation turns reserved booleans off.** `--dry-run=false`,
+    `--quiet=0`, `=no`, `=off` now read as *off*; previously presence-testing
+    meant `--dry-run=false` *enabled* the dry-run gate. Applies to the
+    framework gates and the `req.dry_run()`-family accessors.
+- **Root/help/version paths honor `--select`/`--compact`/`--quiet`.** The root
+    tree advertises the reserved output flags on every command, but the
+    framework-rendered paths ignored them (`calc --quiet` still emitted
+    `next_actions`). The root tree of a large CLI is exactly where an agent
+    wants `--select=commands`.
+
 ### Added
 
+- **`<tool> version` positional alias** — answers like `--version` (unless the
+    CLI defines its own `version` command). The `help` alias landed earlier in
+    this release; `version` is the same reflex.
+- **`error_codes` dictionary in the root help envelope** alongside
+    `exit_codes`, so an agent can build retry/branch policy from a single root
+    call instead of discovering codes one failure at a time.
+- **`audit()` validates the usage-string/parser coupling.** Usage strings are
+    simultaneously documentation, the unknown-flag schema, and the arity
+    bound — a malformed template silently changes parsing. New findings:
+    `UNBALANCED_USAGE_BRACKETS` (error), `USAGE_PROGRAM_MISMATCH` (warning),
+    `RESERVED_FLAG_REDECLARED` (warning).
+- **Golden-envelope test suite** (`tests/golden_envelopes.rs`) pins the exact
+    bytes of every canonical envelope class under `SOURCE_DATE_EPOCH=0`, so
+    schema drift is a red test instead of a downstream agent outage.
+- **`Command::allow_extra_args()`** — per-command opt-out of the new arity
+    check.
+
+### Fixed
+
+- **Usage-declared short value flags were rejected as unknown.** The flag
+    schema collected long flags and bracketed short *booleans* but skipped
+    short *value* flags, so a usage of `t log [-n <count>]` rejected
+    `t log -n 5` — the framework refusing its own advertised affordance — and
+    rendered the error as `--n`. Short value flags are now declared, and
+    single-character flags render with a single dash everywhere.
+- **Out-of-range handler exit codes could escape the panic guard.** The
+    0–255 `debug_assert` fired in the framework's *post-handler* path (after
+    `catch_unwind`), printing nothing to stdout and exiting 101 — the exact
+    non-JSON failure the guard exists to prevent. Envelope-build now masks
+    silently; the development-time assert moved into
+    `CommandOutput::exit_code` / `CommandError::exit_code`, where it fires
+    inside the guard and folds into a structured `HANDLER_PANIC` envelope.
+- **"Did you mean" for typo'd flags covers the reserved flags** (`--selct` →
+    "Did you mean `--select`?") and resolves equal-distance ties
+    deterministically (candidates were previously iterated in `HashSet`
+    order).
+- **`SOURCE_DATE_EPOCH` edge cases.** Malformed and negative values now clamp
+    to 0 per the reproducible-builds convention (previously they silently fell
+    back to the wall clock, defeating the pin); values past
+    9999-12-31T23:59:59Z clamp to that ceiling so the emitted timestamp stays
+    round-trippable through the crate's own parser.
 - **`<tool> help [command...]` alias** — routes through the same path as
     `--help`/`-h`. It is the first thing many agents guess; it used to be
     `UNKNOWN_COMMAND`.

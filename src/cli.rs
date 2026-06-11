@@ -33,6 +33,20 @@ fn is_reserved_bool(flag: &str) -> bool {
     RESERVED_BOOL_FLAGS.contains(&flag)
 }
 
+/// Read a boolean flag's effective state from its parsed value. Presence
+/// means on — except an explicit negation (`--quiet=false`, `--dry-run=0`,
+/// `=no`, `=off`), which means off. Without this, `--dry-run=false` would
+/// *enable* dry-run, punishing the agent that spelled its intent out.
+fn bool_flag_on(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "off"
+        ),
+    }
+}
+
 /// The framework-reserved agent-native flags with their semantics, in the
 /// order they appear in the self-documenting root tree. `--select` is a value
 /// flag; the rest are booleans (see [`RESERVED_BOOL_FLAGS`]).
@@ -497,38 +511,68 @@ impl<'a> CommandRequest<'a> {
     }
 
     /// Parse positional `index` into `T`, erroring with `MISSING_ARG` when
-    /// absent or `INVALID_ARG` when it does not parse.
+    /// absent or `INVALID_ARG` when it does not parse. Non-finite floats
+    /// (`"inf"`, `"NaN"` — which `f64::from_str` happily accepts) are
+    /// rejected as `INVALID_ARG`: serde_json serializes them as `null`, so
+    /// letting one through yields `ok:true` with a corrupted result.
     pub fn arg_parse<T>(&self, index: usize, name: &str) -> Result<T, CommandError>
     where
-        T: std::str::FromStr,
+        T: std::str::FromStr + std::any::Any,
     {
         let raw = self.require_arg(index, name)?;
-        raw.parse::<T>().map_err(|_| {
+        let value = raw.parse::<T>().map_err(|_| {
             CommandError::new(
                 format!("argument <{name}> is not valid: {raw:?}"),
                 "INVALID_ARG",
                 format!("Pass a valid value for <{name}>."),
             )
             .exit_code(ExitCode::USAGE)
-        })
+        })?;
+        if !parsed_value_is_finite(&value) {
+            return Err(CommandError::new(
+                format!("argument <{name}> is not finite: {raw:?}"),
+                "INVALID_ARG",
+                format!(
+                    "Pass a finite number for <{name}> — JSON cannot represent \
+                     infinities or NaN."
+                ),
+            )
+            .exit_code(ExitCode::USAGE));
+        }
+        Ok(value)
     }
 
     /// Parse flag `key` into `T` when present. `Ok(None)` when the flag is
-    /// absent; `INVALID_FLAG` when present but unparseable.
+    /// absent; `INVALID_FLAG` when present but unparseable or non-finite
+    /// (see [`Self::arg_parse`]).
     pub fn flag_parse<T>(&self, key: &str) -> Result<Option<T>, CommandError>
     where
-        T: std::str::FromStr,
+        T: std::str::FromStr + std::any::Any,
     {
         match self.flag(key) {
             None => Ok(None),
-            Some(raw) => raw.parse::<T>().map(Some).map_err(|_| {
-                CommandError::new(
-                    format!("flag --{key} is not valid: {raw:?}"),
-                    "INVALID_FLAG",
-                    format!("Pass a valid value for --{key}."),
-                )
-                .exit_code(ExitCode::USAGE)
-            }),
+            Some(raw) => {
+                let value = raw.parse::<T>().map_err(|_| {
+                    CommandError::new(
+                        format!("flag --{key} is not valid: {raw:?}"),
+                        "INVALID_FLAG",
+                        format!("Pass a valid value for --{key}."),
+                    )
+                    .exit_code(ExitCode::USAGE)
+                })?;
+                if !parsed_value_is_finite(&value) {
+                    return Err(CommandError::new(
+                        format!("flag --{key} is not finite: {raw:?}"),
+                        "INVALID_FLAG",
+                        format!(
+                            "Pass a finite number for --{key} — JSON cannot represent \
+                             infinities or NaN."
+                        ),
+                    )
+                    .exit_code(ExitCode::USAGE));
+                }
+                Ok(Some(value))
+            }
         }
     }
 
@@ -551,37 +595,37 @@ impl<'a> CommandRequest<'a> {
 
     /// `--dry-run`: preview without mutating.
     pub fn dry_run(&self) -> bool {
-        self.flag("dry-run").is_some()
+        bool_flag_on(self.flag("dry-run"))
     }
 
     /// `--quiet`: suppress non-essential output.
     pub fn quiet(&self) -> bool {
-        self.flag("quiet").is_some()
+        bool_flag_on(self.flag("quiet"))
     }
 
     /// `--yes` / `--no-input`: assume yes; never prompt interactively.
     pub fn assume_yes(&self) -> bool {
-        self.flag("yes").is_some() || self.flag("no-input").is_some()
+        bool_flag_on(self.flag("yes")) || bool_flag_on(self.flag("no-input"))
     }
 
     /// `--no-cache`: bypass any local cache.
     pub fn no_cache(&self) -> bool {
-        self.flag("no-cache").is_some()
+        bool_flag_on(self.flag("no-cache"))
     }
 
     /// `--no-color`: emit machine-friendly, uncolored output.
     pub fn no_color(&self) -> bool {
-        self.flag("no-color").is_some()
+        bool_flag_on(self.flag("no-color"))
     }
 
     /// `--compact`: caller asked for high-gravity fields only.
     pub fn compact(&self) -> bool {
-        self.flag("compact").is_some()
+        bool_flag_on(self.flag("compact"))
     }
 
     /// `--stdin`: caller intends to pipe input. Pair with [`read_stdin`].
     pub fn wants_stdin(&self) -> bool {
-        self.flag("stdin").is_some()
+        bool_flag_on(self.flag("stdin"))
     }
 
     /// `--select=a,b,c`: the requested field projection, split and trimmed.
@@ -668,7 +712,19 @@ impl CommandOutput {
     }
 
     /// Override the process exit code while still reporting success.
+    ///
+    /// Codes outside 0–255 cannot survive `std::process::exit` truncation and
+    /// are masked to the low 8 bits at envelope-build time. A `debug_assert`
+    /// here flags the mistake in development; it fires inside the handler
+    /// panic guard, so even then the process emits a structured
+    /// `HANDLER_PANIC` envelope instead of bare panic output.
     pub fn exit_code(mut self, code: i32) -> Self {
+        debug_assert!(
+            (0..=255).contains(&code),
+            "exit code {code} is outside the 0..=255 range a process status can represent; \
+             it will be masked to {} to match std::process::exit truncation",
+            code & 0xff
+        );
         self.exit_code = Some(code);
         self
     }
@@ -732,12 +788,21 @@ impl CommandError {
     /// Set the typed process exit code (use an [`ExitCode`] constant). An
     /// error envelope with `ExitCode::SUCCESS` (0) is contradictory — a shell
     /// or agent reads it as success — so it is rejected by a `debug_assert` in
-    /// development builds.
+    /// development builds, as are codes outside the 0–255 range a process
+    /// status can represent (they are masked at envelope-build time). Both
+    /// asserts fire inside the handler panic guard, so even in development
+    /// the process emits a structured `HANDLER_PANIC` envelope.
     pub fn exit_code(mut self, code: i32) -> Self {
         debug_assert_ne!(
             code,
             ExitCode::SUCCESS,
             "an error must not carry a success (0) exit code"
+        );
+        debug_assert!(
+            (0..=255).contains(&code),
+            "exit code {code} is outside the 0..=255 range a process status can represent; \
+             it will be masked to {} to match std::process::exit truncation",
+            code & 0xff
         );
         self.exit_code = Some(code);
         self
@@ -839,6 +904,9 @@ pub struct Command {
     /// Opt out of unknown-flag rejection for this command (e.g. a passthrough
     /// command forwarding arbitrary flags to another program).
     allow_unknown_flags: bool,
+    /// Opt out of extra-positional rejection for this command. Usage strings
+    /// with a variadic tail (`...`) opt out implicitly.
+    allow_extra_args: bool,
 }
 
 use std::collections::BTreeMap;
@@ -868,6 +936,7 @@ impl Command {
             apply_reserved_projection: true,
             handles_dry_run: false,
             allow_unknown_flags: false,
+            allow_extra_args: false,
         }
     }
 
@@ -885,6 +954,16 @@ impl Command {
     /// commands that forward arbitrary flags elsewhere).
     pub fn allow_unknown_flags(mut self) -> Self {
         self.allow_unknown_flags = true;
+        self
+    }
+
+    /// Opt this command out of extra-positional rejection. By default the
+    /// framework counts the `<...>` placeholders in the usage string and
+    /// refuses surplus positionals with `EXTRA_ARG` — a silently dropped
+    /// argument is how `tool delete <id>` run with two ids deletes the wrong
+    /// thing. Usage strings with a variadic tail (`...`) opt out implicitly.
+    pub fn allow_extra_args(mut self) -> Self {
+        self.allow_extra_args = true;
         self
     }
 
@@ -1168,6 +1247,68 @@ impl AgentCli {
                     "handler command has no usage string; a framework default is used instead",
                 );
             }
+            // The usage string is not just documentation — it is the flag
+            // schema (`extract_all_flag_names`) and the positional-arity
+            // bound (`usage_positional_arity`). A malformed template silently
+            // changes parsing behavior, so structural problems are findings.
+            if let Some(usage) = &command.usage {
+                let opens = usage.matches('[').count();
+                let closes = usage.matches(']').count();
+                let lt = usage.matches('<').count();
+                let gt = usage.matches('>').count();
+                if opens != closes || lt != gt {
+                    report.push(
+                        AuditSeverity::Error,
+                        "UNBALANCED_USAGE_BRACKETS",
+                        &path,
+                        format!(
+                            "usage `{usage}` has unbalanced brackets \
+                             ({opens}×'[' vs {closes}×']', {lt}×'<' vs {gt}×'>'); \
+                             flag and arity validation parse this template, so it \
+                             will misbehave"
+                        ),
+                    );
+                }
+                if usage.split_whitespace().next() != Some(self.name.as_str()) {
+                    report.push(
+                        AuditSeverity::Warning,
+                        "USAGE_PROGRAM_MISMATCH",
+                        &path,
+                        format!(
+                            "usage `{usage}` does not start with the program name \
+                             `{}`; agents copy next_action templates verbatim",
+                            self.name
+                        ),
+                    );
+                }
+                if self.reserved_flags {
+                    let mut declared = HashSet::new();
+                    extract_all_flag_names(usage, &mut declared);
+                    let mut redeclared: Vec<&str> = declared
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|f| reserved_flag_names().contains(f))
+                        .collect();
+                    redeclared.sort_unstable();
+                    if !redeclared.is_empty() {
+                        report.push(
+                            AuditSeverity::Warning,
+                            "RESERVED_FLAG_REDECLARED",
+                            &path,
+                            format!(
+                                "usage `{usage}` declares framework-reserved flag(s) \
+                                 {}; the framework already parses and documents them \
+                                 on every command",
+                                redeclared
+                                    .iter()
+                                    .map(|f| flag_display(f))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        );
+                    }
+                }
+            }
             for action in &command.default_next_actions {
                 if !self.next_action_resolves(&action.command) {
                     report.push(
@@ -1292,6 +1433,15 @@ impl AgentCli {
             return self.help_execution(&invocation, &invocation.positionals()[1..]);
         }
 
+        // `<tool> version` — the positional spelling of `--version`. Skipped
+        // when the CLI defines its own `version` command.
+        if invocation.positionals().len() == 1
+            && invocation.positionals()[0] == "version"
+            && !self.commands.contains_key("version")
+        {
+            return self.version_execution(&invocation);
+        }
+
         // Bare `--version` / `-V` answers with just the version instead of
         // dumping the entire command tree.
         if invocation.positionals().is_empty()
@@ -1396,28 +1546,35 @@ impl AgentCli {
                 invocation.flags().keys().filter(|f| !allowed(f)).collect();
             unknown.sort();
             if let Some(first_unknown) = unknown.first() {
-                let candidates: Vec<&str> = declared.iter().map(String::as_str).collect();
+                let mut declared_sorted: Vec<&str> = declared.iter().map(String::as_str).collect();
+                declared_sorted.sort_unstable();
+                // Typo candidates cover the reserved agent flags too —
+                // `--selct` should nudge toward `--select` even though no
+                // command declares it. Sorted (declared first) so equal-
+                // distance ties resolve deterministically across runs.
+                let mut candidates = declared_sorted.clone();
+                if self.reserved_flags {
+                    candidates.extend(reserved_flag_names());
+                }
                 let mut fix = String::new();
                 use std::fmt::Write as _;
                 if let Some(near) = nearest_name(first_unknown, &candidates) {
-                    let _ = write!(&mut fix, "Did you mean `--{near}`? ");
+                    let _ = write!(&mut fix, "Did you mean `{}`? ", flag_display(&near));
                 }
-                if candidates.is_empty() {
+                if declared_sorted.is_empty() {
                     let _ = write!(
                         &mut fix,
                         "`{}` takes no flags of its own.",
                         path_strs.join(" ")
                     );
                 } else {
-                    let mut names: Vec<&str> = candidates.clone();
-                    names.sort_unstable();
                     let _ = write!(
                         &mut fix,
                         "Valid flags for `{}`: {}.",
                         path_strs.join(" "),
-                        names
+                        declared_sorted
                             .iter()
-                            .map(|n| format!("--{n}"))
+                            .map(|n| flag_display(n))
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
@@ -1432,7 +1589,7 @@ impl AgentCli {
                 }
                 let unknown_list = unknown
                     .iter()
-                    .map(|f| format!("--{f}"))
+                    .map(|f| flag_display(f))
                     .collect::<Vec<_>>()
                     .join(", ");
                 return self.error_execution(
@@ -1446,11 +1603,50 @@ impl AgentCli {
             }
         }
 
+        // Reject surplus positional arguments. Without this, `tool delete
+        // <id>` invoked with two ids silently drops the second — exit 0,
+        // wrong behavior, nothing for the agent to learn from. Bounded by the
+        // `<...>` placeholders in the leaf usage string; variadic usages
+        // (`...`) and `allow_extra_args()` commands opt out.
+        if self.reserved_flags
+            && !path_cmds.iter().any(|c| c.allow_extra_args)
+            && let Some(usage) = &command.usage
+            && let Some((required, optional)) = usage_positional_arity(usage)
+            && resolved.remaining.len() > required + optional
+        {
+            let extras = &resolved.remaining[required + optional..];
+            let extra_list = extras
+                .iter()
+                .map(|a| format!("{a:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let expected = match optional {
+                0 => format!("{required}"),
+                _ => format!("{required}–{}", required + optional),
+            };
+            return self.error_execution(
+                invocation.command_line().to_string(),
+                format!(
+                    "unexpected extra argument(s): {extra_list} (`{}` takes {expected} \
+                     positional argument(s); got {})",
+                    path_strs.join(" "),
+                    resolved.remaining.len()
+                ),
+                "EXTRA_ARG",
+                format!(
+                    "Nothing was run. Re-invoke matching the usage template `{usage}`, \
+                     or drop the extra argument(s)."
+                ),
+                false,
+                self.default_command_actions(&path_strs, command),
+            );
+        }
+
         // `--dry-run` promises "preview without mutating" on every command.
         // Running a handler that never reads `req.dry_run()` would mutate
         // under that promise, so refuse unless the command declared support.
         if self.reserved_flags
-            && invocation.flag("dry-run").is_some()
+            && bool_flag_on(invocation.flag("dry-run"))
             && !path_cmds.iter().any(|c| c.handles_dry_run)
         {
             return self.error_execution(
@@ -1512,7 +1708,7 @@ impl AgentCli {
                         if let Some(raw) = invocation.flag("select") {
                             result = apply_select_flag(result, raw);
                         }
-                        if invocation.flag("compact").is_some() {
+                        if bool_flag_on(invocation.flag("compact")) {
                             result = match &compact_fields {
                                 Some(fields) => {
                                     let refs: Vec<&str> =
@@ -1523,7 +1719,7 @@ impl AgentCli {
                             };
                         }
                     }
-                    if invocation.flag("quiet").is_some() {
+                    if bool_flag_on(invocation.flag("quiet")) {
                         next_actions.clear();
                     }
                 }
@@ -1587,6 +1783,36 @@ impl AgentCli {
         envelope
     }
 
+    /// Build a success `Execution` for a framework-rendered (root / help /
+    /// version) result, honoring the reserved output flags. The root tree
+    /// advertises `--select` / `--compact` / `--quiet` on *every* command, so
+    /// these paths must honor them too — the root tree of a large CLI is
+    /// exactly where an agent wants `--select=commands`. (The handler path
+    /// has its own application with per-command `compact_fields` support.)
+    fn framework_success(
+        &self,
+        invocation: &Invocation,
+        mut result: Value,
+        mut next_actions: Vec<NextAction>,
+    ) -> Execution {
+        if self.reserved_flags {
+            if let Some(raw) = invocation.flag("select") {
+                result = apply_select_flag(result, raw);
+            }
+            if bool_flag_on(invocation.flag("compact")) {
+                result = project::compact(&result);
+            }
+            if bool_flag_on(invocation.flag("quiet")) {
+                next_actions.clear();
+            }
+        }
+        Execution {
+            envelope: self
+                .success_envelope(invocation.command_line().to_string(), result, next_actions)
+                .into(),
+        }
+    }
+
     /// Answer a bare `--version` / `-V` with just `{name, version}` instead of
     /// the full command tree.
     fn version_execution(&self, invocation: &Invocation) -> Execution {
@@ -1594,31 +1820,19 @@ impl AgentCli {
             "name": self.name,
             "version": self.version.clone().unwrap_or_else(|| "unknown".to_string()),
         });
-        Execution {
-            envelope: self
-                .success_envelope(
-                    invocation.command_line().to_string(),
-                    result,
-                    vec![NextAction::new(
-                        self.name.clone(),
-                        "Inspect the full command tree",
-                    )],
-                )
-                .into(),
-        }
+        self.framework_success(
+            invocation,
+            result,
+            vec![NextAction::new(
+                self.name.clone(),
+                "Inspect the full command tree",
+            )],
+        )
     }
 
     fn root_execution(&self, invocation: &Invocation) -> Execution {
         let result = self.root_result(invocation.program());
-        Execution {
-            envelope: self
-                .success_envelope(
-                    invocation.command_line().to_string(),
-                    result,
-                    self.root_actions(),
-                )
-                .into(),
-        }
+        self.framework_success(invocation, result, self.root_actions())
     }
 
     /// Render help for `targets` (a command path, possibly empty for root
@@ -1700,15 +1914,11 @@ impl AgentCli {
             "subcommands": subcommands
         });
 
-        Execution {
-            envelope: self
-                .success_envelope(
-                    invocation.command_line().to_string(),
-                    result,
-                    self.subcommand_actions(&path_strs, command),
-                )
-                .into(),
-        }
+        self.framework_success(
+            invocation,
+            result,
+            self.subcommand_actions(&path_strs, command),
+        )
     }
 
     fn root_result(&self, program: &str) -> Value {
@@ -1756,6 +1966,27 @@ impl AgentCli {
                 "4": "auth (authentication or authorization failure)",
                 "5": "api (an upstream call failed)",
                 "7": "rate_limited (back off and retry)"
+            }),
+        );
+
+        // Publish the framework's conventional error codes so an agent can
+        // build retry/branch policy from a single root call instead of
+        // discovering codes one failure at a time.
+        result.insert(
+            "error_codes".to_string(),
+            json!({
+                "PARSE_ERROR": "the command line could not be parsed",
+                "UNKNOWN_COMMAND": "no such command; fix lists valid names",
+                "UNKNOWN_SUBCOMMAND": "no such subcommand; fix lists valid names",
+                "UNKNOWN_FLAG": "flag not declared by this command; fix lists valid flags",
+                "EXTRA_ARG": "more positional arguments than the usage template declares",
+                "MISSING_ARG": "a required positional argument is absent",
+                "INVALID_ARG": "a positional argument failed to parse",
+                "INVALID_FLAG": "a flag value failed to parse",
+                "MISSING_HANDLER": "the command is a group with no runnable handler",
+                "DRY_RUN_UNSUPPORTED": "--dry-run passed to a command without a preview mode; nothing was changed",
+                "HANDLER_PANIC": "a bug in the command handler, not the invocation",
+                "SERIALIZATION_FAILED": "the handler's result could not be serialized"
             }),
         );
 
@@ -2037,6 +2268,80 @@ fn path_refs(path: &[String]) -> Vec<&str> {
 /// When the bad token also looks like a typo of a real name, a nearest-match
 /// nudge is prefixed. `next_actions` already carry the full templates; this puts
 /// the names where the agent reads first.
+/// True unless `value` is a non-finite `f64`/`f32`. String parsing accepts
+/// `"inf"`/`"NaN"` for the float types, but serde_json serializes non-finite
+/// floats as `null` — an envelope-corrupting value the typed helpers refuse
+/// to produce.
+fn parsed_value_is_finite<T: std::any::Any>(value: &T) -> bool {
+    let any = value as &dyn std::any::Any;
+    if let Some(f) = any.downcast_ref::<f64>() {
+        f.is_finite()
+    } else if let Some(f) = any.downcast_ref::<f32>() {
+        f.is_finite()
+    } else {
+        true
+    }
+}
+
+/// Count the positional placeholders a usage string declares, as
+/// `(required, optional)`. Returns `None` when arity cannot be bounded — the
+/// usage declares a variadic tail (`...`). Flag-value placeholders
+/// (`--flag <v>`, `[-n <count>]`, `--flag=<v>`) are not positionals and are
+/// skipped; plain words are the program/command-path literals.
+fn usage_positional_arity(usage: &str) -> Option<(usize, usize)> {
+    let mut required = 0usize;
+    let mut optional = 0usize;
+    let mut tokens = usage.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        if token.contains("...") {
+            return None;
+        }
+        if let Some(inner) = token.strip_prefix('[') {
+            // Bracketed group. Multi-token forms (`[--flag <v>]`,
+            // `[-n <count>]`) start with a flag, so the whole group is
+            // flag-ish; anything else (`[<x>]`, bare `[path]`) is an
+            // optional positional. Either way, consume tokens through the
+            // closing `]`.
+            let is_positional = !inner.starts_with('-');
+            let mut tok = token;
+            while !tok.ends_with(']') {
+                match tokens.next() {
+                    Some(next) if next.contains("...") => return None,
+                    Some(next) => tok = next,
+                    None => break,
+                }
+            }
+            if is_positional {
+                optional += 1;
+            }
+            continue;
+        }
+        if token.starts_with('-') {
+            // A flag. When it doesn't carry `=value`, its value may be the
+            // next token (`--flag <v>` / `-n <count>`): that placeholder
+            // belongs to the flag, not the positionals.
+            if !token.contains('=') && tokens.peek().is_some_and(|t| t.starts_with('<')) {
+                tokens.next();
+            }
+            continue;
+        }
+        if token.starts_with('<') {
+            required += 1;
+        }
+    }
+    Some((required, optional))
+}
+
+/// Render a flag name with the dash count an agent must actually type:
+/// `-n` for single-character flags, `--select` for long ones.
+fn flag_display(name: &str) -> String {
+    if name.chars().count() == 1 {
+        format!("-{name}")
+    } else {
+        format!("--{name}")
+    }
+}
+
 fn unknown_command_fix(scope: &str, bad: &str, valid: &[&str]) -> String {
     if valid.is_empty() {
         return format!("Run the root command to inspect the available {scope}s.");
@@ -2107,8 +2412,8 @@ fn collect_bool_flags(command: &Command, set: &mut HashSet<String>, depth: usize
 fn extract_all_flag_names(usage: &str, set: &mut HashSet<String>) {
     // Bracketed booleans, including short flags (`[-x]`, `[-abc]`).
     extract_bool_flag_names(usage, set);
-    // Long flags anywhere in the template.
     for raw in usage.split(|c: char| c.is_whitespace() || c == '[' || c == ']') {
+        // Long flags anywhere in the template.
         if let Some(rest) = raw.strip_prefix("--") {
             let name: String = rest
                 .chars()
@@ -2116,6 +2421,20 @@ fn extract_all_flag_names(usage: &str, set: &mut HashSet<String>) {
                 .collect();
             if !name.is_empty() {
                 set.insert(name);
+            }
+        } else if let Some(rest) = raw.strip_prefix('-') {
+            // Short *value* flags (`-n <count>`, bracketed or not). The
+            // bool extractor above only sees bracketed forms without a
+            // `<value>`, so without this arm a usage-declared `[-n <count>]`
+            // would be rejected as unknown — the framework refusing its own
+            // advertised affordance. Letters only: `-1`-style tokens are
+            // negative-number examples, not flags.
+            let mut chars = rest.chars();
+            if let Some(ch) = chars.next()
+                && ch.is_ascii_alphabetic()
+                && matches!(chars.next(), None | Some('='))
+            {
+                set.insert(ch.to_string());
             }
         }
     }
@@ -3497,5 +3816,344 @@ mod tests {
                 .default_next_action(NextAction::new("app", "Inspect the root tree")),
         );
         assert!(cli.audit().is_clean(), "{:?}", cli.audit().findings);
+    }
+
+    // --- Short value flags are declared flags (R1) ---
+
+    #[test]
+    fn extract_all_flag_names_includes_short_value_flags() {
+        let mut set = HashSet::new();
+        extract_all_flag_names("t log [-n <count>] [--follow] -v <level>", &mut set);
+        assert!(set.contains("n"), "{set:?}");
+        assert!(set.contains("v"), "{set:?}");
+        assert!(set.contains("follow"));
+        // `-1`-style tokens are negative-number examples, not flags.
+        let mut neg = HashSet::new();
+        extract_all_flag_names("t add -1 <b>", &mut neg);
+        assert!(!neg.contains("1"));
+    }
+
+    #[tokio::test]
+    async fn declared_short_value_flag_is_accepted() {
+        let cli = AgentCli::new("t", "tool").command(
+            Command::new("log", "Show log")
+                .usage("t log [-n <count>] [--follow]")
+                .handler(|req, _ctx| {
+                    let n = req.flag("n").unwrap_or("10").to_string();
+                    Box::pin(async move { Ok(CommandOutput::new(json!({ "n": n }))) })
+                }),
+        );
+        let run = cli.run_argv(["t", "log", "-n", "5"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success, got {}", run.to_json());
+        };
+        assert_eq!(envelope.result["n"], json!("5"));
+    }
+
+    #[tokio::test]
+    async fn unknown_single_char_flag_renders_single_dash() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "status", "-z"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error");
+        };
+        assert!(
+            envelope.error.message.contains("-z") && !envelope.error.message.contains("--z"),
+            "{}",
+            envelope.error.message
+        );
+    }
+
+    // --- Did-you-mean covers reserved flags (R4) ---
+
+    #[tokio::test]
+    async fn typod_reserved_flag_gets_did_you_mean() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "status", "--selct=healthy"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error");
+        };
+        assert_eq!(envelope.error.code, "UNKNOWN_FLAG");
+        assert!(
+            envelope.fix.contains("Did you mean `--select`?"),
+            "{}",
+            envelope.fix
+        );
+    }
+
+    // --- Extra positionals are rejected (R3) ---
+
+    #[tokio::test]
+    async fn extra_positional_is_rejected() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "status", "surplus"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected error, got {}", run.to_json());
+        };
+        assert_eq!(envelope.error.code, "EXTRA_ARG");
+        assert_eq!(envelope.exit_code, ExitCode::USAGE);
+        assert!(
+            envelope.error.message.contains("\"surplus\""),
+            "{}",
+            envelope.error.message
+        );
+        assert!(envelope.fix.contains("wokhei status"), "{}", envelope.fix);
+    }
+
+    #[tokio::test]
+    async fn variadic_usage_allows_extra_positionals() {
+        let cli = AgentCli::new("t", "tool").command(
+            Command::new("run", "Run things")
+                .usage("t run <cmd> [args...]")
+                .handler(|req, _ctx| {
+                    let count = req.positionals().len();
+                    Box::pin(async move { Ok(CommandOutput::new(json!({ "count": count }))) })
+                }),
+        );
+        let run = cli.run_argv(["t", "run", "make", "all", "install"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success, got {}", run.to_json());
+        };
+        assert_eq!(envelope.result["count"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn allow_extra_args_opts_out_of_arity_check() {
+        let cli = AgentCli::new("t", "tool").command(
+            Command::new("echo", "Echo")
+                .usage("t echo <first>")
+                .allow_extra_args()
+                .handler(|req, _ctx| {
+                    let count = req.positionals().len();
+                    Box::pin(async move { Ok(CommandOutput::new(json!({ "count": count }))) })
+                }),
+        );
+        let run = cli.run_argv(["t", "echo", "a", "b", "c"]).await;
+        assert!(matches!(run.envelope(), Envelope::Success(_)));
+    }
+
+    #[test]
+    fn usage_positional_arity_counts() {
+        assert_eq!(usage_positional_arity("calc add <a> <b>"), Some((2, 0)));
+        assert_eq!(
+            usage_positional_arity("agplan submit [path] [--title=<title>] [--no-git]"),
+            Some((0, 1))
+        );
+        assert_eq!(
+            usage_positional_arity("t log [-n <count>] [--follow]"),
+            Some((0, 0))
+        );
+        assert_eq!(
+            usage_positional_arity("t get <id> [--format <fmt>]"),
+            Some((1, 0))
+        );
+        assert_eq!(usage_positional_arity("t run <cmd> [args...]"), None);
+        assert_eq!(usage_positional_arity("t pick <a> [<b>]"), Some((1, 1)));
+    }
+
+    // --- Framework paths honor the reserved output flags (R5) ---
+
+    #[tokio::test]
+    async fn root_honors_quiet_and_select() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "--quiet"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success");
+        };
+        assert!(envelope.next_actions.is_empty());
+
+        let run = cli.run_argv(["wokhei", "--select=commands"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success");
+        };
+        let keys: Vec<&String> = envelope
+            .result
+            .as_object()
+            .expect("object")
+            .keys()
+            .collect();
+        assert_eq!(keys, ["commands"], "{keys:?}");
+    }
+
+    #[tokio::test]
+    async fn help_tree_honors_quiet() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "help", "gateway", "--quiet"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success");
+        };
+        assert!(envelope.next_actions.is_empty());
+    }
+
+    // --- Bare `version` positional (R6) ---
+
+    #[tokio::test]
+    async fn bare_version_positional_answers_like_version_flag() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "version"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success, got {}", run.to_json());
+        };
+        assert_eq!(envelope.result["name"], json!("wokhei"));
+        assert_eq!(envelope.result["version"], json!("0.1.0"));
+    }
+
+    #[tokio::test]
+    async fn user_defined_version_command_is_not_shadowed() {
+        let cli = AgentCli::new("t", "tool").command(
+            Command::new("version", "Custom version info")
+                .usage("t version")
+                .handler(|_req, _ctx| {
+                    Box::pin(async move { Ok(CommandOutput::new(json!({ "custom": true }))) })
+                }),
+        );
+        let run = cli.run_argv(["t", "version"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success");
+        };
+        assert_eq!(envelope.result["custom"], json!(true));
+    }
+
+    // --- Explicit negation turns reserved booleans off (R7) ---
+
+    #[tokio::test]
+    async fn dry_run_false_does_not_trigger_dry_run_gate() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "status", "--dry-run=false"]).await;
+        assert!(
+            matches!(run.envelope(), Envelope::Success(_)),
+            "{}",
+            run.to_json()
+        );
+    }
+
+    #[tokio::test]
+    async fn quiet_false_keeps_next_actions() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei", "status", "--quiet=false"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success");
+        };
+        assert!(!envelope.next_actions.is_empty());
+    }
+
+    // --- Non-finite floats are rejected by the typed helpers (R8) ---
+
+    #[tokio::test]
+    async fn arg_parse_rejects_non_finite_floats() {
+        let cli = AgentCli::new("calc", "calc").command(
+            Command::new("add", "Add")
+                .usage("calc add <a> <b>")
+                .handler(|req, _ctx| {
+                    let a = req.arg_parse::<f64>(0, "a");
+                    let b = req.arg_parse::<f64>(1, "b");
+                    Box::pin(async move {
+                        let sum = a? + b?;
+                        Ok(CommandOutput::new(json!({ "sum": sum })))
+                    })
+                }),
+        );
+        for bad in ["inf", "-inf", "NaN", "infinity"] {
+            let run = cli.run_argv(["calc", "add", bad, "1"]).await;
+            let Envelope::Error(envelope) = run.envelope() else {
+                panic!("expected error for {bad:?}, got {}", run.to_json());
+            };
+            assert_eq!(envelope.error.code, "INVALID_ARG", "{bad:?}");
+            assert!(envelope.error.message.contains("not finite"), "{bad:?}");
+        }
+    }
+
+    // --- Out-of-range handler exit codes stay inside the panic guard (R2) ---
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn out_of_range_exit_code_yields_handler_panic_envelope() {
+        // The debug_assert in CommandOutput::exit_code fires inside the
+        // handler panic guard, so even in development the process emits a
+        // structured envelope instead of bare panic output + exit 101.
+        let cli = AgentCli::new("t", "tool").command(
+            Command::new("badexit", "Returns an impossible exit code")
+                .usage("t badexit")
+                .handler(|_req, _ctx| {
+                    Box::pin(async move { Ok(CommandOutput::new(json!({})).exit_code(300)) })
+                }),
+        );
+        let run = cli.run_argv(["t", "badexit"]).await;
+        let Envelope::Error(envelope) = run.envelope() else {
+            panic!("expected HANDLER_PANIC envelope, got {}", run.to_json());
+        };
+        assert_eq!(envelope.error.code, "HANDLER_PANIC");
+    }
+
+    // --- error_codes dictionary in the root tree (R9) ---
+
+    #[tokio::test]
+    async fn root_tree_publishes_error_code_dictionary() {
+        let cli = sample_cli();
+        let run = cli.run_argv(["wokhei"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success");
+        };
+        let codes = envelope.result["error_codes"]
+            .as_object()
+            .expect("error_codes object");
+        for expected in [
+            "UNKNOWN_COMMAND",
+            "UNKNOWN_FLAG",
+            "EXTRA_ARG",
+            "MISSING_ARG",
+            "INVALID_ARG",
+            "DRY_RUN_UNSUPPORTED",
+            "HANDLER_PANIC",
+        ] {
+            assert!(codes.contains_key(expected), "missing {expected}");
+        }
+    }
+
+    // --- audit() validates the usage-string/parser coupling (R11) ---
+
+    #[test]
+    fn audit_flags_unbalanced_usage_brackets() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("a", "Command A")
+                .usage("app a [--broken <x>")
+                .handler(|_req, _ctx| Box::pin(async move { Ok(CommandOutput::new(json!({}))) })),
+        );
+        assert!(
+            cli.audit()
+                .findings
+                .iter()
+                .any(|f| f.code == "UNBALANCED_USAGE_BRACKETS")
+        );
+    }
+
+    #[test]
+    fn audit_flags_usage_program_mismatch() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("a", "Command A")
+                .usage("otherprog a <x>")
+                .handler(|_req, _ctx| Box::pin(async move { Ok(CommandOutput::new(json!({}))) })),
+        );
+        assert!(
+            cli.audit()
+                .findings
+                .iter()
+                .any(|f| f.code == "USAGE_PROGRAM_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn audit_flags_reserved_flag_redeclared() {
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("a", "Command A")
+                .usage("app a [--quiet]")
+                .handler(|_req, _ctx| Box::pin(async move { Ok(CommandOutput::new(json!({}))) })),
+        );
+        assert!(
+            cli.audit()
+                .findings
+                .iter()
+                .any(|f| f.code == "RESERVED_FLAG_REDECLARED")
+        );
     }
 }
