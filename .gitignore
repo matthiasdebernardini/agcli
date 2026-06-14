@@ -1,2 +1,6 @@
 /target
 /.claude
+
+# cargo-mutants output
+mutants.out/
+mutants.out.old/
