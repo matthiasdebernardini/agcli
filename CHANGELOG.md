@@ -2,7 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.14.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.14.0) - 2026-07-28
+
+HATEOAS closes the projection gap: list envelopes now carry their own row
+schema and a paste-ready `--select` template, so the cheaper projected call
+no longer requires the agent to already know the field names. The list
+result shape changes, hence a **minor** bump pre-1.0.
+
+### Changed
+
+- **Every `list`/`list_truncated` result gains a `fields` key.** It is emitted
+    unconditionally for object rows — including when reserved flags are
+    disabled, since `CommandOutput` cannot see that configuration — so any
+    downstream test asserting the exact shape of a list result will now see
+    the extra key. Pre-1.0, a shape change like this is a **minor** bump.
 
 ### Added
 
@@ -21,14 +34,6 @@ All notable changes to this project will be documented in this file.
     `--select` is already in use, under `--quiet`, and when reserved flags or
     the command's reserved projection are disabled; `fields` is omitted for
     empty lists and lists of non-objects.
-
-### Changed
-
-- **Every `list`/`list_truncated` result gains a `fields` key.** It is emitted
-    unconditionally for object rows — including when reserved flags are
-    disabled, since `CommandOutput` cannot see that configuration — so any
-    downstream test asserting the exact shape of a list result will now see
-    the extra key. Pre-1.0, a shape change like this is a **minor** bump.
 
 ## [0.13.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.13.0) - 2026-06-11
 
