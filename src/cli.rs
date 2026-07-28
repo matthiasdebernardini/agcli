@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
@@ -33,18 +33,33 @@ fn is_reserved_bool(flag: &str) -> bool {
     RESERVED_BOOL_FLAGS.contains(&flag)
 }
 
+/// Whether an error envelope invites the agent to retry the same invocation.
+/// A named variant keeps the retry intent legible at the call site, where a
+/// bare `bool` would force the reader to recall the positional argument's
+/// meaning.
+#[derive(Clone, Copy)]
+enum Retryable {
+    Yes,
+    No,
+}
+
+impl Retryable {
+    fn as_bool(self) -> bool {
+        matches!(self, Self::Yes)
+    }
+}
+
 /// Read a boolean flag's effective state from its parsed value. Presence
 /// means on — except an explicit negation (`--quiet=false`, `--dry-run=0`,
 /// `=no`, `=off`), which means off. Without this, `--dry-run=false` would
 /// *enable* dry-run, punishing the agent that spelled its intent out.
 fn bool_flag_on(value: Option<&str>) -> bool {
-    match value {
-        None => false,
-        Some(v) => !matches!(
+    value.is_some_and(|v| {
+        !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "false" | "0" | "no" | "off"
-        ),
-    }
+        )
+    })
 }
 
 /// The framework-reserved agent-native flags with their semantics, in the
@@ -98,6 +113,41 @@ fn parse_select_fields(raw: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Derive a list's row schema as sorted `--select` paths, ready to paste into
+/// `--select` verbatim.
+///
+/// Each distinct top-level key of the object items becomes the dot path
+/// `items.<key>`, because `--select` projects *top-level* result keys: a bare
+/// `id` would miss the rows nested under `items` and dead-end in a
+/// `select_warning`. Rows are commonly heterogeneous (optional fields, mixed
+/// variants), so the union across items beats sampling the first row. Keys go
+/// through a [`BTreeSet`], so the paths are deduplicated and sorted — order
+/// does not depend on `serde_json`'s map backing, which a `preserve_order`
+/// feature unification elsewhere in the dependency graph could otherwise flip.
+/// Non-object items contribute nothing, so a list of scalars yields an empty
+/// schema.
+fn row_schema(items: &[Value]) -> Vec<String> {
+    let mut keys: BTreeSet<&str> = BTreeSet::new();
+    for item in items {
+        let Value::Object(map) = item else { continue };
+        keys.extend(map.keys().map(String::as_str));
+    }
+    keys.into_iter().map(|key| format!("items.{key}")).collect()
+}
+
+/// Quote one argv token so the reassembled command string is runnable as
+/// printed. Tokens made only of shell-safe characters pass through unchanged;
+/// anything else is single-quoted, with embedded single quotes escaped the
+/// POSIX way (`'\''`). Without this, an advertised re-run built from raw argv
+/// would mangle any argument containing a space (`--filter two words`).
+fn shell_quote(token: &str) -> Cow<'_, str> {
+    let is_safe = |c: char| c.is_ascii_alphanumeric() || "-_=/.:,@+".contains(c);
+    if !token.is_empty() && token.chars().all(is_safe) {
+        return Cow::Borrowed(token);
+    }
+    Cow::Owned(format!("'{}'", token.replace('\'', r"'\''")))
 }
 
 /// Apply a reserved `--select` value to a handler result, guarding against the
@@ -181,13 +231,11 @@ fn annotate_select_warning(result: Value, warning: String) -> Value {
 
 /// Best-effort human-readable message from a caught panic payload.
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
-    }
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 /// Read all of stdin to a string. Pairs with the `--stdin` convention so a
@@ -401,12 +449,13 @@ where
                 continue;
             }
 
-            if short.chars().count() == 1 {
-                if is_bool(short) {
-                    flags.insert(short.to_string(), "true".to_string());
-                } else {
-                    pending_flag = Some(short.to_string());
-                }
+            let is_single = short.chars().count() == 1;
+            if is_single && is_bool(short) {
+                flags.insert(short.to_string(), "true".to_string());
+                continue;
+            }
+            if is_single {
+                pending_flag = Some(short.to_string());
                 continue;
             }
 
@@ -652,6 +701,13 @@ pub struct CommandOutput {
     /// When `--compact` is requested, project to these fields instead of the
     /// generic null/empty drop. `None` → generic compaction.
     compact_fields: Option<Vec<String>>,
+    /// The `--select` paths covering the row schema, as
+    /// [`CommandOutput::list_truncated`] derived them from the items: one
+    /// sorted `items.<key>` dot path per distinct top-level key across the
+    /// rows. The dispatch path uses it to offer a pre-filled `--select`
+    /// template `next_action` so an agent can re-run this exact invocation
+    /// projected to fewer fields. `None` for every non-list output.
+    select_fields: Option<Vec<String>>,
 }
 
 impl CommandOutput {
@@ -661,6 +717,7 @@ impl CommandOutput {
             next_actions: Vec::new(),
             exit_code: None,
             compact_fields: None,
+            select_fields: None,
         }
     }
 
@@ -682,14 +739,28 @@ impl CommandOutput {
     /// items. When truncated, a `guidance` string nudges the agent to narrow
     /// the query (the framework also always offers the command template as a
     /// `next_action`).
+    ///
+    /// The row schema is published as a `fields` key holding the `--select`
+    /// paths that cover it: one sorted `items.<key>` dot path per distinct
+    /// top-level key across the rows (`["items.id", "items.name"]`). An agent
+    /// therefore learns the shape of a row — and gets a projection it can
+    /// paste into `--select` unedited — without decoding a row itself. This is
+    /// schema disclosure, not a select-only affordance: `fields` is emitted
+    /// whether or not the CLI enables the reserved flags, because the output
+    /// cannot see that configuration. When they *are* enabled, the dispatch
+    /// path turns the same paths into a pre-filled `--select` `next_action`.
     pub fn list_truncated(items: Vec<Value>, total: usize) -> Self {
         let count = items.len();
         let truncated = count < total;
+        let fields = row_schema(&items);
         let mut result = serde_json::Map::new();
         result.insert("items".to_string(), Value::Array(items));
         result.insert("count".to_string(), json!(count));
         result.insert("total".to_string(), json!(total));
         result.insert("truncated".to_string(), json!(truncated));
+        if !fields.is_empty() {
+            result.insert("fields".to_string(), json!(fields));
+        }
         if truncated {
             result.insert(
                 "guidance".to_string(),
@@ -698,7 +769,11 @@ impl CommandOutput {
                 )),
             );
         }
-        Self::new(Value::Object(result))
+        let mut output = Self::new(Value::Object(result));
+        if !fields.is_empty() {
+            output.select_fields = Some(fields);
+        }
+        output
     }
 
     pub fn next_action(mut self, action: NextAction) -> Self {
@@ -819,6 +894,16 @@ impl CommandError {
     }
 }
 
+/// Extract a `<name>` placeholder from `text`, returning the inner name when it
+/// is a usable param — non-empty and free of `.` (which marks a variadic like
+/// `args...`). Returns `None` when there is no placeholder or it is not usable.
+fn placeholder_param_name(text: &str) -> Option<&str> {
+    let angle_start = text.find('<')?;
+    let angle_end = text[angle_start..].find('>')?;
+    let param_name = &text[angle_start + 1..angle_start + angle_end];
+    (!param_name.is_empty() && !param_name.contains('.')).then_some(param_name)
+}
+
 /// Build a `NextAction` from a usage string and description.
 ///
 /// A bare `<name>` placeholder becomes a **required** positional param. Any
@@ -843,13 +928,8 @@ fn next_action_from_usage(usage: &str, description: impl Into<String>) -> NextAc
             && let Some(close) = usage[i..].find(']')
         {
             let bracket_content = &usage[i + 1..i + close]; // strip [ and ]
-            if let Some(angle_start) = bracket_content.find('<')
-                && let Some(angle_end) = bracket_content[angle_start..].find('>')
-            {
-                let param_name = &bracket_content[angle_start + 1..angle_start + angle_end];
-                if !param_name.is_empty() && !param_name.contains('.') {
-                    action = action.with_param(param_name, ActionParam::new().required(false));
-                }
+            if let Some(param_name) = placeholder_param_name(bracket_content) {
+                action = action.with_param(param_name, ActionParam::new().required(false));
             }
             i += close + 1;
             continue;
@@ -1418,7 +1498,7 @@ impl AgentCli {
                         error.to_string(),
                         "PARSE_ERROR",
                         "Use valid CLI syntax. Run the root command to inspect command templates.",
-                        false,
+                        Retryable::No,
                         self.root_actions(),
                     );
                 }
@@ -1467,7 +1547,7 @@ impl AgentCli {
                 format!("unknown command: {unknown}"),
                 "UNKNOWN_COMMAND",
                 unknown_command_fix("command", &unknown, &valid),
-                false,
+                Retryable::No,
                 self.root_actions(),
             );
         }
@@ -1480,7 +1560,7 @@ impl AgentCli {
                     "unknown command".to_string(),
                     "UNKNOWN_COMMAND",
                     "Run the root command and use one of the listed command templates.",
-                    false,
+                    Retryable::No,
                     self.root_actions(),
                 );
             }
@@ -1497,7 +1577,7 @@ impl AgentCli {
                 format!("unknown subcommand: {}", resolved.remaining[0]),
                 "UNKNOWN_SUBCOMMAND",
                 unknown_command_fix("subcommand", &resolved.remaining[0], &valid),
-                false,
+                Retryable::No,
                 self.subcommand_actions(&path_strs, command),
             );
         }
@@ -1510,7 +1590,7 @@ impl AgentCli {
                     "command has no handler".to_string(),
                     "MISSING_HANDLER",
                     "Attach a handler for this command or route to a subcommand.",
-                    false,
+                    Retryable::No,
                     self.root_actions(),
                 );
             }
@@ -1597,7 +1677,7 @@ impl AgentCli {
                     format!("unknown flag(s): {unknown_list}"),
                     "UNKNOWN_FLAG",
                     fix,
-                    false,
+                    Retryable::No,
                     self.default_command_actions(&path_strs, command),
                 );
             }
@@ -1637,7 +1717,7 @@ impl AgentCli {
                     "Nothing was run. Re-invoke matching the usage template `{usage}`, \
                      or drop the extra argument(s)."
                 ),
-                false,
+                Retryable::No,
                 self.default_command_actions(&path_strs, command),
             );
         }
@@ -1657,7 +1737,7 @@ impl AgentCli {
                  --dry-run to execute it, or inspect current state first with a read \
                  command from next_actions."
                     .to_string(),
-                false,
+                Retryable::No,
                 self.default_command_actions(&path_strs, command),
             );
         }
@@ -1678,12 +1758,13 @@ impl AgentCli {
         // — what an agent parses — stays valid JSON.)
         let mut handler_future = handler(&request, context);
         let handler_result = std::future::poll_fn(|cx| {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handler_future.as_mut().poll(cx)
-            })) {
-                Ok(poll) => poll.map(Ok),
-                Err(payload) => std::task::Poll::Ready(Err(payload)),
-            }
+            }))
+            .map_or_else(
+                |payload| std::task::Poll::Ready(Err(payload)),
+                |poll| poll.map(Ok),
+            )
         })
         .await;
         // Drop the future to release its borrow of `request`/`invocation`
@@ -1697,31 +1778,64 @@ impl AgentCli {
                     next_actions: handler_actions,
                     exit_code: output_exit,
                     compact_fields,
+                    select_fields,
                 } = output;
                 let mut next_actions =
                     self.ensure_next_actions(handler_actions, &path_strs, command);
 
+                // A list result knows its row schema, so teach the cheaper call:
+                // the same invocation re-run under --select. Only when the
+                // projection would actually apply and the caller has not already
+                // selected — re-advertising a flag in use is context noise.
+                // Built from the borrowed argv; `invocation` is consumed at the
+                // end of this arm.
+                let advertise_select = self.reserved_flags
+                    && command.apply_reserved_projection
+                    && invocation.flag("select").is_none();
+                if let Some(fields) =
+                    select_fields.filter(|fields| advertise_select && !fields.is_empty())
+                {
+                    // Re-quote argv rather than reuse `command_line()`, which
+                    // joins raw tokens with spaces: an argument containing one
+                    // would render a command the agent cannot re-run.
+                    let base = std::iter::once(invocation.program.as_str())
+                        .chain(invocation.raw_args.iter().map(String::as_str))
+                        .map(shell_quote)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    next_actions.push(
+                        NextAction::new(
+                            format!("{base} --select=<fields>"),
+                            "Re-run projected to only the fields you need — smaller result, same data",
+                        )
+                        .with_param(
+                            "fields",
+                            ActionParam::new().required(true).description(format!(
+                                "Comma-separated subset of: {} (dot paths project each row)",
+                                fields.join(", ")
+                            )),
+                        ),
+                    );
+                }
+
                 // Apply the framework-reserved output flags centrally so every
                 // command supports --select / --compact / --quiet for free.
-                if self.reserved_flags {
-                    if command.apply_reserved_projection {
-                        if let Some(raw) = invocation.flag("select") {
-                            result = apply_select_flag(result, raw);
-                        }
-                        if bool_flag_on(invocation.flag("compact")) {
-                            result = match &compact_fields {
-                                Some(fields) => {
-                                    let refs: Vec<&str> =
-                                        fields.iter().map(String::as_str).collect();
-                                    project::select(&result, &refs)
-                                }
-                                None => project::compact(&result),
-                            };
-                        }
+                if self.reserved_flags && command.apply_reserved_projection {
+                    if let Some(raw) = invocation.flag("select") {
+                        result = apply_select_flag(result, raw);
                     }
-                    if bool_flag_on(invocation.flag("quiet")) {
-                        next_actions.clear();
+                    if bool_flag_on(invocation.flag("compact")) {
+                        result = match &compact_fields {
+                            Some(fields) => {
+                                let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+                                project::select(&result, &refs)
+                            }
+                            None => project::compact(&result),
+                        };
                     }
+                }
+                if self.reserved_flags && bool_flag_on(invocation.flag("quiet")) {
+                    next_actions.clear();
                 }
 
                 let envelope = self
@@ -1742,7 +1856,11 @@ impl AgentCli {
                             error.message,
                             error.code,
                             error.fix,
-                            error.retryable,
+                            if error.retryable {
+                                Retryable::Yes
+                            } else {
+                                Retryable::No
+                            },
                             exit,
                             next_actions,
                         )
@@ -1760,7 +1878,7 @@ impl AgentCli {
                             "HANDLER_PANIC",
                             "This is a bug in the command handler, not the invocation. \
                              Inspect the root command tree and report the panic.",
-                            false,
+                            Retryable::No,
                             ExitCode::ERROR,
                             next_actions,
                         )
@@ -1852,7 +1970,7 @@ impl AgentCli {
                 format!("unknown command: {unknown}"),
                 "UNKNOWN_COMMAND",
                 unknown_command_fix("command", &unknown, &valid),
-                false,
+                Retryable::No,
                 self.root_actions(),
             );
         }
@@ -1865,7 +1983,7 @@ impl AgentCli {
                     "unknown command".to_string(),
                     "UNKNOWN_COMMAND",
                     "Run the root command and inspect the listed templates.",
-                    false,
+                    Retryable::No,
                     self.root_actions(),
                 );
             }
@@ -1880,7 +1998,7 @@ impl AgentCli {
                 format!("unknown subcommand: {}", resolved.remaining[0]),
                 "UNKNOWN_SUBCOMMAND",
                 unknown_command_fix("subcommand", &resolved.remaining[0], &valid),
-                false,
+                Retryable::No,
                 self.subcommand_actions(&path_strs, command),
             );
         }
@@ -2067,7 +2185,7 @@ impl AgentCli {
         message: impl Into<String>,
         code: impl Into<String>,
         fix: impl Into<String>,
-        retryable: bool,
+        retryable: Retryable,
         next_actions: Vec<NextAction>,
     ) -> Execution {
         Execution {
@@ -2094,12 +2212,12 @@ impl AgentCli {
         message: impl Into<String>,
         code: impl Into<String>,
         fix: impl Into<String>,
-        retryable: bool,
+        retryable: Retryable,
         exit_code: i32,
         next_actions: Vec<NextAction>,
     ) -> ErrorEnvelope {
         let mut envelope = ErrorEnvelope::new(command, message, code, fix, next_actions)
-            .retryable(retryable)
+            .retryable(retryable.as_bool())
             .exit_code(exit_code);
         if let Some(ref sv) = self.schema_version {
             envelope = envelope.schema_version(sv.clone());
@@ -2274,13 +2392,10 @@ fn path_refs(path: &[String]) -> Vec<&str> {
 /// to produce.
 fn parsed_value_is_finite<T: std::any::Any>(value: &T) -> bool {
     let any = value as &dyn std::any::Any;
-    if let Some(f) = any.downcast_ref::<f64>() {
-        f.is_finite()
-    } else if let Some(f) = any.downcast_ref::<f32>() {
-        f.is_finite()
-    } else {
-        true
-    }
+    any.downcast_ref::<f64>()
+        .map(|f| f.is_finite())
+        .or_else(|| any.downcast_ref::<f32>().map(|f| f.is_finite()))
+        .unwrap_or(true)
 }
 
 /// Count the positional placeholders a usage string declares, as
@@ -3513,6 +3628,304 @@ mod tests {
         };
         assert_eq!(envelope.result["truncated"], json!(false));
         assert!(envelope.result.get("guidance").is_none());
+    }
+
+    // --- List row schema + --select advertisement ---
+
+    /// A CLI whose single `ls` command returns `items` as a bounded list,
+    /// optionally with a handler-supplied `next_action`.
+    fn list_cli(items: Vec<Value>, handler_action: bool) -> AgentCli {
+        AgentCli::new("app", "x").command(Command::new("ls", "list").usage("app ls").handler(
+            move |_req, _ctx| {
+                let items = items.clone();
+                Box::pin(async move {
+                    let output = CommandOutput::list(items);
+                    Ok(if handler_action {
+                        output.next_action(NextAction::new("app ls", "List again"))
+                    } else {
+                        output
+                    })
+                })
+            },
+        ))
+    }
+
+    fn select_advertisement(envelope: &SuccessEnvelope) -> Option<&NextAction> {
+        envelope
+            .next_actions
+            .iter()
+            .find(|a| a.command.contains("--select=<fields>"))
+    }
+
+    #[tokio::test]
+    async fn list_fields_are_sorted_deduped_select_paths() {
+        // Keys chosen so sorted order differs from first-seen order: this
+        // pins determinism, not the order the rows happened to be built in.
+        let items = vec![
+            json!({ "zebra": 1, "alpha": "a" }),
+            json!({ "beta": true, "zebra": 2 }),
+        ];
+        let run = list_cli(items, false).run_argv(["app", "ls"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(
+            envelope.result["fields"],
+            json!(["items.alpha", "items.beta", "items.zebra"])
+        );
+    }
+
+    /// The contract the whole feature rests on: the advertised paths, fed back
+    /// verbatim, project instead of dead-ending in a `select_warning`.
+    #[tokio::test]
+    async fn advertised_fields_round_trip_into_a_working_select() {
+        let items = vec![
+            json!({ "id": 1, "name": "a", "body": "long…" }),
+            json!({ "id": 2, "name": "b", "body": "longer…" }),
+        ];
+        let run = list_cli(items.clone(), false).run_argv(["app", "ls"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        let fields: Vec<String> = envelope.result["fields"]
+            .as_array()
+            .expect("fields is an array")
+            .iter()
+            .map(|field| field.as_str().expect("field is a string").to_string())
+            .collect();
+        assert_eq!(fields, ["items.body", "items.id", "items.name"]);
+
+        // Re-run with exactly what the envelope advertised.
+        let flag = format!("--select={}", fields.join(","));
+        let run = list_cli(items.clone(), false)
+            .run_argv(["app", "ls", flag.as_str()])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert!(
+            envelope.result.get("select_warning").is_none(),
+            "advertised paths must project, not warn: {}",
+            envelope.result
+        );
+        assert_eq!(envelope.result["items"], json!(items));
+        for meta in ["count", "total", "truncated", "fields"] {
+            assert!(
+                envelope.result.get(meta).is_none(),
+                "projection should have dropped the `{meta}` metadata key"
+            );
+        }
+
+        // A subset projects each row down to just those keys.
+        let run = list_cli(items, false)
+            .run_argv(["app", "ls", "--select=items.id,items.name"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert!(envelope.result.get("select_warning").is_none());
+        assert_eq!(
+            envelope.result["items"],
+            json!([{ "id": 1, "name": "a" }, { "id": 2, "name": "b" }])
+        );
+    }
+
+    #[tokio::test]
+    async fn list_of_non_objects_has_no_fields_or_select_action() {
+        let items = vec![json!("alpha"), json!("beta")];
+        let run = list_cli(items, false).run_argv(["app", "ls"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert!(envelope.result.get("fields").is_none());
+        assert!(select_advertisement(envelope).is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_list_has_no_fields_or_select_action() {
+        let run = list_cli(Vec::new(), false).run_argv(["app", "ls"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["count"], json!(0));
+        assert!(envelope.result.get("fields").is_none());
+        assert!(select_advertisement(envelope).is_none());
+    }
+
+    #[tokio::test]
+    async fn list_envelope_advertises_prefilled_select_template() {
+        let items = vec![json!({ "id": 1, "name": "a" })];
+        let run = list_cli(items, false).run_argv(["app", "ls"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        let action = select_advertisement(envelope).expect("--select advertisement present");
+        // The template re-runs *this* invocation, verbatim, plus the flag.
+        assert_eq!(action.command, "app ls --select=<fields>");
+        let param = action
+            .params
+            .as_ref()
+            .expect("params make the command a template")
+            .get("fields")
+            .expect("fields param");
+        assert_eq!(param.required, Some(true));
+        let description = param.description.as_deref().expect("fields description");
+        assert!(
+            description.contains("items.id") && description.contains("items.name"),
+            "description names the working --select paths: {description}"
+        );
+    }
+
+    #[test]
+    fn shell_quote_only_quotes_what_needs_it() {
+        assert_eq!(shell_quote("--select=items.id"), "--select=items.id");
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote(""), "''");
+        // POSIX has no escape inside single quotes: close, escape, reopen.
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("a;rm -rf /"), "'a;rm -rf /'");
+    }
+
+    #[tokio::test]
+    async fn advertised_command_shell_quotes_argv_tokens() {
+        let items = vec![json!({ "id": 1 })];
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("ls", "list")
+                .usage("app ls [--filter <value>]")
+                .handler(move |_req, _ctx| {
+                    let items = items.clone();
+                    Box::pin(async move { Ok(CommandOutput::list(items)) })
+                }),
+        );
+        let run = cli.run_argv(["app", "ls", "--filter", "two words"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        let action = select_advertisement(envelope).expect("--select advertisement present");
+        assert_eq!(
+            action.command, "app ls --filter 'two words' --select=<fields>",
+            "an advertised command must be runnable as printed"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_advertisement_appends_to_handler_next_actions() {
+        let items = vec![json!({ "id": 1 })];
+        let run = list_cli(items, true).run_argv(["app", "ls"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.next_actions.len(), 2);
+        assert_eq!(envelope.next_actions[0].command, "app ls");
+        assert_eq!(envelope.next_actions[0].description, "List again");
+        assert!(select_advertisement(envelope).is_some());
+    }
+
+    #[tokio::test]
+    async fn select_flag_suppresses_the_advertisement_and_still_projects() {
+        let items = vec![json!({ "id": 1, "name": "a" })];
+        let run = list_cli(items, false)
+            .run_argv(["app", "ls", "--select=items.id"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert!(
+            select_advertisement(envelope).is_none(),
+            "no re-advertisement once --select is in use"
+        );
+        // Projection still works exactly as before: only the selected path.
+        assert_eq!(envelope.result["items"], json!([{ "id": 1 }]));
+        assert!(envelope.result.get("fields").is_none());
+        assert!(envelope.result.get("count").is_none());
+    }
+
+    #[tokio::test]
+    async fn truncated_list_carries_both_guidance_and_fields() {
+        let cli =
+            AgentCli::new("app", "x").command(Command::new("ls", "list").usage("app ls").handler(
+                |_req, _ctx| {
+                    Box::pin(async move {
+                        Ok(CommandOutput::list_truncated(
+                            vec![json!({ "id": 1, "name": "a" })],
+                            9,
+                        ))
+                    })
+                },
+            ));
+        let run = cli.run_argv(["app", "ls"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["truncated"], json!(true));
+        assert!(
+            envelope.result["guidance"]
+                .as_str()
+                .expect("guidance on a truncated list")
+                .contains("1 of 9")
+        );
+        assert_eq!(
+            envelope.result["fields"],
+            json!(["items.id", "items.name"]),
+            "narrowing guidance and the row schema are complementary, not exclusive"
+        );
+        assert!(select_advertisement(envelope).is_some());
+    }
+
+    #[tokio::test]
+    async fn reserved_flags_off_keeps_fields_but_drops_the_advertisement() {
+        let items = vec![json!({ "id": 1, "name": "a" })];
+        let run = list_cli(items, false)
+            .reserved_flags(false)
+            .run_argv(["app", "ls"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        // `fields` is schema disclosure the output emits unconditionally; only
+        // the advertisement depends on --select actually being available.
+        assert_eq!(envelope.result["fields"], json!(["items.id", "items.name"]));
+        assert!(select_advertisement(envelope).is_none());
+    }
+
+    #[tokio::test]
+    async fn reserved_projection_opt_out_drops_the_advertisement() {
+        let items = vec![json!({ "id": 1, "name": "a" })];
+        let mut command = Command::new("ls", "list")
+            .usage("app ls")
+            .handler(move |_req, _ctx| {
+                let items = items.clone();
+                Box::pin(async move { Ok(CommandOutput::list(items)) })
+            });
+        // The opt-out `AgentCli::doctor` uses: --select never applies here, so
+        // advertising it would send the agent to a flag that does nothing.
+        command.apply_reserved_projection = false;
+        let run = AgentCli::new("app", "x")
+            .command(command)
+            .run_argv(["app", "ls"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["fields"], json!(["items.id", "items.name"]));
+        assert!(select_advertisement(envelope).is_none());
+    }
+
+    #[tokio::test]
+    async fn quiet_drops_the_advertisement_with_every_other_next_action() {
+        let items = vec![json!({ "id": 1, "name": "a" })];
+        let run = list_cli(items, true)
+            .run_argv(["app", "ls", "--quiet"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert!(
+            envelope.next_actions.is_empty(),
+            "--quiet means no next_actions at all: {:?}",
+            envelope.next_actions
+        );
+        assert_eq!(envelope.result["fields"], json!(["items.id", "items.name"]));
     }
 
     // --- Static audit ---

@@ -160,6 +160,39 @@ golden!(
     r#"{"ok":false,"command":"calc fail","timestamp":"1970-01-01T00:00:00Z","exit_code":3,"error":{"message":"the thing was not found","code":"NOT_FOUND","retryable":false},"fix":"Create the thing first with `calc add <a> <b>`.","next_actions":[{"command":"calc fail","description":"Run this command template"},{"command":"calc","description":"Inspect the full command tree"}]}"#
 );
 
+/// The list case gets its own CLI: adding an `ls` command to [`golden_cli`]
+/// would shift the "Valid commands" fix line in every other golden.
+fn list_golden_cli() -> AgentCli {
+    AgentCli::new("notes", "Agent-native notes")
+        .version("1.0.0")
+        .command(
+            Command::new("ls", "List notes")
+                .usage("notes ls")
+                .handler(|_req, _ctx| {
+                    Box::pin(async move {
+                        Ok(CommandOutput::list(vec![
+                            json!({ "id": 1, "title": "first", "done": false }),
+                            json!({ "id": 2, "title": "second", "done": true }),
+                        ]))
+                    })
+                }),
+        )
+}
+
+/// Pins the full list contract: the `items`/`count`/`total`/`truncated` shape,
+/// the `fields` row schema as sorted `--select` dot paths, and the pre-filled
+/// `--select` advertisement that re-runs this invocation projected.
+#[tokio::test]
+async fn list_envelope() {
+    pin_clock();
+    let actual = list_golden_cli().run_argv(["notes", "ls"]).await.to_json();
+    assert_eq!(
+        actual,
+        r#"{"ok":true,"command":"notes ls","timestamp":"1970-01-01T00:00:00Z","exit_code":0,"result":{"count":2,"fields":["items.done","items.id","items.title"],"items":[{"done":false,"id":1,"title":"first"},{"done":true,"id":2,"title":"second"}],"total":2,"truncated":false},"next_actions":[{"command":"notes ls","description":"Run this command template"},{"command":"notes","description":"Inspect the full command tree"},{"command":"notes ls --select=<fields>","description":"Re-run projected to only the fields you need — smaller result, same data","params":{"fields":{"description":"Comma-separated subset of: items.done, items.id, items.title (dot paths project each row)","required":true}}}]}"#,
+        "envelope bytes drifted"
+    );
+}
+
 /// The root tree is large; rather than pinning the whole line, pin its
 /// structural contract: key order-independent presence of every section plus
 /// determinism across two builds.

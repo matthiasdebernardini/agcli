@@ -146,6 +146,39 @@ Err(CommandError::new("no such issue", "NOT_FOUND", "Check the id")
 emit a bounded `{ items, count, total, truncated }` result. When truncated,
 a `guidance` field tells the agent how to narrow the query.
 
+Both also publish the row schema and teach the cheaper call. A `fields` key
+lists the `--select` paths that cover a row — one `items.<key>` dot path per
+distinct top-level key across the items, sorted (omitted when the rows are not
+objects, or the list is empty) — and the framework appends a `next_action`
+that re-runs *this exact invocation* under `--select`:
+
+```json
+{ "result": { "items": [ { "id": 1, "name": "a" } ], "count": 1, "total": 1,
+              "truncated": false, "fields": ["items.id", "items.name"] },
+  "next_actions": [
+    { "command": "app ls --select=<fields>",
+      "description": "Re-run projected to only the fields you need — smaller result, same data",
+      "params": { "fields": { "required": true,
+                              "description": "Comma-separated subset of: items.id, items.name (dot paths project each row)" } } } ] }
+```
+
+They are dot paths because `--select` projects *top-level* result keys: a bare
+`id` would miss the rows nested under `items` and come back as a
+`select_warning`. Paste them back unedited —
+
+```bash
+app ls --select=items.id,items.name
+# => { "items": [ { "id": 1, "name": "a" } ] }
+```
+
+— and the metadata keys (`count`, `total`, `truncated`, `fields`) drop out
+with everything else you did not ask for. Projection is the biggest token win
+available on a list result, and the agent no longer has to decode a row to
+learn the field names. The advertisement is skipped when `--select` is already
+in use, under `--quiet` (which strips `next_actions` entirely), and when
+reserved flags or the command's reserved projection are disabled. `fields`
+itself is schema disclosure and is emitted either way.
+
 ## Built-in `doctor` and self-audit
 
 `AgentCli::doctor(checks)` registers a `doctor` command that runs your

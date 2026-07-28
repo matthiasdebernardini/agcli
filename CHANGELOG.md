@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **List results publish their row schema and teach the `--select` call.**
+    `CommandOutput::list`/`list_truncated` now emit a `fields` key holding the
+    `--select` paths that cover a row — one sorted `items.<key>` dot path per
+    distinct top-level key across the items, e.g.
+    `["items.id", "items.name"]` — and the framework appends a `next_action`
+    templating this exact invocation re-run under `--select`, with those paths
+    in the param description. Projection is the largest token saving available
+    on a list result, but an agent could only use it after decoding a row to
+    guess the field names; now the first response carries both the schema and
+    a projection it can paste back unedited. The paths are dot paths on
+    purpose: `--select` projects top-level result keys, so a bare `id` would
+    miss the rows nested under `items`. The advertisement is skipped when
+    `--select` is already in use, under `--quiet`, and when reserved flags or
+    the command's reserved projection are disabled; `fields` is omitted for
+    empty lists and lists of non-objects.
+
+### Changed
+
+- **Every `list`/`list_truncated` result gains a `fields` key.** It is emitted
+    unconditionally for object rows — including when reserved flags are
+    disabled, since `CommandOutput` cannot see that configuration — so any
+    downstream test asserting the exact shape of a list result will now see
+    the extra key. Pre-1.0, a shape change like this is a **minor** bump.
+
 ## [0.13.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.13.0) - 2026-06-11
 
 Agent-ergonomics pass 2, driven by an empirical audit + multi-pass bug hunt of
