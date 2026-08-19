@@ -92,6 +92,10 @@ const RESERVED_FLAG_DOCS: &[(&str, &str)] = &[
         "--stdin",
         "Read piped input; pair with `agcli::read_stdin()` (`req.wants_stdin()`).",
     ),
+    (
+        "--json",
+        "Accepted and ignored — output is always JSON. Reserved so a caller migrating off a `--json` flag keeps working.",
+    ),
 ];
 
 /// Every framework-reserved flag name (without the leading `--`), for runtime
@@ -961,6 +965,15 @@ type CommandHandler = dyn for<'a> Fn(
     + Send
     + Sync;
 
+/// Handler for a raw passthrough command: it receives the verbatim argv tail
+/// and returns the process exit code. See [`Command::raw_handler`].
+type RawCommandHandler = dyn for<'a> Fn(
+        &'a [String],
+        &'a mut ExecutionContext,
+    ) -> Pin<Box<dyn Future<Output = i32> + Send + 'a>>
+    + Send
+    + Sync;
+
 /// CLI command definition.
 #[derive(Clone)]
 pub struct Command {
@@ -968,6 +981,10 @@ pub struct Command {
     description: String,
     usage: Option<String>,
     handler: Option<Arc<CommandHandler>>,
+    /// A raw passthrough handler. Present only for commands built with
+    /// [`Command::raw_handler`]: they own stdout and their own argv, so the
+    /// framework dispatches them before parsing and emits no envelope.
+    raw_handler: Option<Arc<RawCommandHandler>>,
     default_next_actions: Vec<NextAction>,
     subcommands: BTreeMap<String, Command>,
     /// When false, the framework-reserved `--select`/`--compact` projection is
@@ -1000,6 +1017,7 @@ impl fmt::Debug for Command {
             .field("default_next_actions", &self.default_next_actions)
             .field("subcommand_count", &self.subcommands.len())
             .field("has_handler", &self.handler.is_some())
+            .field("raw", &self.raw_handler.is_some())
             .finish()
     }
 }
@@ -1011,6 +1029,7 @@ impl Command {
             description: description.into(),
             usage: None,
             handler: None,
+            raw_handler: None,
             default_next_actions: Vec::new(),
             subcommands: BTreeMap::new(),
             apply_reserved_projection: true,
@@ -1086,6 +1105,70 @@ impl Command {
         self
     }
 
+    /// Attach a **raw passthrough handler**: the command owns its own argv,
+    /// its own stdout, and its own exit code.
+    ///
+    /// Some commands are defined by a foreign output contract the JSON
+    /// envelope cannot express — a `grep` that must print `path:line:content`
+    /// and exit 1 for "no matches", a `cat`, a `sh -c` shim. Wrapping those in
+    /// an envelope does not make them agent-native, it makes them wrong. A raw
+    /// command opts out of the envelope entirely and keeps the contract it
+    /// promised:
+    ///
+    /// - **Verbatim argv.** The handler receives every token after the command
+    ///   path, unparsed and in order — patterns starting with `-`, `-C 3`,
+    ///   `-t rust`, `-g '*.rs'`, `--` — nothing is consumed, reordered, or
+    ///   rejected. Flag validation, positional-arity checks, the `--dry-run`
+    ///   gate and the reserved `--select` / `--compact` / `--quiet` projection
+    ///   are all skipped, and unknown flags are the handler's business.
+    /// - **Raw stdout.** The framework writes nothing. Print from the handler.
+    /// - **Own exit code.** The returned `i32` becomes the process status, so
+    ///   `1` can mean "no hits" rather than "failure".
+    ///
+    /// The command still appears in the root command tree (marked
+    /// `"raw": true`), in `help`, and in [`AgentCli::audit`] — it is a normal
+    /// member of the CLI, only its output contract differs.
+    ///
+    /// ```ignore
+    /// Command::new("grep", "Search the index (ripgrep-compatible output)")
+    ///     .usage("app grep [rg-flags...] <pattern> [path...]")
+    ///     .raw_handler(|args, _ctx| {
+    ///         let args = args.to_vec();
+    ///         Box::pin(async move {
+    ///             let hits = search(&args).await;
+    ///             for hit in &hits {
+    ///                 println!("{}:{}:{}", hit.path, hit.line, hit.text);
+    ///             }
+    ///             i32::from(hits.is_empty()) // rg's convention: 1 = no matches
+    ///         })
+    ///     })
+    /// ```
+    ///
+    /// Two consequences worth knowing before reaching for this:
+    /// `<tool> grep --help` goes to the handler like any other token (ask the
+    /// framework instead with `<tool> help grep`), and a raw command is a leaf
+    /// — any subcommands under it are unreachable, which
+    /// [`AgentCli::audit`] reports.
+    pub fn raw_handler<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(
+                &'a [String],
+                &'a mut ExecutionContext,
+            ) -> Pin<Box<dyn Future<Output = i32> + Send + 'a>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.raw_handler = Some(Arc::new(f));
+        self
+    }
+
+    /// True when this command was built with [`Command::raw_handler`] and so
+    /// emits raw stdout instead of a JSON envelope.
+    pub fn is_raw(&self) -> bool {
+        self.raw_handler.is_some()
+    }
+
     pub fn subcommand(mut self, command: Command) -> Self {
         debug_assert!(
             !self.subcommands.contains_key(&command.name),
@@ -1114,7 +1197,9 @@ impl Command {
             return usage.clone();
         }
         let joined = path.join(" ");
-        if !self.subcommands.is_empty() && self.handler.is_none() {
+        if self.raw_handler.is_some() {
+            format!("{program} {joined} [args...]")
+        } else if !self.subcommands.is_empty() && self.handler.is_none() {
             format!("{program} {joined} <subcommand>")
         } else {
             format!("{program} {joined} [--flag=<value>] [args...]")
@@ -1126,6 +1211,10 @@ impl Command {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Execution {
     envelope: Envelope,
+    /// True when a [`Command::raw_handler`] ran: the command already wrote its
+    /// own stdout, so the envelope below is bookkeeping (exit code, panic
+    /// detail) and must not be printed on stdout.
+    raw: bool,
 }
 
 impl Execution {
@@ -1143,6 +1232,49 @@ impl Execution {
 
     pub fn to_json_pretty(&self) -> String {
         self.envelope.to_json_pretty()
+    }
+
+    /// True when a raw command ran and already wrote its own stdout.
+    ///
+    /// The envelope stays available for inspection and tests — it carries the
+    /// exit code, and a `HANDLER_PANIC` if the raw handler died — but printing
+    /// it on stdout would append JSON to output the command promised would be
+    /// raw. [`Execution::print`] and [`Execution::finish`] honor this; a
+    /// hand-rolled `println!(run.to_json())` does not.
+    pub fn is_raw(&self) -> bool {
+        self.raw
+    }
+
+    /// Write this execution to the process streams and return the exit code.
+    ///
+    /// Normal executions print the JSON envelope on stdout. A raw execution
+    /// prints nothing — its handler already wrote stdout — except when the
+    /// framework itself failed it (a panicking raw handler), in which case the
+    /// error envelope goes to **stderr** so stdout stays clean.
+    pub fn print(&self) -> i32 {
+        if self.raw {
+            if !self.envelope.ok() {
+                eprintln!("{}", self.envelope.to_json());
+            }
+        } else {
+            println!("{}", self.envelope.to_json());
+        }
+        self.exit_code()
+    }
+
+    /// [`Execution::print`], then exit the process with the typed exit code.
+    /// The one-line ending for `main`:
+    ///
+    /// ```ignore
+    /// cli.run_env().await.finish()
+    /// ```
+    ///
+    /// `std::process::exit` runs no destructors, so a raw handler that buffers
+    /// its own writer must flush before it returns. `println!` flushes each
+    /// line already.
+    pub fn finish(self) -> ! {
+        let code = self.print();
+        std::process::exit(code)
     }
 }
 
@@ -1221,10 +1353,16 @@ impl AgentCli {
     }
 
     /// Register a built-in `doctor` command that runs `checks` and reports a
-    /// structured health envelope `{ healthy, checks: [...] }`. When any check
-    /// fails the command still returns an `ok: true` envelope (the report
-    /// succeeded) but carries the failing check's exit code so a shell or
-    /// agent sees a non-zero status. See [`Check`] and [`crate::CheckResult`].
+    /// structured health envelope `{ healthy, skipped, checks: [...] }`. When
+    /// any check fails the command still returns an `ok: true` envelope (the
+    /// report succeeded) but carries the failing check's exit code so a shell
+    /// or agent sees a non-zero status.
+    ///
+    /// Each check entry carries `status` (`pass` / `fail` / `skip`) alongside
+    /// `ok`. A skipped check — [`crate::CheckResult::skip`] — did not run: it
+    /// leaves `healthy` true and never contributes an exit code, so an optional
+    /// subsystem cannot fail the run for a caller that does not use it. See
+    /// [`Check`] and [`crate::CheckResult`].
     pub fn doctor(self, checks: Vec<Check>) -> Self {
         let usage = format!("{} doctor", self.name);
         let checks = Arc::new(checks);
@@ -1235,10 +1373,11 @@ impl AgentCli {
                 Box::pin(async move {
                     let mut entries = Vec::with_capacity(checks.len());
                     let mut healthy = true;
+                    let mut skipped = 0usize;
                     let mut fail_exit: Option<i32> = None;
                     for check in checks.iter() {
                         let result = check.run().await;
-                        if !result.ok {
+                        if result.failed() {
                             healthy = false;
                             // Prefer a specific (non-ERROR) exit code over the
                             // generic ERROR so the shell sees the most
@@ -1250,9 +1389,13 @@ impl AgentCli {
                                 Some(prev) => prev,
                             });
                         }
+                        if result.skipped() {
+                            skipped += 1;
+                        }
                         let mut entry = Map::new();
                         entry.insert("name".to_string(), json!(check.name()));
-                        entry.insert("ok".to_string(), json!(result.ok));
+                        entry.insert("status".to_string(), json!(result.status.as_str()));
+                        entry.insert("ok".to_string(), json!(result.is_ok()));
                         if let Some(detail) = result.detail {
                             entry.insert("detail".to_string(), json!(detail));
                         }
@@ -1263,6 +1406,7 @@ impl AgentCli {
                     }
                     let mut output = CommandOutput::new(json!({
                         "healthy": healthy,
+                        "skipped": skipped,
                         "checks": entries,
                     }));
                     if !healthy {
@@ -1303,12 +1447,24 @@ impl AgentCli {
             path_buf.push(&command.name);
             let path = path_buf.join(" ");
 
-            if command.handler.is_none() && command.subcommands.is_empty() {
+            let runnable = command.handler.is_some() || command.raw_handler.is_some();
+            if !runnable && command.subcommands.is_empty() {
                 report.push(
                     AuditSeverity::Error,
                     "DEAD_END_COMMAND",
                     &path,
                     "command has neither a handler nor subcommands; invoking it always errors",
+                );
+            }
+            // A raw command claims the whole argv tail after its own name, so
+            // nothing under it can ever be reached.
+            if command.raw_handler.is_some() && !command.subcommands.is_empty() {
+                report.push(
+                    AuditSeverity::Error,
+                    "RAW_COMMAND_HAS_SUBCOMMANDS",
+                    &path,
+                    "raw command declares subcommands; a raw handler consumes every \
+                     token after its own name, so they are unreachable",
                 );
             }
             if command.description.trim().is_empty() {
@@ -1319,7 +1475,7 @@ impl AgentCli {
                     "command has an empty description; agents rely on it to choose commands",
                 );
             }
-            if command.handler.is_some() && command.usage.is_none() {
+            if runnable && command.usage.is_none() {
                 report.push(
                     AuditSeverity::Warning,
                     "MISSING_USAGE",
@@ -1361,7 +1517,9 @@ impl AgentCli {
                         ),
                     );
                 }
-                if self.reserved_flags {
+                // Raw commands are exempt: the framework parses none of their
+                // flags, so "redeclared" means nothing there.
+                if self.reserved_flags && command.raw_handler.is_none() {
                     let mut declared = HashSet::new();
                     extract_all_flag_names(usage, &mut declared);
                     let mut redeclared: Vec<&str> = declared
@@ -1482,6 +1640,13 @@ impl AgentCli {
             argv.push(self.name.clone());
         }
 
+        // Pass 0: a raw command claims its argv before anything reads it. The
+        // scan is purely lexical — no flag parsing, no `--help` interception —
+        // because parsing is exactly what the command opted out of.
+        if let Some((command, args_start)) = self.resolve_raw_command(&argv) {
+            return self.run_raw(command, &argv, args_start, context).await;
+        }
+
         let preliminary_path = self.preliminary_command_path(&argv);
         let bool_flags = Self::path_bool_flag_set(&preliminary_path);
         let reserved = self.reserved_flags;
@@ -1565,6 +1730,15 @@ impl AgentCli {
                 );
             }
         };
+
+        // A raw command whose name was not the leading token — a global flag
+        // preceded it, so the Pass-0 lexical scan did not fire. Recover the
+        // verbatim tail from argv and hand over anyway; a raw command must
+        // never fall through to envelope machinery.
+        if command.raw_handler.is_some() {
+            let args_start = raw_args_start(&argv, &resolved.path);
+            return self.run_raw(command, &argv, args_start, context).await;
+        }
 
         if command.handler.is_none() && !command.subcommands.is_empty() {
             if resolved.remaining.is_empty() {
@@ -1843,6 +2017,7 @@ impl AgentCli {
                     .exit_code(output_exit.unwrap_or(ExitCode::SUCCESS));
                 Execution {
                     envelope: envelope.into(),
+                    raw: false,
                 }
             }
             Ok(Err(error)) => {
@@ -1865,6 +2040,7 @@ impl AgentCli {
                             next_actions,
                         )
                         .into(),
+                    raw: false,
                 }
             }
             Err(payload) => {
@@ -1883,9 +2059,100 @@ impl AgentCli {
                             next_actions,
                         )
                         .into(),
+                    raw: false,
                 }
             }
         }
+    }
+
+    /// Run a [`Command::raw_handler`]: hand it the verbatim argv tail, let it
+    /// own stdout, and turn the exit code it returns into an `Execution` that
+    /// prints nothing.
+    ///
+    /// The handler runs under the same panic guard as a normal handler. A
+    /// panicking raw handler cannot get a JSON error envelope on stdout — that
+    /// would corrupt whatever it printed before dying — so the envelope is
+    /// built, marked raw, and left for [`Execution::print`] to route to stderr.
+    async fn run_raw(
+        &self,
+        command: &Command,
+        argv: &[String],
+        args_start: usize,
+        context: &mut ExecutionContext,
+    ) -> Execution {
+        let command_line = raw_command_line(argv);
+        let args: Vec<String> = argv[args_start.min(argv.len())..].to_vec();
+        let Some(handler) = &command.raw_handler else {
+            return self.error_execution(
+                command_line,
+                "command has no handler".to_string(),
+                "MISSING_HANDLER",
+                "Attach a handler for this command or route to a subcommand.",
+                Retryable::No,
+                self.root_actions(),
+            );
+        };
+
+        let mut handler_future = handler(&args, context);
+        let outcome = std::future::poll_fn(|cx| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler_future.as_mut().poll(cx)
+            }))
+            .map_or_else(
+                |payload| std::task::Poll::Ready(Err(payload)),
+                |poll| poll.map(Ok),
+            )
+        })
+        .await;
+        drop(handler_future);
+
+        match outcome {
+            Ok(code) => Execution {
+                envelope: self
+                    .success_envelope(command_line, raw_result(), Vec::new())
+                    .exit_code(code)
+                    .into(),
+                raw: true,
+            },
+            Err(payload) => {
+                let detail = panic_payload_message(payload.as_ref());
+                Execution {
+                    envelope: self
+                        .build_error_envelope(
+                            command_line,
+                            format!("handler panicked: {detail}"),
+                            "HANDLER_PANIC",
+                            "This is a bug in the command handler, not the invocation. \
+                             Its stdout is incomplete; do not parse it.",
+                            Retryable::No,
+                            ExitCode::ERROR,
+                            Vec::new(),
+                        )
+                        .into(),
+                    raw: true,
+                }
+            }
+        }
+    }
+
+    /// Pass 0 of dispatch: does argv name a raw command, and where does its
+    /// own argv start?
+    ///
+    /// Walks the leading argv tokens against the command tree literally — no
+    /// flag parsing, because a raw command's tokens are not the framework's to
+    /// parse. The first command on that walk carrying a raw handler wins, and
+    /// everything after its name is its argv. A token that names no command
+    /// ends the walk: the invocation is a normal one.
+    fn resolve_raw_command<'a>(&'a self, argv: &[String]) -> Option<(&'a Command, usize)> {
+        let mut commands = &self.commands;
+        for (idx, token) in argv.iter().enumerate().skip(1).take(MAX_COMMAND_DEPTH) {
+            let found = commands.get(token)?;
+            if found.raw_handler.is_some() {
+                return Some((found, idx + 1));
+            }
+            commands = &found.subcommands;
+        }
+        None
     }
 
     fn success_envelope(
@@ -1928,6 +2195,7 @@ impl AgentCli {
             envelope: self
                 .success_envelope(invocation.command_line().to_string(), result, next_actions)
                 .into(),
+            raw: false,
         }
     }
 
@@ -2200,6 +2468,7 @@ impl AgentCli {
                     next_actions,
                 )
                 .into(),
+            raw: false,
         }
     }
 
@@ -2252,6 +2521,7 @@ impl AgentCli {
                 name: command.name.clone(),
                 description: command.description.clone(),
                 usage,
+                raw: command.raw_handler.is_some(),
                 subcommands: sub_docs,
             });
             path_buf.pop();
@@ -2376,6 +2646,48 @@ impl AgentCli {
 
 fn path_refs(path: &[String]) -> Vec<&str> {
     path.iter().map(String::as_str).collect()
+}
+
+/// The bookkeeping `result` of a raw execution. The envelope never reaches
+/// stdout, so this exists to make an inspected or logged raw `Execution`
+/// self-explanatory rather than blank.
+fn raw_result() -> Value {
+    json!({
+        "raw": true,
+        "stdout": "written directly by the command; this envelope is not printed",
+    })
+}
+
+/// `program tokens...` for a raw invocation, matching the `command` field a
+/// parsed [`Invocation`] would produce (argv[0] reduced to its file name).
+fn raw_command_line(argv: &[String]) -> String {
+    let program = argv.first().map_or("", String::as_str);
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    if argv.len() <= 1 {
+        program.to_string()
+    } else {
+        format!("{program} {}", argv[1..].join(" "))
+    }
+}
+
+/// Index into `argv` of the first token after the resolved command `path`.
+///
+/// The Pass-0 scan knows this by construction; this recovers it when a raw
+/// command was reached through the normal parse instead (its name was not the
+/// leading token). Path names are matched in order, so a value that happens to
+/// equal a command name cannot shift the split leftward.
+fn raw_args_start(argv: &[String], path: &[String]) -> usize {
+    let mut idx = 1;
+    for name in path {
+        while idx < argv.len() && argv[idx] != *name {
+            idx += 1;
+        }
+        idx += 1;
+    }
+    idx.min(argv.len())
 }
 
 /// Corrective `fix` text for an unknown command/subcommand error.
@@ -2601,8 +2913,17 @@ struct CommandDoc {
     name: String,
     description: String,
     usage: String,
+    /// Present (and true) only for [`Command::raw_handler`] commands, so an
+    /// introspecting agent knows this one answers with raw stdout and its own
+    /// exit code instead of a JSON envelope. Omitted for every other command.
+    #[serde(skip_serializing_if = "is_false")]
+    raw: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     subcommands: Vec<CommandDoc>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(test)]

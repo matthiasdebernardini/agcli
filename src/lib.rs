@@ -47,7 +47,7 @@ pub use cli::{
     Invocation, ParseInvocationError, parse_invocation, parse_invocation_with_bool_flags,
     read_stdin, reserved_flag_names,
 };
-pub use doctor::{Check, CheckResult};
+pub use doctor::{Check, CheckResult, CheckStatus};
 pub use envelope::{
     ActionParam, Envelope, ErrorBody, ErrorEnvelope, ExitCode, NextAction, SuccessEnvelope,
 };

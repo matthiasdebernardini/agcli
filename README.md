@@ -11,6 +11,7 @@ It is built around the design in [design.md](design.md):
 - context-safe output truncation and bounded list output
 - built-in `doctor` health checks and a static command-tree self-audit
 - typed NDJSON streaming with terminal `result`/`error`
+- raw passthrough commands for the few that owe a foreign output contract
 
 ## Why terminal envelopes and truncation pointers matter
 
@@ -23,7 +24,7 @@ It is built around the design in [design.md](design.md):
 
 ```toml
 [dependencies]
-agcli = "0.14.0"
+agcli = "0.15.0"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -54,9 +55,8 @@ async fn main() {
                 }),
         );
 
-    let run = cli.run_env().await;
-    println!("{}", run.to_json());
-    std::process::exit(run.exit_code());
+    // Prints the envelope on stdout, then exits with the typed code.
+    cli.run_env().await.finish()
 }
 ```
 
@@ -95,8 +95,17 @@ accessors on `CommandRequest`, for the handler to act on:
 `--no-cache` → `req.no_cache()`, `--no-color` → `req.no_color()`,
 `--stdin` → `req.wants_stdin()` (pair with `agcli::read_stdin().await`).
 
+`--json` is reserved too, and does nothing: output is always JSON. It exists so
+a CLI can *drop* its own `--json` flag without breaking the calls agents already
+have memorized. Because it is reserved as a **boolean**, it never consumes the
+next token — `app brain --json myrepo` keeps `myrepo` as a positional. The same
+holds for any undeclared flag the command has opted to allow: only the reserved
+booleans are guaranteed not to swallow what follows them (declare a bool flag in
+`.usage(...)` to get the same guarantee for your own).
+
 These names are reserved while enabled (the default). If a command needs one
-with conflicting semantics, opt out per-CLI with `AgentCli::reserved_flags(false)`.
+with conflicting semantics, opt out per-CLI with `AgentCli::reserved_flags(false)`
+— which also gives up the `--json` back-compat above.
 
 The reserved vocabulary is **discoverable**: the root command tree includes an
 `agent_flags` section describing every flag (so an introspecting agent finds
@@ -179,16 +188,89 @@ in use, under `--quiet` (which strips `next_actions` entirely), and when
 reserved flags or the command's reserved projection are disabled. `fields`
 itself is schema disclosure and is emitted either way.
 
+## Raw passthrough commands
+
+Most commands should answer with an envelope. A few cannot: a `grep` that owes
+callers `path:line:content` on stdout and exit `1` for "no matches", a `cat`, a
+shim around another program. Wrapping those in JSON does not make them
+agent-native, it makes them wrong.
+
+`Command::raw_handler(...)` is the opt-out. The handler receives the verbatim
+argv tail as `&[String]`, writes stdout itself, and returns the process exit
+code:
+
+```rust
+Command::new("grep", "Search the index (ripgrep-compatible output)")
+    .usage("app grep [rg-flags...] <pattern> [path...]")
+    .raw_handler(|args, _ctx| {
+        let args = args.to_vec();
+        Box::pin(async move {
+            let hits = search(&args).await;
+            for hit in &hits {
+                println!("{}:{}:{}", hit.path, hit.line, hit.text);
+            }
+            i32::from(hits.is_empty()) // rg's convention: 1 = no matches
+        })
+    })
+```
+
+What the framework does *not* do for a raw command:
+
+| Skipped | Why it matters |
+|---------|----------------|
+| Flag parsing | `-C 3`, `-t rust`, `-g '*.rs'`, `--`, and patterns that start with `-` arrive untouched and in order. |
+| Unknown-flag rejection | An unrecognized flag is the handler's business, not a `UNKNOWN_FLAG` error. |
+| Positional-arity checks | No `EXTRA_ARG` on a long argument list. |
+| The `--dry-run` gate | The token is passed through like any other. |
+| `--select` / `--compact` / `--quiet` projection | There is no envelope to project. |
+| Envelope serialization and `next_actions` | Stdout carries exactly what the handler printed. |
+
+What it still does: the command appears in the root command tree (marked
+`"raw": true` so an introspecting agent knows it answers in raw text), in
+`help`, and in `audit()`. Panics are still caught — a panicking raw handler
+exits `1` and its `HANDLER_PANIC` envelope goes to **stderr**, never onto the
+stdout it was in the middle of writing.
+
+Finish `main` with `Execution::finish()` — or check `Execution::is_raw()`
+before printing anything yourself:
+
+```rust
+let run = cli.run_env().await;
+if !run.is_raw() {
+    println!("{}", run.to_json()); // a raw command already wrote its stdout
+}
+std::process::exit(run.exit_code());
+```
+
+`finish()` ends in `std::process::exit`, which runs no destructors: a raw
+handler that buffers its own writer must flush before it returns. `println!`
+already flushes each line.
+
+Two things to know. `app grep --help` reaches the handler like any other token,
+so `app help grep` is how an agent asks the framework instead. And a raw
+command is a leaf: anything declared under it is unreachable, which `audit()`
+reports as `RAW_COMMAND_HAS_SUBCOMMANDS`.
+
 ## Built-in `doctor` and self-audit
 
 `AgentCli::doctor(checks)` registers a `doctor` command that runs your
-[`Check`]s and reports `{ healthy, checks: [...] }`. A failing check still
-produces an `ok: true` envelope (the report ran) but carries that check's
+[`Check`]s and reports `{ healthy, skipped, checks: [...] }`. A failing check
+still produces an `ok: true` envelope (the report ran) but carries that check's
 exit code (e.g. `ExitCode::AUTH`), so the shell sees a non-zero status.
+
+A check has three outcomes. `CheckResult::pass()`, `CheckResult::fail(detail,
+fix)`, and `CheckResult::skip(reason)` — the last for a check that never ran
+because it does not apply: no bucket configured, an optional dependency absent.
+Each check entry reports `status` (`"pass"` / `"fail"` / `"skip"`) next to `ok`,
+and the report counts the skips. A skipped check leaves `healthy` true and never
+contributes its exit code, so an optional subsystem cannot fail a `doctor` run
+for a caller that does not use it — and an agent is never told a thing was
+verified when nothing was.
 
 `AgentCli::audit()` statically validates the command tree and returns an
 `AuditReport`: it flags dangling `next_action` templates (HATEOAS integrity),
-dead-end commands, and missing usage/descriptions. Use it in a test:
+dead-end commands, unreachable subcommands under a raw command, and missing
+usage/descriptions. Use it in a test:
 
 ```rust
 assert!(cli.audit().is_clean());
@@ -202,7 +284,7 @@ agcli targets **macOS and Linux only**. The crate ships with optimized release/b
 
 ```toml
 [dependencies]
-agcli = "0.14.0"
+agcli = "0.15.0"
 
 [profile.release]
 opt-level = 3
@@ -221,3 +303,4 @@ See [examples/ops.rs](examples/ops.rs) — a runnable `ops` CLI demonstrating:
 - the self-documenting command tree
 - contextual `next_actions`
 - log truncation with file pointers
+- a raw passthrough command (`ops echo`) that owns its stdout and exit code

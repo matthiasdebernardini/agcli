@@ -6,6 +6,12 @@
 //! code (e.g. [`crate::ExitCode::AUTH`]) while still emitting a valid
 //! `ok: true` envelope whose `healthy` field and per-check breakdown tell an
 //! agent exactly what to fix.
+//!
+//! A check has three outcomes, not two. [`CheckResult::skip`] reports that the
+//! check never ran — no credentials configured, an optional dependency absent,
+//! a platform the check does not apply to. A skipped check is not a failure: it
+//! leaves `healthy` true and never drives the exit code. Folding "did not run"
+//! into "passed" would tell an agent something was verified when nothing was.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -13,10 +19,35 @@ use std::sync::Arc;
 
 use crate::envelope::ExitCode;
 
+/// The three outcomes of a [`Check`]. Serialized into the `doctor` report as
+/// the lowercase `status` string on each check entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckStatus {
+    /// The check ran and what it verifies is healthy.
+    Pass,
+    /// The check ran and found a problem. Drives `healthy: false` and the
+    /// check's [`Check::exit_code`].
+    Fail,
+    /// The check did not run — it does not apply here, or a precondition for
+    /// running it is absent. Neither healthy nor broken.
+    Skip,
+}
+
+impl CheckStatus {
+    /// The wire spelling used in the `doctor` envelope.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Skip => "skip",
+        }
+    }
+}
+
 /// Outcome of a single [`Check`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckResult {
-    pub ok: bool,
+    pub status: CheckStatus,
     pub detail: Option<String>,
     pub fix: Option<String>,
 }
@@ -25,7 +56,7 @@ impl CheckResult {
     /// The check passed, no extra detail.
     pub fn pass() -> Self {
         Self {
-            ok: true,
+            status: CheckStatus::Pass,
             detail: None,
             fix: None,
         }
@@ -34,7 +65,7 @@ impl CheckResult {
     /// The check passed, with an informational detail string.
     pub fn pass_with(detail: impl Into<String>) -> Self {
         Self {
-            ok: true,
+            status: CheckStatus::Pass,
             detail: Some(detail.into()),
             fix: None,
         }
@@ -44,10 +75,38 @@ impl CheckResult {
     /// recover — both surface in the `doctor` envelope.
     pub fn fail(detail: impl Into<String>, fix: impl Into<String>) -> Self {
         Self {
-            ok: false,
+            status: CheckStatus::Fail,
             detail: Some(detail.into()),
             fix: Some(fix.into()),
         }
+    }
+
+    /// The check did not run. `reason` says why — it lands in `detail`.
+    ///
+    /// A skipped check keeps the report healthy and never sets the exit code,
+    /// so an optional subsystem cannot fail a `doctor` run for a caller that
+    /// does not use it.
+    pub fn skip(reason: impl Into<String>) -> Self {
+        Self {
+            status: CheckStatus::Skip,
+            detail: Some(reason.into()),
+            fix: None,
+        }
+    }
+
+    /// True unless the check failed. A skipped check is not a failure.
+    pub fn is_ok(&self) -> bool {
+        !matches!(self.status, CheckStatus::Fail)
+    }
+
+    /// True only for [`CheckStatus::Fail`].
+    pub fn failed(&self) -> bool {
+        matches!(self.status, CheckStatus::Fail)
+    }
+
+    /// True only for [`CheckStatus::Skip`].
+    pub fn skipped(&self) -> bool {
+        matches!(self.status, CheckStatus::Skip)
     }
 }
 

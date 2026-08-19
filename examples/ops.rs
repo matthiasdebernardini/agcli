@@ -72,9 +72,30 @@ async fn main() {
                         )
                     })
                 }),
+        )
+        // A raw passthrough command: it owns its argv, its stdout, and its
+        // exit code. Nothing here is parsed, projected, or wrapped in an
+        // envelope — the shape a `grep` or a `cat` needs.
+        .command(
+            Command::new(
+                "echo",
+                "Print each argument on its own line (raw passthrough)",
+            )
+            .usage("ops echo [args...]")
+            .raw_handler(|args, _ctx| {
+                let args = args.to_vec();
+                Box::pin(async move {
+                    for arg in &args {
+                        println!("{arg}");
+                    }
+                    // grep's convention: 1 means "nothing matched", not
+                    // "the command failed".
+                    i32::from(args.is_empty())
+                })
+            }),
         );
 
-    let run = cli.run_env().await;
-    println!("{}", run.to_json());
-    std::process::exit(run.exit_code());
+    // Prints the envelope on stdout — or nothing at all, when a raw command
+    // already wrote its own — then exits with the typed code.
+    cli.run_env().await.finish()
 }

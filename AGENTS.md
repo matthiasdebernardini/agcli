@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-agcli = "0.10.1"
+agcli = "0.15.0"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -179,3 +179,5 @@ cargo run --example calc -- add foo bar  # Error case (typed-error envelope)
 - **Retryable errors**: Chain `.retryable(true)` on `CommandError` for transient failures
 - **Truncation**: Use `truncate_lines_with_file()` to cap large outputs and write full content to a temp file
 - **Streaming**: Use `NdjsonEmitter` for temporal operations; terminal `result`/`error` events carry `timestamp` and `schema_version`
+- **Raw passthrough**: `Command::raw_handler(|args, ctx| ...)` for a command that owes a foreign output contract (a ripgrep-compatible `grep`, a `cat`). It gets the verbatim argv tail, writes stdout itself, and returns its own exit code — no parsing, no envelope, no `next_actions`. It still shows up in the command tree, marked `"raw": true`. End `main` with `cli.run_env().await.finish()` so a raw command's stdout is never followed by an envelope.
+- **Doctor skips**: `CheckResult::skip(reason)` reports a check that never ran. It keeps `healthy` true and never sets the exit code, so an optional subsystem cannot fail `doctor` for a caller that does not use it.
