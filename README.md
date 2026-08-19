@@ -229,7 +229,19 @@ What it still does: the command appears in the root command tree (marked
 `"raw": true` so an introspecting agent knows it answers in raw text), in
 `help`, and in `audit()`. Panics are still caught — a panicking raw handler
 exits `1` and its `HANDLER_PANIC` envelope goes to **stderr**, never onto the
-stdout it was in the middle of writing.
+stdout it was in the middle of writing. The exit code the handler returns is
+truncated to its low 8 bits, so forwarding another program's
+`status.code().unwrap_or(-1)` yields `255` — the same value the shell sees.
+
+The guarantee is unconditional. It does not depend on where the command's name
+sits on the line, and it survives a line the parser cannot read:
+
+```bash
+app grep -h pat            # -h belongs to grep, not to the framework
+app --json grep -h pat     # a global flag first changes nothing
+app --json grep --=x       # even an unparseable token reaches the handler
+app help grep              # …and this is how you ask the framework instead
+```
 
 Finish `main` with `Execution::finish()` — or check `Execution::is_raw()`
 before printing anything yourself:
@@ -246,10 +258,9 @@ std::process::exit(run.exit_code());
 handler that buffers its own writer must flush before it returns. `println!`
 already flushes each line.
 
-Two things to know. `app grep --help` reaches the handler like any other token,
-so `app help grep` is how an agent asks the framework instead. And a raw
-command is a leaf: anything declared under it is unreachable, which `audit()`
-reports as `RAW_COMMAND_HAS_SUBCOMMANDS`.
+A raw command is a leaf, and it replaces the normal handler. `audit()` reports
+both mistakes: `RAW_COMMAND_HAS_SUBCOMMANDS` for subcommands that can never be
+reached, `RAW_COMMAND_HAS_HANDLER` for a `.handler(...)` that can never run.
 
 ## Built-in `doctor` and self-audit
 

@@ -21,6 +21,11 @@ types, hence a **minor** bump pre-1.0.
     `status`.** Entries keep `ok` (true unless the check failed), so an agent
     reading `ok` still works, but a test asserting the exact shape of a
     `doctor` result will see the new keys.
+- **Adding a raw command changes what `main` may print.** A hand-rolled
+    `println!("{}", run.to_json()); std::process::exit(run.exit_code())`
+    appends an envelope to whatever the raw command already wrote. Replace it
+    with `run.finish()`, or guard the print on `!run.is_raw()`. A CLI with no
+    raw command is unaffected.
 
 ### Added
 
@@ -47,9 +52,11 @@ types, hence a **minor** bump pre-1.0.
     `healthy` true and never contributes its exit code, so an optional
     subsystem cannot fail a `doctor` run for a caller that does not use it.
 - **`Command::is_raw()`** for downstream introspection.
-- **`audit()` reports `RAW_COMMAND_HAS_SUBCOMMANDS`** (error severity): a raw
-    handler consumes every token after its own name, so anything declared
-    under it is unreachable. `MISSING_USAGE` now covers raw commands too, and
+- **`audit()` reports `RAW_COMMAND_HAS_SUBCOMMANDS` and
+    `RAW_COMMAND_HAS_HANDLER`** (both error severity): a raw handler consumes
+    every token after its own name, so anything declared under it is
+    unreachable, and it wins over a `.handler(...)` on the same command, which
+    then never runs. `MISSING_USAGE` now covers raw commands too, and
     the reserved-flag-redeclaration warning skips them (the framework parses
     none of their flags).
 - **`--json` is documented in the root tree's `agent_flags`.** It was already

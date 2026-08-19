@@ -130,6 +130,88 @@ async fn framework_help_is_still_reachable_by_name() {
 }
 
 #[tokio::test]
+async fn a_help_flag_behind_a_global_flag_still_belongs_to_the_command() {
+    // The recovery path used to sit after the `--help` interception, so this
+    // shape answered with a help envelope and never ran the handler.
+    let (execution, ctx) = run(&raw_cli(0), &["app", "--json", "grep", "--help"]).await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen_argv(&ctx), ["--help"]);
+}
+
+#[tokio::test]
+async fn a_short_help_flag_behind_a_global_flag_belongs_to_the_command() {
+    let (execution, ctx) = run(&raw_cli(0), &["app", "--quiet", "grep", "-h", "pat"]).await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen_argv(&ctx), ["-h", "pat"]);
+}
+
+#[tokio::test]
+async fn a_line_the_parser_rejects_still_reaches_the_handler() {
+    // `--=x` is a parse error. Judging a raw command's syntax is exactly what
+    // the framework promised not to do, so the handler gets it anyway.
+    let (execution, ctx) = run(&raw_cli(0), &["app", "--json", "grep", "--=x"]).await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen_argv(&ctx), ["--=x"]);
+}
+
+#[tokio::test]
+async fn a_value_flag_may_repeat_the_command_name() {
+    // `--select` eats the first `grep` as its value; the second is the
+    // command. Splitting argv by searching for the command name would hand the
+    // handler ["grep", "pat"] — the parser's positional indices get it right.
+    let (execution, ctx) = run(&raw_cli(0), &["app", "--select", "grep", "grep", "pat"]).await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen_argv(&ctx), ["pat"]);
+}
+
+#[tokio::test]
+async fn an_undeclared_flag_may_repeat_the_command_name() {
+    let (execution, ctx) = run(
+        &raw_cli(0),
+        &["app", "--unknownflag", "grep", "grep", "pat"],
+    )
+    .await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen_argv(&ctx), ["pat"]);
+}
+
+#[tokio::test]
+async fn a_nested_raw_command_behind_a_global_flag_splits_correctly() {
+    let cli = AgentCli::new("app", "Test CLI").command(
+        Command::new("code", "Code tools")
+            .usage("app code <subcommand>")
+            .subcommand(
+                Command::new("grep", "Search")
+                    .usage("app code grep [args...]")
+                    .raw_handler(|args, ctx| {
+                        let seen: Vec<Value> = args.iter().map(|a| json!(a)).collect();
+                        ctx.set("argv", Value::Array(seen));
+                        Box::pin(async move { 0 })
+                    }),
+            ),
+    );
+    let (execution, ctx) = run(&cli, &["app", "--json", "code", "grep", "-i", "pat"]).await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen_argv(&ctx), ["-i", "pat"]);
+}
+
+#[tokio::test]
+async fn a_forwarded_signal_status_is_truncated_not_panicked() {
+    // `Command::status().code()` gives -1 for "killed by a signal". The OS
+    // truncates that to 255; so does the envelope, so both agree.
+    let (execution, _) = run(&raw_cli(-1), &["app", "grep", "pat"]).await;
+
+    assert_eq!(execution.exit_code(), 255);
+    assert!(execution.is_raw());
+}
+
+#[tokio::test]
 async fn reached_through_a_leading_global_flag() {
     // The lexical Pass-0 scan misses when a flag precedes the command name;
     // the normal path must still hand over, never emit an envelope.
@@ -216,6 +298,27 @@ fn audit_flags_unreachable_subcommands_under_a_raw_command() {
 }
 
 #[test]
+fn audit_flags_a_command_carrying_both_handlers() {
+    let cli = AgentCli::new("app", "Test CLI").command(
+        Command::new("grep", "Search")
+            .usage("app grep [args...]")
+            .handler(|_req, _ctx| Box::pin(async move { Ok(CommandOutput::new(json!({}))) }))
+            .raw_handler(|_args, _ctx| Box::pin(async move { 0 })),
+    );
+    let report = cli.audit();
+
+    assert!(!report.is_clean());
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.code == "RAW_COMMAND_HAS_HANDLER"),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
 fn audit_warns_when_a_raw_command_has_no_usage() {
     let cli = AgentCli::new("app", "Test CLI").command(
         Command::new("grep", "Search").raw_handler(|_args, _ctx| Box::pin(async move { 0 })),
@@ -230,27 +333,34 @@ fn audit_warns_when_a_raw_command_has_no_usage() {
     );
 }
 
+/// Run the shipped `ops` example with the given arguments.
+///
+/// The nested cargo gets its own `CARGO_TARGET_DIR`, so it takes its own
+/// build-directory lock instead of queueing behind the outer test run.
+///
+/// (A machine that also points `build.build-dir` at a cache shared across
+/// projects still serializes this build against every other project's — that
+/// is the shared cache working as configured, not something a test can route
+/// around.)
+fn run_ops_example(args: &[&str]) -> std::process::Output {
+    let target_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("raw-passthrough-e2e");
+    let mut command = std::process::Command::new(env!("CARGO"));
+    command
+        .args(["run", "-q", "--example", "ops", "--"])
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("CARGO_TARGET_DIR", target_dir);
+    command.output().expect("run the ops example")
+}
+
 /// The half no in-process assertion can reach: that stdout carries the
-/// command's own bytes and nothing else. Runs the shipped `ops` example,
-/// whose `echo` command is a raw passthrough.
+/// command's own bytes and nothing else. The example's `echo` command is a
+/// raw passthrough.
 #[test]
 fn stdout_is_raw_end_to_end() {
-    let output = std::process::Command::new(env!("CARGO"))
-        .args([
-            "run",
-            "-q",
-            "--example",
-            "ops",
-            "--",
-            "echo",
-            "-C",
-            "3",
-            "--not-a-flag",
-            "hello",
-        ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("run the ops example");
+    let output = run_ops_example(&["echo", "-C", "3", "--not-a-flag", "hello"]);
 
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
@@ -259,12 +369,24 @@ fn stdout_is_raw_end_to_end() {
     assert_eq!(output.status.code(), Some(0));
 
     // No arguments echoed: the example returns grep's "nothing matched" code.
-    let empty = std::process::Command::new(env!("CARGO"))
-        .args(["run", "-q", "--example", "ops", "--", "echo"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("run the ops example");
+    let empty = run_ops_example(&["echo"]);
 
     assert!(empty.stdout.is_empty());
     assert_eq!(empty.status.code(), Some(1));
+
+    // The shapes that used to fall through to an envelope: a global flag
+    // before the command name, `--help`, and a line the parser rejects.
+    for args in [
+        vec!["--json", "echo", "--help"],
+        vec!["--quiet", "echo", "-h"],
+        vec!["--json", "echo", "--=x"],
+    ] {
+        let out = run_ops_example(&args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("\"ok\""),
+            "envelope leaked onto raw stdout for {args:?}: {stdout}"
+        );
+        assert_eq!(stdout, format!("{}\n", args[args.len() - 1]), "{args:?}");
+    }
 }

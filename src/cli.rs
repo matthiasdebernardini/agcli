@@ -13,6 +13,7 @@ use crate::audit::{AuditReport, AuditSeverity};
 use crate::doctor::Check;
 use crate::envelope::{
     ActionParam, Envelope, ErrorEnvelope, ExitCode, NextAction, SuccessEnvelope,
+    normalize_exit_code,
 };
 use crate::project;
 
@@ -259,6 +260,11 @@ pub struct Invocation {
     raw_args: Vec<String>,
     flags: HashMap<String, String>,
     positionals: Vec<String>,
+    /// For each entry of `positionals`, its index in `raw_args`. Recovering
+    /// this after the fact by searching `raw_args` for the token does not
+    /// work: a value flag can consume a token spelled exactly like a later
+    /// positional, so the first textual match is not always the right one.
+    positional_indices: Vec<usize>,
     help_requested: bool,
 }
 
@@ -290,6 +296,14 @@ impl Invocation {
 
     pub fn positionals(&self) -> &[String] {
         &self.positionals
+    }
+
+    /// Where each positional sat in [`Invocation::raw_args`], same order and
+    /// length as [`Invocation::positionals`]. Lets a caller map a positional
+    /// back to the original argv position — which is how a raw command finds
+    /// the exact token its own argv starts after.
+    pub fn positional_indices(&self) -> &[usize] {
+        &self.positional_indices
     }
 
     pub fn help_requested(&self) -> bool {
@@ -368,6 +382,7 @@ where
 
     let mut flags = HashMap::new();
     let mut positionals = Vec::new();
+    let mut positional_indices = Vec::new();
     let mut help_requested = false;
     let mut positional_only = false;
     // A bare `--key` whose value form we don't yet know. If the next token is
@@ -380,10 +395,11 @@ where
         }
     };
 
-    for token in &tokens {
+    for (index, token) in tokens.iter().enumerate() {
         if positional_only {
             flush_pending(&mut pending_flag, &mut flags);
             positionals.push(token.clone());
+            positional_indices.push(index);
             continue;
         }
 
@@ -433,7 +449,10 @@ where
                 Some(key) => {
                     flags.insert(key, token.clone());
                 }
-                None => positionals.push(token.clone()),
+                None => {
+                    positionals.push(token.clone());
+                    positional_indices.push(index);
+                }
             }
             continue;
         }
@@ -475,7 +494,10 @@ where
             Some(key) => {
                 flags.insert(key, token.clone());
             }
-            None => positionals.push(token.clone()),
+            None => {
+                positionals.push(token.clone());
+                positional_indices.push(index);
+            }
         }
     }
 
@@ -488,6 +510,7 @@ where
         raw_args: tokens,
         flags,
         positionals,
+        positional_indices,
         help_requested,
     })
 }
@@ -1123,7 +1146,16 @@ impl Command {
     ///   are all skipped, and unknown flags are the handler's business.
     /// - **Raw stdout.** The framework writes nothing. Print from the handler.
     /// - **Own exit code.** The returned `i32` becomes the process status, so
-    ///   `1` can mean "no hits" rather than "failure".
+    ///   `1` can mean "no hits" rather than "failure". It is truncated to its
+    ///   low 8 bits, which is what a process status can carry — forwarding
+    ///   `Command::status().code().unwrap_or(-1)` yields `255`, matching what
+    ///   the shell would have seen.
+    ///
+    /// The guarantee is unconditional: it holds wherever the command's name
+    /// sits on the line. `app grep -h pat`, `app --json grep -h pat`, and even
+    /// a line the parser rejects outright (`app --json grep --=x`) all reach
+    /// the handler with their own tokens. `--help` and `-h` are the command's
+    /// too — ask the framework with `app help grep` instead.
     ///
     /// The command still appears in the root command tree (marked
     /// `"raw": true`), in `help`, and in [`AgentCli::audit`] — it is a normal
@@ -1144,11 +1176,9 @@ impl Command {
     ///     })
     /// ```
     ///
-    /// Two consequences worth knowing before reaching for this:
-    /// `<tool> grep --help` goes to the handler like any other token (ask the
-    /// framework instead with `<tool> help grep`), and a raw command is a leaf
-    /// — any subcommands under it are unreachable, which
-    /// [`AgentCli::audit`] reports.
+    /// A raw command is a leaf, and it replaces the normal handler: anything
+    /// declared under it is unreachable and a `.handler(...)` on the same
+    /// command never runs. [`AgentCli::audit`] reports both.
     pub fn raw_handler<F>(mut self, f: F) -> Self
     where
         F: for<'a> Fn(
@@ -1467,6 +1497,17 @@ impl AgentCli {
                      token after its own name, so they are unreachable",
                 );
             }
+            // Two handlers, one command: the raw one wins and the other is
+            // dead code that looks live at the call site.
+            if command.raw_handler.is_some() && command.handler.is_some() {
+                report.push(
+                    AuditSeverity::Error,
+                    "RAW_COMMAND_HAS_HANDLER",
+                    &path,
+                    "command declares both a handler and a raw handler; the raw \
+                     handler always wins, so the normal handler never runs",
+                );
+            }
             if command.description.trim().is_empty() {
                 report.push(
                     AuditSeverity::Warning,
@@ -1643,7 +1684,7 @@ impl AgentCli {
         // Pass 0: a raw command claims its argv before anything reads it. The
         // scan is purely lexical — no flag parsing, no `--help` interception —
         // because parsing is exactly what the command opted out of.
-        if let Some((command, args_start)) = self.resolve_raw_command(&argv) {
+        if let Some((command, args_start)) = self.resolve_raw_command(&argv, 1) {
             return self.run_raw(command, &argv, args_start, context).await;
         }
 
@@ -1656,6 +1697,12 @@ impl AgentCli {
             }) {
                 Ok(value) => value,
                 Err(error) => {
+                    // A raw command still owns its argv when a *later* token
+                    // fails to parse (`app --json grep --=x`): the syntax the
+                    // parser rejected was never the framework's to judge.
+                    if let Some((command, args_start)) = self.find_raw_command(&argv) {
+                        return self.run_raw(command, &argv, args_start, context).await;
+                    }
                     // Defer fallback_command construction to the error path
                     let fallback_command = argv.join(" ");
                     return self.error_execution(
@@ -1668,6 +1715,25 @@ impl AgentCli {
                     );
                 }
             };
+
+        // Pass 1 for a raw command: its name was not the leading token, so the
+        // lexical scan missed it (`app --json grep -h pat`). This has to come
+        // before the `--help` and `version` interceptions — `-h` belongs to
+        // the command, not to the framework — and the parsed positionals give
+        // the exact argv index its own arguments start at.
+        {
+            let resolved = self.resolve_command(invocation.positionals());
+            let path_cmds = self.path_command_refs(&resolved.path);
+            // First raw command on the walk wins, exactly as in Pass 0.
+            if let Some((depth, command)) = path_cmds
+                .iter()
+                .enumerate()
+                .find(|(_, cmd)| cmd.raw_handler.is_some())
+                && let Some(args_start) = raw_args_start(&invocation, depth + 1)
+            {
+                return self.run_raw(command, &argv, args_start, context).await;
+            }
+        }
 
         if invocation.help_requested() {
             return self.help_execution(&invocation, invocation.positionals());
@@ -1730,15 +1796,6 @@ impl AgentCli {
                 );
             }
         };
-
-        // A raw command whose name was not the leading token — a global flag
-        // preceded it, so the Pass-0 lexical scan did not fire. Recover the
-        // verbatim tail from argv and hand over anyway; a raw command must
-        // never fall through to envelope machinery.
-        if command.raw_handler.is_some() {
-            let args_start = raw_args_start(&argv, &resolved.path);
-            return self.run_raw(command, &argv, args_start, context).await;
-        }
 
         if command.handler.is_none() && !command.subcommands.is_empty() {
             if resolved.remaining.is_empty() {
@@ -2107,10 +2164,17 @@ impl AgentCli {
         drop(handler_future);
 
         match outcome {
+            // A raw handler forwards another program's status, and
+            // `Command::status().code()` hands back `-1` for "killed by a
+            // signal". Truncating to the low 8 bits here is what the OS does
+            // to the value anyway, and it keeps the envelope's `exit_code`
+            // equal to the status the caller will observe. `CommandOutput`'s
+            // range `debug_assert` is deliberately not reused: it would fire
+            // outside the panic guard, on a value the handler did not invent.
             Ok(code) => Execution {
                 envelope: self
                     .success_envelope(command_line, raw_result(), Vec::new())
-                    .exit_code(code)
+                    .exit_code(normalize_exit_code(code))
                     .into(),
                 raw: true,
             },
@@ -2135,17 +2199,21 @@ impl AgentCli {
         }
     }
 
-    /// Pass 0 of dispatch: does argv name a raw command, and where does its
-    /// own argv start?
+    /// Pass 0 of dispatch: does argv name a raw command starting at `start`,
+    /// and where does its own argv begin?
     ///
-    /// Walks the leading argv tokens against the command tree literally — no
-    /// flag parsing, because a raw command's tokens are not the framework's to
-    /// parse. The first command on that walk carrying a raw handler wins, and
-    /// everything after its name is its argv. A token that names no command
-    /// ends the walk: the invocation is a normal one.
-    fn resolve_raw_command<'a>(&'a self, argv: &[String]) -> Option<(&'a Command, usize)> {
+    /// Walks argv against the command tree literally — no flag parsing,
+    /// because a raw command's tokens are not the framework's to parse. The
+    /// first command on that walk carrying a raw handler wins, and everything
+    /// after its name is its argv. A token that names no command ends the
+    /// walk: this is not a raw invocation.
+    fn resolve_raw_command<'a>(
+        &'a self,
+        argv: &[String],
+        start: usize,
+    ) -> Option<(&'a Command, usize)> {
         let mut commands = &self.commands;
-        for (idx, token) in argv.iter().enumerate().skip(1).take(MAX_COMMAND_DEPTH) {
+        for (idx, token) in argv.iter().enumerate().skip(start).take(MAX_COMMAND_DEPTH) {
             let found = commands.get(token)?;
             if found.raw_handler.is_some() {
                 return Some((found, idx + 1));
@@ -2153,6 +2221,18 @@ impl AgentCli {
             commands = &found.subcommands;
         }
         None
+    }
+
+    /// Last-resort scan for a raw command anywhere in argv, used only when the
+    /// parser rejected the line outright.
+    ///
+    /// Normally the split between "the framework's tokens" and "the command's
+    /// tokens" comes from the parse. When there is no parse, the choice is
+    /// between handing a raw command tokens it may not own and refusing to run
+    /// a command whose whole contract is that the framework does not judge its
+    /// syntax. The second is worse, so every start offset is tried in order.
+    fn find_raw_command<'a>(&'a self, argv: &[String]) -> Option<(&'a Command, usize)> {
+        (1..argv.len()).find_map(|start| self.resolve_raw_command(argv, start))
     }
 
     fn success_envelope(
@@ -2673,21 +2753,19 @@ fn raw_command_line(argv: &[String]) -> String {
     }
 }
 
-/// Index into `argv` of the first token after the resolved command `path`.
+/// Index into argv of the first token after a resolved command path
+/// `path_len` positionals deep.
 ///
 /// The Pass-0 scan knows this by construction; this recovers it when a raw
-/// command was reached through the normal parse instead (its name was not the
-/// leading token). Path names are matched in order, so a value that happens to
-/// equal a command name cannot shift the split leftward.
-fn raw_args_start(argv: &[String], path: &[String]) -> usize {
-    let mut idx = 1;
-    for name in path {
-        while idx < argv.len() && argv[idx] != *name {
-            idx += 1;
-        }
-        idx += 1;
-    }
-    idx.min(argv.len())
+/// command was reached through the parse instead (its name was not the leading
+/// token). It reads the parser's recorded positional indices rather than
+/// searching argv for the command name: `app --select grep grep pat` spells
+/// `grep` twice, once as a flag value, and only the parser knows which one was
+/// the command. `+ 2` converts a `raw_args` index to an argv index (`+ 1` for
+/// the program) and steps past the command token itself.
+fn raw_args_start(invocation: &Invocation, path_len: usize) -> Option<usize> {
+    let last = path_len.checked_sub(1)?;
+    Some(invocation.positional_indices().get(last)? + 2)
 }
 
 /// Corrective `fix` text for an unknown command/subcommand error.

@@ -21,7 +21,11 @@ use crate::envelope::ExitCode;
 
 /// The three outcomes of a [`Check`]. Serialized into the `doctor` report as
 /// the lowercase `status` string on each check entry.
+///
+/// `#[non_exhaustive]`: a fourth outcome — a warning tier, say — would
+/// otherwise break every downstream `match`. Add a wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CheckStatus {
     /// The check ran and what it verifies is healthy.
     Pass,

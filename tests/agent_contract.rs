@@ -85,6 +85,33 @@ async fn the_root_tree_documents_the_json_flag() {
 }
 
 #[tokio::test]
+async fn without_reserved_flags_an_undeclared_json_swallows_the_positional() {
+    // The other half of the guarantee, pinned so it cannot drift: `--json` is
+    // safe *because* it is reserved. Turn the reserved vocabulary off and it
+    // becomes an ordinary undeclared flag, which consumes the next token.
+    let cli = AgentCli::new("app", "Test CLI")
+        .reserved_flags(false)
+        .command(
+            Command::new("brain", "Report state")
+                .usage("app brain [<repo>]")
+                .handler(|req, _ctx| {
+                    let positionals = req.positionals().to_vec();
+                    let json_flag = req.flag("json").map(str::to_string);
+                    Box::pin(async move {
+                        Ok(CommandOutput::new(
+                            json!({ "positionals": positionals, "json_flag": json_flag }),
+                        ))
+                    })
+                }),
+        );
+    let execution = cli.run_argv(["app", "brain", "--json", "myrepo"]).await;
+    let json = parse(&execution);
+
+    assert_eq!(json["result"]["json_flag"], json!("myrepo"));
+    assert_eq!(json["result"]["positionals"], json!([]));
+}
+
+#[tokio::test]
 async fn a_successful_command_exits_zero_whatever_it_reports() {
     // A degraded backing service is still a successful report. Nothing in the
     // result — not `"healthy": false`, not an error string — can move the exit
@@ -168,6 +195,12 @@ async fn a_skipped_doctor_check_is_neither_pass_nor_fail() {
     assert_eq!(checks[1]["detail"], json!("no bucket configured"));
     // …but it is not reported as a pass either.
     assert_ne!(checks[1]["status"], checks[0]["status"]);
+    // The back-compat the changelog promises: an agent still reading `ok`
+    // sees a skip as "not a failure", which is the honest coarse answer.
+    assert_eq!(checks[0]["ok"], json!(true));
+    assert_eq!(checks[1]["ok"], json!(true));
+    // A skip carries no `fix` — there is nothing to repair.
+    assert!(checks[1].get("fix").is_none(), "{checks:?}");
 }
 
 #[tokio::test]
