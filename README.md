@@ -24,7 +24,7 @@ It is built around the design in [design.md](design.md):
 
 ```toml
 [dependencies]
-agcli = "0.15.0"
+agcli = "0.16.0"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -148,6 +148,24 @@ Err(CommandError::new("no such issue", "NOT_FOUND", "Check the id")
   "exit_code": 3, "error": { "message": "no such issue", "code": "NOT_FOUND",
   "retryable": false }, "fix": "Check the id", "next_actions": [ ... ] }
 ```
+
+### Structured failure payloads
+
+`message` and `fix` are prose. When the failure also carries facts the agent
+must act on — which rows were rejected and why, what the server replied —
+attach them with `CommandError::data(...)` instead of writing them into the
+message for the caller to parse back out:
+
+```rust
+Err(CommandError::new("2 of 3 comments rejected", "PARTIAL_REJECT",
+        "Fix the line numbers and re-post the rejected comments")
+    .data(json!({ "rejected": [ { "line": 91, "why": "past end of file" } ] })))
+```
+
+The payload becomes a `data` key on the error envelope, next to `error` and
+`fix` — and on the NDJSON terminal `error` event, in the same place, so the
+failure reads the same whichever channel the caller chose. Set nothing and the
+key is absent.
 
 ## Bounded lists
 
@@ -278,6 +296,41 @@ contributes its exit code, so an optional subsystem cannot fail a `doctor` run
 for a caller that does not use it — and an agent is never told a thing was
 verified when nothing was.
 
+### A `doctor` with your own flags
+
+`doctor(checks)` hardcodes the command: named `doctor`, described "Run
+environment health checks", usage `<cli> doctor`, no flags. When the command
+needs to be yours — its own description, or a `--profile <name>` picking which
+credentials to verify — build the `Command` and pass it to
+`doctor_with(command, checks)`. agcli supplies only the handler that runs the
+checks and builds the report; `doctor(checks)` is now sugar over it.
+
+Declared flags reach the checks through `Check::with_request`, which hands the
+check the same `CommandRequest` a handler gets:
+
+```rust
+let doctor = Command::new("doctor", "Check the active or named profile")
+    .usage("app doctor [--profile=<name>]");
+
+let cli = AgentCli::new("app", "…").doctor_with(doctor, vec![
+    Check::with_request("profile", |req| {
+        let profile = req.flag("profile").unwrap_or("active").to_string();
+        Box::pin(async move {
+            match load_profile(&profile).await {
+                Some(p) => CheckResult::pass_with(format!("profile {p} resolves")),
+                None => CheckResult::fail("no such profile", "Run `app login`"),
+            }
+        })
+    })
+    .exit_code(ExitCode::AUTH),
+]);
+```
+
+Declaring the flag in the usage string is what makes it legal: unknown-flag
+rejection reads that string as the flag schema, so `app --profile ci doctor`
+fails with `UNKNOWN_FLAG` until `--profile` appears there. `Check::new` checks
+still work unchanged and can sit in the same list.
+
 `AgentCli::audit()` statically validates the command tree and returns an
 `AuditReport`: it flags dangling `next_action` templates (HATEOAS integrity),
 dead-end commands, unreachable subcommands under a raw command, and missing
@@ -295,7 +348,7 @@ agcli targets **macOS and Linux only**. The crate ships with optimized release/b
 
 ```toml
 [dependencies]
-agcli = "0.15.0"
+agcli = "0.16.0"
 
 [profile.release]
 opt-level = 3

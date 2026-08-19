@@ -856,6 +856,15 @@ pub struct CommandError {
     /// with [`CommandError::exit_code`] using an [`ExitCode`] constant so an
     /// agent can branch on the failure class without parsing the message.
     pub exit_code: Option<i32>,
+    /// Optional structured payload for the failure. `None` → the envelope has
+    /// no `data` key. Set it with [`CommandError::data`] when the failure
+    /// carries facts an agent should read rather than parse out of prose — the
+    /// three rejected line numbers, the server's reply, the conflicting id.
+    ///
+    /// Boxed on purpose: a `CommandError` sits in the `Err` arm of every
+    /// handler's `Result`, and an inline `Value` would widen that arm for
+    /// every command whether or not it carries a payload.
+    pub data: Option<Box<Value>>,
 }
 
 impl fmt::Display for CommandError {
@@ -879,11 +888,28 @@ impl CommandError {
             retryable: false,
             next_actions: Vec::new(),
             exit_code: None,
+            data: None,
         }
     }
 
     pub fn retryable(mut self, retryable: bool) -> Self {
         self.retryable = retryable;
+        self
+    }
+
+    /// Attach a structured payload, serialized as the envelope's `data` key.
+    ///
+    /// `message` and `fix` are prose an agent reads; `data` is the part it
+    /// should act on without parsing. A validation failure that rejected three
+    /// annotations can say so in the message and carry the three, with their
+    /// reasons, here. Omitted from the envelope when never set.
+    ///
+    /// ```ignore
+    /// CommandError::new("2 of 5 comments rejected", "PARTIAL_REJECT", "Fix the line numbers")
+    ///     .data(json!({ "rejected": [{ "line": 91, "why": "past end of file" }] }))
+    /// ```
+    pub fn data(mut self, data: impl Into<Value>) -> Self {
+        self.data = Some(Box::new(data.into()));
         self
     }
 
@@ -1393,61 +1419,114 @@ impl AgentCli {
     /// leaves `healthy` true and never contributes an exit code, so an optional
     /// subsystem cannot fail the run for a caller that does not use it. See
     /// [`Check`] and [`crate::CheckResult`].
+    ///
+    /// The command is fixed: named `doctor`, described "Run environment health
+    /// checks", usage `<cli> doctor`, no flags of its own. To name it, describe
+    /// it, or give it flags, build the [`Command`] yourself and pass it to
+    /// [`AgentCli::doctor_with`].
     pub fn doctor(self, checks: Vec<Check>) -> Self {
-        let usage = format!("{} doctor", self.name);
+        self.doctor_with(
+            Command::new("doctor", "Run environment health checks"),
+            checks,
+        )
+    }
+
+    /// Register a `doctor` command from a [`Command`] you supply, running
+    /// `checks` under it.
+    ///
+    /// Same report and same exit-code rules as [`AgentCli::doctor`] — this
+    /// version just lets the command be yours. The name, the description, the
+    /// usage string (and so the declared flags), the `next_actions`: all come
+    /// from `command`. agcli supplies only the handler, which runs the checks
+    /// and builds the health envelope; any handler already on `command` is
+    /// replaced.
+    ///
+    /// Declared flags reach the checks through
+    /// [`Check::with_request`]. Declaring them is what makes them legal —
+    /// unknown-flag rejection reads the usage string as the flag schema, so
+    /// `app --profile ci doctor` fails with `UNKNOWN_FLAG` until `--profile`
+    /// appears there:
+    ///
+    /// ```ignore
+    /// let doctor = Command::new("doctor", "Check the active or named profile")
+    ///     .usage("app doctor [--profile=<name>]");
+    /// let cli = AgentCli::new("app", "…").doctor_with(doctor, vec![
+    ///     Check::with_request("profile", |req| {
+    ///         let profile = req.flag("profile").map(str::to_string);
+    ///         Box::pin(async move { verify(profile.as_deref()).await })
+    ///     })
+    ///     .exit_code(ExitCode::AUTH),
+    /// ]);
+    /// ```
+    ///
+    /// A usage string is optional. Without one the framework fills in
+    /// `<cli> <name>`, which keeps flag validation on (declaring no flags)
+    /// rather than silently switching it off for the whole command.
+    pub fn doctor_with(self, command: Command, checks: Vec<Check>) -> Self {
+        debug_assert!(
+            !command.is_raw(),
+            "doctor command `{}` has a raw handler; the check-running handler replaces it",
+            command.name
+        );
+        let usage = command
+            .usage
+            .clone()
+            .unwrap_or_else(|| format!("{} {}", self.name, command.name));
         let checks = Arc::new(checks);
-        let mut command = Command::new("doctor", "Run environment health checks")
-            .usage(usage)
-            .handler(move |_req, _ctx| {
-                let checks = Arc::clone(&checks);
-                Box::pin(async move {
-                    let mut entries = Vec::with_capacity(checks.len());
-                    let mut healthy = true;
-                    let mut skipped = 0usize;
-                    let mut fail_exit: Option<i32> = None;
-                    for check in checks.iter() {
-                        let result = check.run().await;
-                        if result.failed() {
-                            healthy = false;
-                            // Prefer a specific (non-ERROR) exit code over the
-                            // generic ERROR so the shell sees the most
-                            // actionable failure class regardless of the order
-                            // checks were registered in.
-                            fail_exit = Some(match fail_exit {
-                                None => check.exit_code,
-                                Some(prev) if prev == ExitCode::ERROR => check.exit_code,
-                                Some(prev) => prev,
-                            });
-                        }
-                        if result.skipped() {
-                            skipped += 1;
-                        }
-                        let mut entry = Map::new();
-                        entry.insert("name".to_string(), json!(check.name()));
-                        entry.insert("status".to_string(), json!(result.status.as_str()));
-                        entry.insert("ok".to_string(), json!(result.is_ok()));
-                        if let Some(detail) = result.detail {
-                            entry.insert("detail".to_string(), json!(detail));
-                        }
-                        if let Some(fix) = result.fix {
-                            entry.insert("fix".to_string(), json!(fix));
-                        }
-                        entries.push(Value::Object(entry));
+        let mut command = command.usage(usage).handler(move |req, _ctx| {
+            let checks = Arc::clone(&checks);
+            Box::pin(async move {
+                let mut entries = Vec::with_capacity(checks.len());
+                let mut healthy = true;
+                let mut skipped = 0usize;
+                let mut fail_exit: Option<i32> = None;
+                for check in checks.iter() {
+                    let result = check.run(req).await;
+                    if result.failed() {
+                        healthy = false;
+                        // Prefer a specific (non-ERROR) exit code over the
+                        // generic ERROR so the shell sees the most
+                        // actionable failure class regardless of the order
+                        // checks were registered in.
+                        fail_exit = Some(match fail_exit {
+                            None => check.exit_code,
+                            Some(prev) if prev == ExitCode::ERROR => check.exit_code,
+                            Some(prev) => prev,
+                        });
                     }
-                    let mut output = CommandOutput::new(json!({
-                        "healthy": healthy,
-                        "skipped": skipped,
-                        "checks": entries,
-                    }));
-                    if !healthy {
-                        output = output.exit_code(fail_exit.unwrap_or(ExitCode::ERROR));
+                    if result.skipped() {
+                        skipped += 1;
                     }
-                    Ok(output)
-                })
-            });
+                    let mut entry = Map::new();
+                    entry.insert("name".to_string(), json!(check.name()));
+                    entry.insert("status".to_string(), json!(result.status.as_str()));
+                    entry.insert("ok".to_string(), json!(result.is_ok()));
+                    if let Some(detail) = result.detail {
+                        entry.insert("detail".to_string(), json!(detail));
+                    }
+                    if let Some(fix) = result.fix {
+                        entry.insert("fix".to_string(), json!(fix));
+                    }
+                    entries.push(Value::Object(entry));
+                }
+                let mut output = CommandOutput::new(json!({
+                    "healthy": healthy,
+                    "skipped": skipped,
+                    "checks": entries,
+                }));
+                if !healthy {
+                    output = output.exit_code(fail_exit.unwrap_or(ExitCode::ERROR));
+                }
+                Ok(output)
+            })
+        });
         // Never narrow the doctor report: `--select`/`--compact` must not be
         // able to strip the per-check `fix` strings from an unhealthy result.
         command.apply_reserved_projection = false;
+        // A raw handler would win over the one just installed and no check
+        // would ever run. The debug_assert above catches it in development;
+        // dropping it keeps a release build honest to the documented contract.
+        command.raw_handler = None;
         self.command(command)
     }
 
@@ -2081,22 +2160,24 @@ impl AgentCli {
                 let exit = error.exit_code.unwrap_or(ExitCode::ERROR);
                 let next_actions =
                     self.ensure_next_actions(error.next_actions, &path_strs, command);
+                let mut envelope = self.build_error_envelope(
+                    invocation.into_command_line(),
+                    error.message,
+                    error.code,
+                    error.fix,
+                    if error.retryable {
+                        Retryable::Yes
+                    } else {
+                        Retryable::No
+                    },
+                    exit,
+                    next_actions,
+                );
+                // The handler's structured payload rides along untouched: it is
+                // the part of the failure an agent acts on without parsing prose.
+                envelope.data = error.data.map(|payload| *payload);
                 Execution {
-                    envelope: self
-                        .build_error_envelope(
-                            invocation.into_command_line(),
-                            error.message,
-                            error.code,
-                            error.fix,
-                            if error.retryable {
-                                Retryable::Yes
-                            } else {
-                                Retryable::No
-                            },
-                            exit,
-                            next_actions,
-                        )
-                        .into(),
+                    envelope: envelope.into(),
                     raw: false,
                 }
             }

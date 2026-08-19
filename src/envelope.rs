@@ -404,6 +404,11 @@ pub struct ErrorEnvelope {
     /// `exit_code` field (alongside the failure class in `error.code`) and
     /// masked to 0–255 so it equals the process status.
     pub exit_code: i32,
+    /// Optional structured payload describing the failure — the rejected
+    /// rows, the upstream reply, the conflicting id. Serialized as the `data`
+    /// key and omitted entirely when `None`, so an error that has nothing
+    /// structured to add keeps the envelope it always had.
+    pub data: Option<Value>,
 }
 
 impl ErrorEnvelope {
@@ -422,11 +427,18 @@ impl ErrorEnvelope {
             fix: fix.into(),
             next_actions,
             exit_code: ExitCode::ERROR,
+            data: None,
         }
     }
 
     pub fn retryable(mut self, retryable: bool) -> Self {
         self.error.retryable = retryable;
+        self
+    }
+
+    /// Attach the structured `data` payload. See [`crate::CommandError::data`].
+    pub fn data(mut self, data: impl Into<Value>) -> Self {
+        self.data = Some(data.into());
         self
     }
 
@@ -444,7 +456,8 @@ impl ErrorEnvelope {
 impl Serialize for ErrorEnvelope {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let field_count = 7 + usize::from(self.schema_version.is_some());
+        let field_count =
+            7 + usize::from(self.schema_version.is_some()) + usize::from(self.data.is_some());
         let mut s = serializer.serialize_struct("ErrorEnvelope", field_count)?;
         s.serialize_field("ok", &false)?;
         s.serialize_field("command", &self.command)?;
@@ -455,6 +468,9 @@ impl Serialize for ErrorEnvelope {
         }
         s.serialize_field("error", &self.error)?;
         s.serialize_field("fix", &self.fix)?;
+        if let Some(ref data) = self.data {
+            s.serialize_field("data", data)?;
+        }
         s.serialize_field("next_actions", &self.next_actions)?;
         s.end()
     }
@@ -481,6 +497,8 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
             schema_version: Option<String>,
             error: ErrorBody,
             fix: String,
+            #[serde(default)]
+            data: Option<Value>,
             next_actions: Vec<NextAction>,
         }
         let raw = Raw::deserialize(deserializer)?;
@@ -497,6 +515,7 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
             fix: raw.fix,
             next_actions: raw.next_actions,
             exit_code: raw.exit_code,
+            data: raw.data,
         })
     }
 }
@@ -759,6 +778,32 @@ mod tests {
         let decoded: SuccessEnvelope = serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(original, decoded);
         assert_eq!(decoded.exit_code, 2);
+    }
+
+    #[test]
+    fn error_envelope_data_serializes_only_when_set() {
+        let bare = serde_json::to_value(ErrorEnvelope::new("cmd", "m", "C", "fix", vec![]))
+            .expect("must serialize");
+        assert!(
+            bare.get("data").is_none(),
+            "an unset payload must not add a key: {bare}"
+        );
+
+        let with_data = serde_json::to_value(
+            ErrorEnvelope::new("cmd", "m", "C", "fix", vec![]).data(json!({ "rejected": [91] })),
+        )
+        .expect("must serialize");
+        assert_eq!(with_data["data"], json!({ "rejected": [91] }));
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn error_envelope_data_roundtrips() {
+        let original = ErrorEnvelope::new("test cmd", "oops", "ERR", "fix it", vec![])
+            .data(json!({ "rejected": [{ "line": 91 }] }));
+        let json = serde_json::to_string(&original).expect("must serialize");
+        let decoded: ErrorEnvelope = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(original, decoded);
     }
 
     #[cfg(feature = "deserialize")]

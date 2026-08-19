@@ -44,6 +44,16 @@ release bump:
 changelog:
     git cliff --output CHANGELOG.md
 
+# Everything CI and the pre-commit hooks check, in one command.
+# `--doc` is here because nextest cannot run doctests: it would otherwise be
+# the one target nothing checks. Most rustdoc examples are ```ignore (they
+# reference the consumer's own helpers), so this compiles the rest.
+gate:
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -W clippy::all -W clippy::pedantic -D warnings
+    cargo nextest run --all-features
+    cargo test --all-features --doc
+
 # Dry-run publish check
 publish-check:
     cargo publish --dry-run

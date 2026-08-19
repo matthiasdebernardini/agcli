@@ -12,11 +12,20 @@
 //! a platform the check does not apply to. A skipped check is not a failure: it
 //! leaves `healthy` true and never drives the exit code. Folding "did not run"
 //! into "passed" would tell an agent something was verified when nothing was.
+//!
+//! A check may also read the invocation that triggered it.
+//! [`Check::with_request`] hands the check the same [`CommandRequest`] a
+//! handler gets, so a `doctor` command that declares its own flags — a
+//! `--profile <name>` selecting which credentials to verify — can act on them
+//! instead of always checking the default. Declare those flags on the
+//! [`crate::Command`] you pass to [`crate::AgentCli::doctor_with`]; the usage
+//! string is the flag schema.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::cli::CommandRequest;
 use crate::envelope::ExitCode;
 
 /// The three outcomes of a [`Check`]. Serialized into the `doctor` report as
@@ -116,13 +125,24 @@ impl CheckResult {
 
 type CheckFuture = Pin<Box<dyn Future<Output = CheckResult> + Send>>;
 type CheckFn = dyn Fn() -> CheckFuture + Send + Sync;
+type RequestCheckFn = dyn for<'a> Fn(&'a CommandRequest<'a>) -> Pin<Box<dyn Future<Output = CheckResult> + Send + 'a>>
+    + Send
+    + Sync;
+
+/// How a [`Check`] is invoked: on its own, or with the request that triggered
+/// the `doctor` run.
+#[derive(Clone)]
+enum CheckRunner {
+    Bare(Arc<CheckFn>),
+    WithRequest(Arc<RequestCheckFn>),
+}
 
 /// A single named health check with the exit code to use if it fails.
 #[derive(Clone)]
 pub struct Check {
     pub(crate) name: String,
     pub(crate) exit_code: i32,
-    pub(crate) runner: Arc<CheckFn>,
+    runner: CheckRunner,
 }
 
 impl Check {
@@ -141,7 +161,42 @@ impl Check {
         Self {
             name: name.into(),
             exit_code: ExitCode::ERROR,
-            runner: Arc::new(run),
+            runner: CheckRunner::Bare(Arc::new(run)),
+        }
+    }
+
+    /// Build a check that reads the invocation. `run` receives the same
+    /// [`CommandRequest`] a handler gets — flags, positionals, `dry_run()` —
+    /// so the check can verify what the caller asked about:
+    ///
+    /// ```ignore
+    /// Check::with_request("profile", |req| {
+    ///     let profile = req.flag("profile").map(str::to_string);
+    ///     Box::pin(async move {
+    ///         match load_profile(profile.as_deref()) {
+    ///             Some(p) => CheckResult::pass_with(format!("profile {p} resolves")),
+    ///             None => CheckResult::fail("no such profile", "Run `app login`"),
+    ///         }
+    ///     })
+    /// })
+    /// ```
+    ///
+    /// The flags a check reads must be declared in the usage string of the
+    /// [`crate::Command`] given to [`crate::AgentCli::doctor_with`], or the
+    /// framework rejects them as unknown before any check runs.
+    pub fn with_request<F>(name: impl Into<String>, run: F) -> Self
+    where
+        F: for<'a> Fn(
+                &'a CommandRequest<'a>,
+            ) -> Pin<Box<dyn Future<Output = CheckResult> + Send + 'a>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            name: name.into(),
+            exit_code: ExitCode::ERROR,
+            runner: CheckRunner::WithRequest(Arc::new(run)),
         }
     }
 
@@ -156,7 +211,10 @@ impl Check {
         &self.name
     }
 
-    pub(crate) async fn run(&self) -> CheckResult {
-        (self.runner)().await
+    pub(crate) async fn run(&self, req: &CommandRequest<'_>) -> CheckResult {
+        match &self.runner {
+            CheckRunner::Bare(run) => run().await,
+            CheckRunner::WithRequest(run) => run(req).await,
+        }
     }
 }

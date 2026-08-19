@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-agcli = "0.15.0"
+agcli = "0.16.0"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -181,3 +181,5 @@ cargo run --example calc -- add foo bar  # Error case (typed-error envelope)
 - **Streaming**: Use `NdjsonEmitter` for temporal operations; terminal `result`/`error` events carry `timestamp` and `schema_version`
 - **Raw passthrough**: `Command::raw_handler(|args, ctx| ...)` for a command that owes a foreign output contract (a ripgrep-compatible `grep`, a `cat`). It gets the verbatim argv tail, writes stdout itself, and returns its own exit code — no parsing, no envelope, no `next_actions`. It still shows up in the command tree, marked `"raw": true`. The handover is unconditional — `app grep -h pat`, `app --json grep -h pat`, and even a line the parser rejects all reach the handler; ask the framework with `app help grep` instead. End `main` with `cli.run_env().await.finish()` so a raw command's stdout is never followed by an envelope.
 - **Doctor skips**: `CheckResult::skip(reason)` reports a check that never ran. It keeps `healthy` true and never sets the exit code, so an optional subsystem cannot fail `doctor` for a caller that does not use it.
+- **Your own doctor**: `AgentCli::doctor_with(command, checks)` takes the `Command` from you — its name, description, and usage string, so `doctor` can declare flags like `[--profile=<name>]`. `Check::with_request(name, |req| ...)` hands a check the same `CommandRequest` a handler gets, so it can read them. `doctor(checks)` is sugar for a fixed, flagless command.
+- **Structured failures**: `CommandError::data(json!({...}))` attaches a `data` key to the error envelope for facts the agent acts on — the rejected rows, the upstream reply — instead of encoding them into `message`.

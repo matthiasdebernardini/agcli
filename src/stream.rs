@@ -78,6 +78,11 @@ pub enum StreamEvent {
         schema_version: Option<String>,
         error: ErrorBody,
         fix: String,
+        /// The failure's structured payload, mirroring
+        /// [`crate::ErrorEnvelope::data`]. The same failure must read the same
+        /// on both terminal channels: an agent that switched to NDJSON cannot
+        /// lose the facts the direct envelope would have handed it.
+        data: Option<Value>,
         next_actions: Vec<NextAction>,
     },
 }
@@ -178,9 +183,10 @@ impl Serialize for StreamEvent {
                 schema_version,
                 error,
                 fix,
+                data,
                 next_actions,
             } => {
-                let count = 8 + usize::from(schema_version.is_some());
+                let count = 8 + usize::from(schema_version.is_some()) + usize::from(data.is_some());
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("type", "error")?;
                 map.serialize_entry("ok", &false)?;
@@ -192,6 +198,11 @@ impl Serialize for StreamEvent {
                 }
                 map.serialize_entry("error", error)?;
                 map.serialize_entry("fix", fix)?;
+                // Between `fix` and `next_actions`, matching ErrorEnvelope's
+                // key order — the two channels serialize the same shape.
+                if let Some(payload) = data {
+                    map.serialize_entry("data", payload)?;
+                }
                 map.serialize_entry("next_actions", next_actions)?;
                 map.end()
             }
@@ -315,6 +326,7 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                     schema_version: opt_str_field(&value, "schema_version"),
                     error: parse_field(&value, "error", Value::Null)?,
                     fix: str_field(&value, "fix"),
+                    data: value.get("data").cloned(),
                     next_actions: parse_field(&value, "next_actions", Value::Array(vec![]))?,
                 })
             }
@@ -345,6 +357,7 @@ impl StreamEvent {
             schema_version: envelope.schema_version,
             error: envelope.error,
             fix: envelope.fix,
+            data: envelope.data,
             next_actions: envelope.next_actions,
         }
     }
@@ -665,6 +678,39 @@ mod tests {
         assert!(ts.ends_with('Z'), "timestamp must be RFC 3339 UTC: {ts}");
         assert_eq!(encoded["schema_version"], json!("v2.0"));
         assert_eq!(encoded["error"]["retryable"], json!(true));
+    }
+
+    #[test]
+    fn error_from_envelope_carries_the_structured_payload() {
+        // The two terminal channels must report the same failure the same way:
+        // an agent that switched to NDJSON cannot lose the facts the direct
+        // envelope would have given it.
+        let envelope = ErrorEnvelope::new("app post", "2 of 3 rejected", "PARTIAL", "fix", vec![])
+            .data(json!({ "rejected": [{ "line": 91 }] }));
+
+        let event = StreamEvent::error_from_envelope(envelope);
+        let encoded = serde_json::to_value(&event).expect("must serialize");
+        assert_eq!(encoded["data"]["rejected"][0]["line"], json!(91));
+
+        // Key order matches ErrorEnvelope: `data` sits between fix and
+        // next_actions.
+        let line = serde_json::to_string(&event).expect("must serialize");
+        let fix_at = line.find("\"fix\"").expect("fix key");
+        let data_at = line.find("\"data\"").expect("data key");
+        let actions_at = line.find("\"next_actions\"").expect("next_actions key");
+        assert!(fix_at < data_at && data_at < actions_at, "{line}");
+    }
+
+    #[test]
+    fn a_streamed_error_without_a_payload_has_no_data_key() {
+        // The shape existing NDJSON consumers already parse must not drift.
+        let envelope = ErrorEnvelope::new("cmd", "oops", "ERR", "fix it", vec![]);
+        let encoded = serde_json::to_value(StreamEvent::error_from_envelope(envelope))
+            .expect("must serialize");
+        assert!(
+            encoded.get("data").is_none(),
+            "unset payload must not add a key: {encoded}"
+        );
     }
 
     #[test]

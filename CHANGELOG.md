@@ -2,6 +2,52 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.16.0) - 2026-08-19
+
+The built-in `doctor` stops being a command the framework owns and becomes one
+the consumer owns, and a failure can carry structured facts instead of prose
+about them. Three public types gain a field, hence a **minor** bump pre-1.0.
+
+### Breaking changes
+
+- **`StreamEvent::Error` gains a `data: Option<Value>` field.** The NDJSON
+    terminal error carries the same payload as the direct envelope: the same
+    failure must not read differently because the caller chose the streaming
+    channel. Code matching the variant exhaustively must add `data` or a `..`
+    arm.
+- **`CommandError` and `ErrorEnvelope` gain a `data` field**
+    (`Option<Box<Value>>` and `Option<Value>` respectively — boxed on the error
+    type so the `Err` arm of every handler `Result` stays small). Code that
+    builds either with a struct literal, or destructures one exhaustively, must
+    add `data`. Builder calls (`CommandError::new(...)`,
+    `ErrorEnvelope::new(...)`) are unaffected, and an error that never sets a
+    payload serializes exactly as before.
+
+### Added
+
+- **`AgentCli::doctor_with(command, checks)`.** `doctor(checks)` hardcodes the
+    command — name, description, usage, and therefore *no flags* — so a CLI
+    whose `doctor` takes `--profile <name>` had nowhere to declare it:
+    unknown-flag rejection reads the usage string as the flag schema and exited
+    `2` on the consumer's own flag, and the description had to be smuggled into
+    a `root_field`. Now the `Command` is yours — name it, describe it, declare
+    flags and `next_actions` on it — and agcli supplies only the handler that
+    runs the checks and builds the health report. `doctor(checks)` is sugar over
+    it and behaves as before. Without a usage string the framework fills in
+    `<cli> <name>`, which keeps flag validation on rather than silently
+    disabling it.
+- **`Check::with_request(name, run)`.** A check that receives the same
+    `CommandRequest` a handler gets, so the flags declared on the `doctor`
+    command reach the checks that act on them. `Check::new` checks are unchanged
+    and can sit in the same list.
+- **`CommandError::data(value)` and `ErrorEnvelope::data(value)`.** A structured
+    payload for the failure — the rejected rows and why, the upstream reply, the
+    conflicting id — serialized as a `data` key beside `error` and `fix`. Prose
+    stays in `message` and `fix`; facts an agent acts on no longer have to be
+    encoded into the message text and parsed back out. The key is absent when
+    the payload is never set, on both the envelope and the NDJSON `error`
+    event.
+
 ## [0.15.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.15.0) - 2026-08-19
 
 Two escape hatches for contracts the envelope cannot express: a command that
