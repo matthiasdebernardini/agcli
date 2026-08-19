@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.15.0) - 2026-08-19
+
+Two escape hatches for contracts the envelope cannot express: a command that
+owes callers raw stdout, and a health check that never ran. Both change public
+types, hence a **minor** bump pre-1.0.
+
+### Breaking changes
+
+- **`CheckResult.ok: bool` is now `CheckResult.status: CheckStatus`.** Two
+    states could not tell "verified healthy" apart from "never ran", so a
+    check with no credentials to test had to lie in one direction or the
+    other. Construct with `CheckResult::pass()`, `::pass_with(detail)`,
+    `::fail(detail, fix)`, or the new `::skip(reason)`; read with `is_ok()`,
+    `failed()`, `skipped()`. Code matching on the `ok` field must move to
+    `status`.
+- **The `doctor` result gains a `skipped` count, and each check entry gains
+    `status`.** Entries keep `ok` (true unless the check failed), so an agent
+    reading `ok` still works, but a test asserting the exact shape of a
+    `doctor` result will see the new keys.
+
+### Added
+
+- **Raw passthrough commands: `Command::raw_handler(...)`.** Some commands owe
+    callers a foreign output contract — a ripgrep-compatible `grep` printing
+    `path:line:content` and exiting `1` for "no matches", a `cat`, a shim
+    around another program. Wrapping those in JSON does not make them
+    agent-native, it makes them wrong. A raw handler receives the verbatim
+    argv tail as `&[String]`, writes stdout itself, and returns the process
+    exit code. Flag parsing, unknown-flag rejection, positional-arity checks,
+    the `--dry-run` gate, the reserved `--select`/`--compact`/`--quiet`
+    projection, envelope serialization and `next_actions` are all skipped —
+    `-C 3`, `-t rust`, `-g '*.rs'`, `--`, and patterns starting with `-`
+    arrive untouched. The command still appears in the root tree (marked
+    `"raw": true`), in `help`, and in `audit()`. Panics are still caught: the
+    handler exits `1` and its `HANDLER_PANIC` envelope goes to stderr, never
+    onto the stdout it was writing.
+- **`Execution::is_raw()`, `::print()`, and `::finish()`.** `finish()` prints
+    the envelope and exits with the typed code — and prints nothing at all when
+    a raw command already wrote its own stdout, which a hand-rolled
+    `println!("{}", run.to_json())` would corrupt. It is now the recommended
+    ending for `main`.
+- **`CheckResult::skip(reason)` and `CheckStatus`.** A skipped check keeps
+    `healthy` true and never contributes its exit code, so an optional
+    subsystem cannot fail a `doctor` run for a caller that does not use it.
+- **`Command::is_raw()`** for downstream introspection.
+- **`audit()` reports `RAW_COMMAND_HAS_SUBCOMMANDS`** (error severity): a raw
+    handler consumes every token after its own name, so anything declared
+    under it is unreachable. `MISSING_USAGE` now covers raw commands too, and
+    the reserved-flag-redeclaration warning skips them (the framework parses
+    none of their flags).
+- **`--json` is documented in the root tree's `agent_flags`.** It was already
+    reserved, parsed as a boolean, and ignored — the property a CLI dropping
+    its own `--json` flag depends on, since a reserved boolean never consumes
+    the token after it (`app brain --json myrepo` keeps `myrepo` as a
+    positional). Now an introspecting agent can see that guarantee instead of
+    inferring it.
+
 ## [0.14.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.14.0) - 2026-07-28
 
 HATEOAS closes the projection gap: list envelopes now carry their own row
