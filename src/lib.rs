@@ -38,6 +38,7 @@ mod cli;
 mod doctor;
 mod envelope;
 mod project;
+mod skill;
 mod stream;
 mod truncate;
 

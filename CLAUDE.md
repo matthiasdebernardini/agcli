@@ -184,6 +184,17 @@ cargo run --example calc -- add foo bar  # Error case (typed-error envelope)
 - **List results advertise their row schema**: `CommandOutput::list`/`list_truncated` add a `fields` key holding the `--select` paths that cover a row — one sorted `items.<key>` dot path per distinct top-level key, e.g. `["items.id", "items.name"]` — and the framework appends a pre-filled `--select` `next_action` re-running that exact invocation, so an agent can make the cheaper projected call without first decoding a row. Dot paths because `--select` projects top-level keys: `--select=items.id,items.name` works, bare `id,name` hits the `select_warning`. The advertisement is suppressed when the caller already passed `--select`, under `--quiet`, and when reserved flags or the command's reserved projection are off; `fields` is emitted regardless
 - **Streaming**: Use `NdjsonEmitter` for temporal operations; terminal `result`/`error` events carry `timestamp` and `schema_version`. The emitter poisons itself on a write/flush error so a retry can't concatenate onto a corrupt NDJSON line
 
+### Bootstrap an agent
+
+`AgentCli::skill()` registers a `skill` command that prints the CLI as an agent skill — a `SKILL.md` file with YAML frontmatter, generated from the live command tree. Help becomes a skill: an agent that runs the binary once learns the whole surface, and the file cannot drift from the code because nobody writes it by hand.
+
+```bash
+cargo run --example calc -- skill                            # markdown in the envelope result
+cargo run --example calc -- skill --install=.claude/skills   # writes .claude/skills/calc/SKILL.md
+```
+
+The document carries the envelope contract, every command usage template (subcommands indented, raw commands marked), the reserved agent flags, and the exit-code and error-code dictionaries — the same tables the root tree publishes. It is rendered when the command runs, from the finished tree, so `.skill()` can sit anywhere in the builder chain. `--install` answers with the absolute `path` and its `bytes` instead of the markdown, and honors `--dry-run`. `cli.skill_markdown()` returns the same string for a test to pin.
+
 ## Performance
 
 agcli targets **macOS and Linux only**. The crate ships with optimized release/bench profiles. Downstream binaries get maximum runtime performance with these settings:

@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`AgentCli::skill()` — help becomes a skill.** Registers a built-in `skill`
+    command that prints the CLI as a Claude-Code/Agent-Skills style `SKILL.md`:
+    YAML frontmatter plus the envelope contract, every command usage template
+    (subcommands indented, raw commands marked), the reserved agent flags, and
+    the exit-code and error-code dictionaries — all generated from the live
+    command tree, so the file cannot drift from the code. An agent that can run
+    the binary once can bootstrap itself from it.
+- **`skill --install=<dir>`** writes `<dir>/<name>/SKILL.md`, creating the
+    directories, and answers with `{path, bytes, skill_name}` — the absolute
+    path and the size of the file, not the markdown a second time. A failed
+    write is a `WRITE_FAILED` error envelope, not a panic. An empty, bare
+    (`--install` with no value), or unexpanded-tilde (`--install=~/skills`)
+    directory is refused with `INVALID_FLAG` before anything is written.
+- **`skill` honors `--dry-run`**: it reports the `path` it would write, plus
+    `dry_run: true`, and touches no disk.
+- **`AgentCli::skill_markdown()`** returns the same document from Rust, for a
+    downstream test that pins the generated skill.
+- **`audit()` reports `SKILL_NAME_INVALID`** when a CLI that registered
+    `.skill()` has a name that is not a slug. The name is both the frontmatter
+    `name` a harness matches on and the directory `--install` writes into.
+
+### Changed
+
+- The root tree's `exit_codes` and `error_codes` dictionaries now come from
+    shared tables (`EXIT_CODE_DOCS`, `ERROR_CODE_DOCS`) that the skill renderer
+    reads too, so JSON and markdown cannot disagree. `error_codes` gains
+    `WRITE_FAILED`.
+
 ## [0.16.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.16.0) - 2026-08-19
 
 The built-in `doctor` stops being a command the framework owns and becomes one

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use tokio::fs;
 
 use crate::audit::{AuditReport, AuditSeverity};
 use crate::doctor::Check;
@@ -66,7 +67,7 @@ fn bool_flag_on(value: Option<&str>) -> bool {
 /// The framework-reserved agent-native flags with their semantics, in the
 /// order they appear in the self-documenting root tree. `--select` is a value
 /// flag; the rest are booleans (see [`RESERVED_BOOL_FLAGS`]).
-const RESERVED_FLAG_DOCS: &[(&str, &str)] = &[
+pub(crate) const RESERVED_FLAG_DOCS: &[(&str, &str)] = &[
     (
         "--select=<a,b,c>",
         "Project the result to only these fields (top-level keys or `a.b` dot paths; maps over arrays).",
@@ -98,6 +99,91 @@ const RESERVED_FLAG_DOCS: &[(&str, &str)] = &[
         "Accepted and ignored — output is always JSON. Reserved so a caller migrating off a `--json` flag keeps working.",
     ),
 ];
+
+/// The typed process exit codes, keyed by the number a shell sees in `$?`.
+/// Published in the root tree and in the generated skill so an agent can
+/// branch on `$?` without parsing error text (see [`ExitCode`]).
+pub(crate) const EXIT_CODE_DOCS: &[(&str, &str)] = &[
+    ("0", "success"),
+    ("1", "error (unclassified failure)"),
+    (
+        "2",
+        "usage (unknown command/subcommand/flag, bad or missing argument, unsupported --dry-run)",
+    ),
+    ("3", "not_found (a requested resource does not exist)"),
+    ("4", "auth (authentication or authorization failure)"),
+    ("5", "api (an upstream call failed)"),
+    ("7", "rate_limited (back off and retry)"),
+];
+
+/// The framework's conventional `error.code` values, so an agent can build a
+/// retry/branch policy from one root call instead of discovering codes one
+/// failure at a time.
+pub(crate) const ERROR_CODE_DOCS: &[(&str, &str)] = &[
+    ("PARSE_ERROR", "the command line could not be parsed"),
+    ("UNKNOWN_COMMAND", "no such command; fix lists valid names"),
+    (
+        "UNKNOWN_SUBCOMMAND",
+        "no such subcommand; fix lists valid names",
+    ),
+    (
+        "UNKNOWN_FLAG",
+        "flag not declared by this command; fix lists valid flags",
+    ),
+    (
+        "EXTRA_ARG",
+        "more positional arguments than the usage template declares",
+    ),
+    ("MISSING_ARG", "a required positional argument is absent"),
+    ("INVALID_ARG", "a positional argument failed to parse"),
+    ("INVALID_FLAG", "a flag value failed to parse"),
+    (
+        "MISSING_HANDLER",
+        "the command is a group with no runnable handler",
+    ),
+    (
+        "DRY_RUN_UNSUPPORTED",
+        "--dry-run passed to a command without a preview mode; nothing was changed",
+    ),
+    (
+        "HANDLER_PANIC",
+        "a bug in the command handler, not the invocation",
+    ),
+    (
+        "SERIALIZATION_FAILED",
+        "the handler's result could not be serialized",
+    ),
+    (
+        "WRITE_FAILED",
+        "the framework could not write a file the command was asked to produce",
+    ),
+];
+
+/// True when `name` matches `^[a-z0-9]+(-[a-z0-9]+)*$` — the slug shape an
+/// agent-skill harness accepts as a frontmatter `name` and a directory name.
+fn is_slug(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Turn a `(key, description)` doc table into a JSON object for the root tree.
+fn docs_object(docs: &[(&str, &str)]) -> Value {
+    Value::Object(
+        docs.iter()
+            .map(|(key, description)| {
+                (
+                    (*key).to_string(),
+                    Value::String((*description).to_string()),
+                )
+            })
+            .collect(),
+    )
+}
 
 /// Every framework-reserved flag name (without the leading `--`), for runtime
 /// discovery. These names are reserved whenever
@@ -1053,6 +1139,11 @@ pub struct Command {
     /// Opt out of extra-positional rejection for this command. Usage strings
     /// with a variadic tail (`...`) opt out implicitly.
     allow_extra_args: bool,
+    /// Marks the built-in `skill` command registered by [`AgentCli::skill`].
+    /// It renders the whole command tree, which no handler closure can see —
+    /// the closure is owned by the very tree it would have to read — so the
+    /// framework dispatches it itself, the way it dispatches root and help.
+    builtin_skill: bool,
 }
 
 use std::collections::BTreeMap;
@@ -1085,6 +1176,7 @@ impl Command {
             handles_dry_run: false,
             allow_unknown_flags: false,
             allow_extra_args: false,
+            builtin_skill: false,
         }
     }
 
@@ -1337,13 +1429,13 @@ impl Execution {
 /// Agent-native CLI runtime.
 #[derive(Clone)]
 pub struct AgentCli {
-    name: String,
-    description: String,
-    version: Option<String>,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) version: Option<String>,
     schema_version: Option<String>,
     commands: BTreeMap<String, Command>,
     root_extra: Map<String, Value>,
-    reserved_flags: bool,
+    pub(crate) reserved_flags: bool,
 }
 
 impl fmt::Debug for AgentCli {
@@ -1406,6 +1498,54 @@ impl AgentCli {
     pub fn root_field(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.root_extra.insert(key.into(), value.into());
         self
+    }
+
+    /// Register a built-in `skill` command that prints this CLI as an agent
+    /// skill: a `SKILL.md` document (YAML frontmatter plus markdown) generated
+    /// from the live command tree.
+    ///
+    /// Help becomes a skill. An agent that can run the binary once can learn
+    /// the whole surface — envelope contract, every command template, the
+    /// reserved flags, the exit and error codes — and a harness can load the
+    /// file directly:
+    ///
+    /// ```bash
+    /// mycli skill                          # markdown in the envelope result
+    /// mycli skill --install=.claude/skills # writes .claude/skills/mycli/SKILL.md
+    /// ```
+    ///
+    /// The document is rendered when the command runs, from the finished tree,
+    /// so `.skill()` can sit anywhere in the builder chain. `--install` writes
+    /// `<dir>/<name>/SKILL.md` and answers with the absolute `path` and its
+    /// `bytes` instead of the markdown; under `--dry-run` it reports the path
+    /// it would write and writes nothing.
+    pub fn skill(self) -> Self {
+        let usage = format!("{} skill [--install=<dir>]", self.name);
+        let mut command = Command::new("skill", "Print this CLI as an agent skill (SKILL.md)")
+            .usage(usage)
+            .handles_dry_run()
+            .default_next_action(NextAction::new(
+                self.name.clone(),
+                "Inspect the full command tree",
+            ));
+        command.builtin_skill = true;
+        self.command(command)
+    }
+
+    /// This CLI rendered as an agent skill (`SKILL.md`) — the same document
+    /// the built-in `skill` command returns. Useful in a downstream test that
+    /// pins the generated skill, or to write the file from your own code
+    /// without registering the command.
+    pub fn skill_markdown(&self) -> String {
+        crate::skill::render(self)
+    }
+
+    /// The root command tree as doc entries, for the skill renderer.
+    pub(crate) fn command_docs(&self) -> Vec<CommandDoc> {
+        let mut path_buf = Vec::new();
+        let mut docs = Vec::with_capacity(self.commands.len());
+        self.command_docs_into(&self.name, &mut path_buf, &self.commands, &mut docs, 0);
+        docs
     }
 
     /// Register a built-in `doctor` command that runs `checks` and reports a
@@ -1539,6 +1679,22 @@ impl AgentCli {
         let mut report = AuditReport::default();
         let mut path_buf: Vec<&str> = Vec::new();
         self.audit_commands(&self.commands, &mut path_buf, &mut report, 0);
+        // The CLI name becomes the generated skill's frontmatter `name` *and*
+        // the directory `--install` writes into. A harness rejects a name that
+        // is not a slug, so the skill would be dead on arrival.
+        if self.commands.get("skill").is_some_and(|c| c.builtin_skill) && !is_slug(&self.name) {
+            report.push(
+                AuditSeverity::Error,
+                "SKILL_NAME_INVALID",
+                "skill",
+                format!(
+                    "CLI name `{}` is not a slug (lowercase letters, digits, and single \
+                     hyphens between them); the generated SKILL.md frontmatter name and its \
+                     install directory would both be invalid",
+                    self.name
+                ),
+            );
+        }
         report
     }
 
@@ -1556,7 +1712,10 @@ impl AgentCli {
             path_buf.push(&command.name);
             let path = path_buf.join(" ");
 
-            let runnable = command.handler.is_some() || command.raw_handler.is_some();
+            // The built-in `skill` command is runnable without a handler of
+            // its own: the framework dispatches it (see `skill_execution`).
+            let runnable =
+                command.handler.is_some() || command.raw_handler.is_some() || command.builtin_skill;
             if !runnable && command.subcommands.is_empty() {
                 report.push(
                     AuditSeverity::Error,
@@ -1892,20 +2051,6 @@ impl AgentCli {
             );
         }
 
-        let handler = match &command.handler {
-            Some(value) => value,
-            None => {
-                return self.error_execution(
-                    invocation.command_line().to_string(),
-                    "command has no handler".to_string(),
-                    "MISSING_HANDLER",
-                    "Attach a handler for this command or route to a subcommand.",
-                    Retryable::No,
-                    self.root_actions(),
-                );
-            }
-        };
-
         let path_strs = path_refs(&resolved.path);
         let path_cmds = self.path_command_refs(&resolved.path);
 
@@ -2051,6 +2196,29 @@ impl AgentCli {
                 self.default_command_actions(&path_strs, command),
             );
         }
+
+        // The built-in `skill` command renders the live command tree, so the
+        // framework runs it here instead of through a handler: a handler
+        // closure is owned by the very tree it would have to read. It sits
+        // after the checks above so `skill` gets unknown-flag and extra-
+        // argument rejection like every other command.
+        if command.builtin_skill {
+            return self.skill_execution(&invocation).await;
+        }
+
+        let handler = match &command.handler {
+            Some(value) => value,
+            None => {
+                return self.error_execution(
+                    invocation.command_line().to_string(),
+                    "command has no handler".to_string(),
+                    "MISSING_HANDLER",
+                    "Attach a handler for this command or route to a subcommand.",
+                    Retryable::No,
+                    self.root_actions(),
+                );
+            }
+        };
 
         let request = CommandRequest {
             invocation: &invocation,
@@ -2377,6 +2545,118 @@ impl AgentCli {
         )
     }
 
+    /// Answer the built-in `skill` command: render the live command tree as a
+    /// `SKILL.md` document and, under `--install=<dir>`, write it to
+    /// `<dir>/<name>/SKILL.md`.
+    async fn skill_execution(&self, invocation: &Invocation) -> Execution {
+        let root_action = || NextAction::new(self.name.clone(), "Inspect the full command tree");
+
+        // No `--install`: the document itself is the answer.
+        let Some(raw_dir) = invocation.flag("install") else {
+            let result = json!({
+                "markdown": self.skill_markdown(),
+                "skill_name": self.name,
+            });
+            return self.framework_success(invocation, result, vec![root_action()]);
+        };
+
+        let dir = raw_dir.trim();
+        // A bare `--install` parses as the boolean sentinel `"true"`, which
+        // would write `./true/<name>/SKILL.md` — a wrong answer reported as a
+        // success. Refuse it, and tell the caller the spelling that works.
+        let bare = invocation.raw_args.iter().any(|arg| arg == "--install");
+        // `--install=~/skills` never reaches tilde expansion: a shell expands
+        // `~` only at the start of a word, not after `=`. A literal `~`
+        // directory is never what the caller meant.
+        let tilde = dir.split('/').next().is_some_and(|c| c.starts_with('~'));
+        if dir.is_empty() || (bare && dir == "true") || tilde {
+            let fix = if tilde {
+                format!(
+                    "Nothing was written. `~` is not expanded after `=` — pass an absolute \
+                     path: `{} skill --install=/absolute/path`.",
+                    self.name
+                )
+            } else {
+                format!(
+                    "Nothing was written. Pass the skills directory: \
+                     `{} skill --install=<dir>`.",
+                    self.name
+                )
+            };
+            return self.error_execution(
+                invocation.command_line().to_string(),
+                format!("--install needs a directory, got {raw_dir:?}"),
+                "INVALID_FLAG",
+                fix,
+                Retryable::No,
+                vec![root_action()],
+            );
+        }
+
+        // Absolute, so the reported path means the same thing to a caller with
+        // a different working directory.
+        let relative = Path::new(dir).join(&self.name).join("SKILL.md");
+        let file = match std::path::absolute(&relative) {
+            Ok(file) => file,
+            Err(error) => return self.write_failed(invocation, &relative, &error),
+        };
+
+        let markdown = self.skill_markdown();
+        let bytes = markdown.len();
+        let dry_run = self.reserved_flags && bool_flag_on(invocation.flag("dry-run"));
+        if !dry_run {
+            if let Some(parent) = file.parent()
+                && let Err(error) = fs::create_dir_all(parent).await
+            {
+                return self.write_failed(invocation, &file, &error);
+            }
+            if let Err(error) = fs::write(&file, markdown.as_bytes()).await {
+                return self.write_failed(invocation, &file, &error);
+            }
+        }
+
+        // The document is on disk (or would be): returning it inline again
+        // would double the envelope for nothing.
+        let mut result = Map::new();
+        result.insert(
+            "path".to_string(),
+            Value::String(file.display().to_string()),
+        );
+        result.insert("bytes".to_string(), Value::from(bytes));
+        result.insert("skill_name".to_string(), Value::String(self.name.clone()));
+        if dry_run {
+            result.insert("dry_run".to_string(), Value::Bool(true));
+        }
+        self.framework_success(invocation, Value::Object(result), vec![root_action()])
+    }
+
+    /// The `skill --install` write failed. Filesystem trouble is the caller's
+    /// to fix, so it carries [`ExitCode::ERROR`], not a usage code.
+    fn write_failed(
+        &self,
+        invocation: &Invocation,
+        file: &Path,
+        error: &std::io::Error,
+    ) -> Execution {
+        Execution {
+            envelope: self
+                .build_error_envelope(
+                    invocation.command_line().to_string(),
+                    format!("could not write {}: {error}", file.display()),
+                    "WRITE_FAILED",
+                    "Check the directory exists and is writable.",
+                    Retryable::No,
+                    ExitCode::ERROR,
+                    vec![NextAction::new(
+                        self.name.clone(),
+                        "Inspect the full command tree",
+                    )],
+                )
+                .into(),
+            raw: false,
+        }
+    }
+
     fn root_execution(&self, invocation: &Invocation) -> Execution {
         let result = self.root_result(invocation.program());
         self.framework_success(invocation, result, self.root_actions())
@@ -2501,41 +2781,11 @@ impl AgentCli {
             result.insert("agent_flags".to_string(), Value::Array(flags));
         }
 
-        // Publish the exit-code dictionary so an agent can branch on `$?`
-        // without parsing error text (see [`ExitCode`]).
-        result.insert(
-            "exit_codes".to_string(),
-            json!({
-                "0": "success",
-                "1": "error (unclassified failure)",
-                "2": "usage (unknown command/subcommand/flag, bad or missing argument, unsupported --dry-run)",
-                "3": "not_found (a requested resource does not exist)",
-                "4": "auth (authentication or authorization failure)",
-                "5": "api (an upstream call failed)",
-                "7": "rate_limited (back off and retry)"
-            }),
-        );
-
-        // Publish the framework's conventional error codes so an agent can
-        // build retry/branch policy from a single root call instead of
-        // discovering codes one failure at a time.
-        result.insert(
-            "error_codes".to_string(),
-            json!({
-                "PARSE_ERROR": "the command line could not be parsed",
-                "UNKNOWN_COMMAND": "no such command; fix lists valid names",
-                "UNKNOWN_SUBCOMMAND": "no such subcommand; fix lists valid names",
-                "UNKNOWN_FLAG": "flag not declared by this command; fix lists valid flags",
-                "EXTRA_ARG": "more positional arguments than the usage template declares",
-                "MISSING_ARG": "a required positional argument is absent",
-                "INVALID_ARG": "a positional argument failed to parse",
-                "INVALID_FLAG": "a flag value failed to parse",
-                "MISSING_HANDLER": "the command is a group with no runnable handler",
-                "DRY_RUN_UNSUPPORTED": "--dry-run passed to a command without a preview mode; nothing was changed",
-                "HANDLER_PANIC": "a bug in the command handler, not the invocation",
-                "SERIALIZATION_FAILED": "the handler's result could not be serialized"
-            }),
-        );
+        // Publish the exit-code and error-code dictionaries. Both come from
+        // the same tables the generated skill renders, so the JSON tree and
+        // the markdown can never disagree.
+        result.insert("exit_codes".to_string(), docs_object(EXIT_CODE_DOCS));
+        result.insert("error_codes".to_string(), docs_object(ERROR_CODE_DOCS));
 
         Value::Object(result)
     }
@@ -3068,17 +3318,17 @@ struct ResolvedCommand<'a> {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-struct CommandDoc {
+pub(crate) struct CommandDoc {
     name: String,
-    description: String,
-    usage: String,
+    pub(crate) description: String,
+    pub(crate) usage: String,
     /// Present (and true) only for [`Command::raw_handler`] commands, so an
     /// introspecting agent knows this one answers with raw stdout and its own
     /// exit code instead of a JSON envelope. Omitted for every other command.
     #[serde(skip_serializing_if = "is_false")]
-    raw: bool,
+    pub(crate) raw: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    subcommands: Vec<CommandDoc>,
+    pub(crate) subcommands: Vec<CommandDoc>,
 }
 
 fn is_false(value: &bool) -> bool {

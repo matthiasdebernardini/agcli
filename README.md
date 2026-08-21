@@ -340,6 +340,31 @@ usage/descriptions. Use it in a test:
 assert!(cli.audit().is_clean());
 ```
 
+## Bootstrap an agent
+
+`AgentCli::skill()` registers a `skill` command that prints the CLI as an agent
+skill — a `SKILL.md` file with YAML frontmatter, generated from the live command
+tree. Help becomes a skill: an agent that can run the binary once learns the
+whole surface, and the file cannot drift from the code because nobody writes it
+by hand.
+
+```bash
+calc skill                            # markdown inside the envelope result
+calc skill --install=.claude/skills   # writes .claude/skills/calc/SKILL.md
+```
+
+The document carries the envelope contract, every command usage template
+(subcommands indented, raw commands marked), the reserved agent flags, and the
+exit-code and error-code dictionaries — the same tables the root tree publishes.
+The document is rendered when the command runs, from the finished tree, so
+`.skill()` can sit anywhere in the builder chain. `cli.skill_markdown()`
+returns the same string from your own code, which is what a test pins.
+
+`--install` answers with the absolute `path` and its `bytes` instead of the
+markdown. Under `--dry-run` it reports the path it would write and writes
+nothing. `audit()` reports `SKILL_NAME_INVALID` when the CLI name is not a slug:
+the name is both the frontmatter `name` and the directory written into.
+
 ## Performance
 
 agcli targets **macOS and Linux only**. The crate ships with optimized release/bench profiles. To maximize runtime performance in a downstream binary:

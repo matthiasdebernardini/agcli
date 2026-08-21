@@ -8,6 +8,7 @@
 //! cargo run --example calc -- add 3 5
 //! cargo run --example calc -- sub 10 4
 //! cargo run --example calc -- add foo bar   # typed-error envelope
+//! cargo run --example calc -- skill         # this CLI as a SKILL.md
 //! ```
 
 use agcli::{ActionParam, AgentCli, Command, CommandError, CommandOutput, ExitCode, NextAction};
@@ -88,7 +89,8 @@ async fn main() {
                         ))
                     })
                 }),
-        );
+        )
+        .skill();
 
     let run = cli.run_env().await;
     println!("{}", run.to_json());
