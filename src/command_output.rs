@@ -465,6 +465,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_that_changes_nothing_in_a_hollow_selection_has_no_warning() {
+        // The selection is already hollow, but --compact removed nothing from
+        // it, so there is nothing to warn about.
+        let cli = AgentCli::new("app", "x").command(Command::new("get", "get").handler(
+            |_req| async move { Ok(CommandOutput::new(json!({ "h": [{}, {}], "x": 1 }))) },
+        ));
+        let run = cli.run(["app", "get", "--select=h", "--compact"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result, json!({ "h": [{}, {}] }));
+        assert!(envelope.select_warning.is_none());
+    }
+
+    #[tokio::test]
     async fn list_of_non_objects_has_no_fields_or_select_action() {
         let items = vec![json!("alpha"), json!("beta")];
         let run = list_cli(items, false).run(["app", "ls"]).await;

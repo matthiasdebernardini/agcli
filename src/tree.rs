@@ -29,13 +29,16 @@ impl AgentCli {
     /// The `UNKNOWN_FLAG` answer for a framework-rendered tree (root or
     /// version), or the tokens before a raw command's name, carrying a flag
     /// the framework does not reserve: none of them declare flags of their
-    /// own.
+    /// own. `known` names flags that are someone's without being the line's,
+    /// a raw command's own before its name, so they are not called unknown.
     pub(crate) fn framework_flag_error(
         &self,
         invocation: &Invocation,
+        known: &HashSet<String>,
         clock: &ClockFn,
     ) -> Option<Execution> {
-        let error = self.unknown_flag_error(invocation, &HashSet::new(), invocation.program())?;
+        let error =
+            self.unknown_flag_error(invocation, &HashSet::new(), known, invocation.program())?;
         Some(self.error_execution(
             invocation.command_line().to_string(),
             clock,
@@ -58,14 +61,18 @@ impl AgentCli {
             return match invocation.positionals() {
                 [unknown, ..] => self.unknown_command_execution(invocation, clock, unknown),
                 [] => self
-                    .framework_flag_error(invocation, clock)
+                    .framework_flag_error(invocation, &HashSet::new(), clock)
                     .unwrap_or_else(|| self.version_answer(invocation, clock)),
             };
         };
         let path_strs = dispatch::path_refs(resolved.path);
         if let Some(declared) = Self::declared_flags(&self.path_command_refs(resolved.path))
-            && let Some(error) =
-                self.unknown_flag_error(invocation, &declared, &path_strs.join(" "))
+            && let Some(error) = self.unknown_flag_error(
+                invocation,
+                &declared,
+                &HashSet::new(),
+                &path_strs.join(" "),
+            )
         {
             return self.error_execution(
                 invocation.command_line().to_string(),
@@ -99,7 +106,7 @@ impl AgentCli {
             );
         }
         // `version` names no command, so the flags are checked as the root's.
-        self.framework_flag_error(invocation, clock)
+        self.framework_flag_error(invocation, &HashSet::new(), clock)
             .unwrap_or_else(|| self.version_answer(invocation, clock))
     }
 
@@ -123,7 +130,7 @@ impl AgentCli {
     }
 
     pub(crate) fn root_execution(&self, invocation: &Invocation, clock: &ClockFn) -> Execution {
-        if let Some(error) = self.framework_flag_error(invocation, clock) {
+        if let Some(error) = self.framework_flag_error(invocation, &HashSet::new(), clock) {
             return error;
         }
         let result = self.root_result(invocation.program());
@@ -190,8 +197,12 @@ impl AgentCli {
     ) -> Execution {
         let path_strs: Vec<&str> = path.iter().map(String::as_str).collect();
         if let Some(declared) = Self::declared_flags(&self.path_command_refs(path))
-            && let Some(error) =
-                self.unknown_flag_error(invocation, &declared, &path_strs.join(" "))
+            && let Some(error) = self.unknown_flag_error(
+                invocation,
+                &declared,
+                &HashSet::new(),
+                &path_strs.join(" "),
+            )
         {
             return self.error_execution(
                 invocation.command_line().to_string(),

@@ -232,10 +232,10 @@ impl AgentCli {
     /// framework has answered for its own tokens: `prefix`, the parsed line up
     /// to the command's name, when the name was not the leading token. A help
     /// or version flag there is answered, a value that is not a boolean is
-    /// refused, a flag the command's usage declares is refused as one that
-    /// cannot reach it, any other flag the framework does not reserve is
-    /// unknown, as on the root line, and a reserved flag that cannot reach
-    /// the handler is refused. The command's own tokens, after its name, are never read.
+    /// refused, a flag neither the framework reserves nor the command's usage
+    /// declares is unknown, as on the root line, a flag the usage declares is
+    /// refused as one that cannot reach the command, and a reserved flag that
+    /// cannot reach the handler is refused. The command's own tokens, after its name, are never read.
     async fn raw_execution(
         &self,
         handler: &RawCommandHandler,
@@ -254,10 +254,11 @@ impl AgentCli {
             if let Some(execution) = self.framework_route(prefix, &**clock) {
                 return execution;
             }
-            if let Some(execution) = self.declared_prefix_flag(prefix, &**clock) {
+            let declared = self.raw_declared_flags(prefix);
+            if let Some(execution) = self.framework_flag_error(prefix, &declared, &**clock) {
                 return execution;
             }
-            if let Some(execution) = self.framework_flag_error(prefix, &**clock) {
+            if let Some(execution) = self.declared_prefix_flag(prefix, &declared, &**clock) {
                 return execution;
             }
             if let Some(execution) = self.undeliverable_prefix_flag(prefix, &**clock) {
@@ -311,14 +312,18 @@ impl AgentCli {
     /// own usage declares: it is not unknown, it is the command's, but it
     /// cannot reach the command from there. Reserved flags are left to
     /// [`Self::undeliverable_prefix_flag`], and nothing is refused when the
-    /// reserved flags are off, as no other flag there is.
-    fn declared_prefix_flag(&self, prefix: &Invocation, clock: &ClockFn) -> Option<Execution> {
+    /// reserved flags are off, as no other flag there is. `declared` is
+    /// [`Self::raw_declared_flags`].
+    fn declared_prefix_flag(
+        &self,
+        prefix: &Invocation,
+        declared: &HashSet<String>,
+        clock: &ClockFn,
+    ) -> Option<Execution> {
         if !self.reserved_flags {
             return None;
         }
         let resolved = self.resolve_command(prefix.positionals())?;
-        let mut declared = HashSet::new();
-        usage::extract_all_flag_names(resolved.command.usage.as_deref()?, &mut declared);
         let mut own: Vec<&str> = prefix
             .flags()
             .keys()
@@ -333,6 +338,19 @@ impl AgentCli {
             clock,
             error.next_actions(self.default_command_actions(&path, resolved.command)),
         ))
+    }
+
+    /// The flags the usage of the raw command `prefix` names declares, none
+    /// when it has no usage string.
+    fn raw_declared_flags(&self, prefix: &Invocation) -> HashSet<String> {
+        let mut declared = HashSet::new();
+        if let Some(usage) = self
+            .resolve_command(prefix.positionals())
+            .and_then(|resolved| resolved.command.usage.as_deref())
+        {
+            usage::extract_all_flag_names(usage, &mut declared);
+        }
+        declared
     }
 
     /// Run a normal or streaming handler on `request`, under the panic hook
@@ -616,9 +634,11 @@ impl AgentCli {
     }
 
     /// The `UNKNOWN_FLAG` error for the flags on `invocation` that neither
-    /// `declared` lists nor the framework reserves, or `None` when there are
-    /// none or the reserved flags are off. `scope` names who owns `declared`
-    /// in the fix (`calc add`, or the program for the root tree).
+    /// `declared` nor `known` lists and the framework does not reserve, or
+    /// `None` when there are none or the reserved flags are off. `scope`
+    /// names who owns `declared` in the fix (`calc add`, or the program for
+    /// the root tree); `known` flags are left out of it, as they are not
+    /// `scope`'s.
     ///
     /// Without this, a typo'd flag (`--lmit 3`) is silently dropped and the
     /// command runs with defaults: exit 0, wrong behavior, nothing for the
@@ -627,6 +647,7 @@ impl AgentCli {
         &self,
         invocation: &Invocation,
         declared: &HashSet<String>,
+        known: &HashSet<String>,
         scope: &str,
     ) -> Option<CommandError> {
         use std::fmt::Write as _;
@@ -637,6 +658,7 @@ impl AgentCli {
         let reserved = reserved_flags::reserved_flag_names();
         let allowed = |flag: &str| {
             declared.contains(flag)
+                || known.contains(flag)
                 || reserved_flags::is_framework_flag(flag)
                 || reserved.contains(&flag)
         };
@@ -695,8 +717,12 @@ impl AgentCli {
     /// [`Self::unknown_flag_error`]).
     fn reject_unknown_flags(&self, gate: &Gate<'_>) -> Option<Execution> {
         let declared = Self::declared_flags(gate.path_cmds)?;
-        let error =
-            self.unknown_flag_error(gate.invocation, &declared, &gate.path_strs.join(" "))?;
+        let error = self.unknown_flag_error(
+            gate.invocation,
+            &declared,
+            &HashSet::new(),
+            &gate.path_strs.join(" "),
+        )?;
         Some(self.gate_error(gate, error))
     }
 

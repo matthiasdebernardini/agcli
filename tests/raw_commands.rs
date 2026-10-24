@@ -402,6 +402,57 @@ async fn the_commands_own_flag_before_the_name_says_where_it_goes() {
 }
 
 #[tokio::test]
+async fn an_unknown_flag_before_the_name_is_reported_before_the_commands_own() {
+    // `--count` is grep's and `--bogus` nobody's: the unknown one is the more
+    // useful answer, and `--count` is not called unknown beside it.
+    let seen = Seen::default();
+    let cli = AgentCli::new("app", "Test CLI").command(
+        Command::new("grep", "Search the index")
+            .usage("app grep [--count] <pattern> [path...]")
+            .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+    );
+    let fixture = Fixture { cli, seen };
+    let (execution, seen) = run(&fixture, &["app", "--bogus=1", "--count", "grep", "pat"]).await;
+
+    assert!(!execution.is_raw());
+    assert!(seen.is_empty(), "the handler ran");
+    assert_eq!(execution.exit_code(), ExitCode::USAGE);
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(json["error"]["code"], json!("UNKNOWN_FLAG"), "{json}");
+    assert_eq!(json["error"]["message"], json!("unknown flag(s): --bogus"));
+    let fix = json["fix"].as_str().unwrap();
+    assert!(fix.contains("`app` takes no flags of its own."), "{fix}");
+}
+
+#[tokio::test]
+async fn the_commands_value_and_short_flags_before_the_name_say_where_they_go() {
+    let seen = Seen::default();
+    let cli = AgentCli::new("app", "Test CLI").command(
+        Command::new("grep", "Search the index")
+            .usage("app grep [--max=<n>] [-n <lines>] <pattern> [path...]")
+            .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+    );
+    let fixture = Fixture { cli, seen };
+    for (argv, flag) in [
+        (["app", "--max=2", "grep", "pat"].as_slice(), "--max"),
+        (["app", "-n", "3", "grep", "pat"].as_slice(), "-n"),
+    ] {
+        let (execution, seen) = run(&fixture, argv).await;
+        assert!(seen.is_empty(), "the handler ran for {argv:?}");
+        assert_eq!(execution.exit_code(), ExitCode::USAGE, "{argv:?}");
+        let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+        assert_eq!(json["error"]["code"], json!("INVALID_FLAG"), "{json}");
+        assert_eq!(
+            json["error"]["message"],
+            json!(format!(
+                "flag {flag} does not reach raw command `grep`: it receives only the tokens \
+                 after its name"
+            ))
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_nested_raw_command_is_named_by_its_path() {
     let seen = Seen::default();
     let cli = AgentCli::new("app", "Test CLI").command(

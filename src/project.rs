@@ -147,6 +147,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn is_hollow_sees_only_droppable_leaves() {
+        assert!(is_hollow(&json!(null)));
+        assert!(is_hollow(&json!([])));
+        assert!(is_hollow(&json!({})));
+        assert!(is_hollow(&json!({ "a": [{}, { "b": null }], "c": [] })));
+        assert!(!is_hollow(&json!({ "a": [{}, { "b": 0 }] })));
+        assert!(!is_hollow(&json!(false)));
+        // An empty string is kept by `--compact`, so it is not hollow.
+        assert!(!is_hollow(&json!("")));
+        assert!(!is_hollow(&json!({ "a": [""] })));
+    }
+
+    #[test]
     fn select_keeps_only_named_top_level_keys() {
         let value = json!({ "id": 1, "name": "x", "body": "long…" });
         let out = select(&value, &["id", "name"]);
