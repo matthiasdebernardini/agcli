@@ -253,6 +253,19 @@ fn a_slug_name_passes_the_audit_and_the_builder() {
     }
 }
 
+#[test]
+#[should_panic(expected = "CLI name \"My App\" is not a slug")]
+fn a_non_slug_name_cannot_register_the_skill() {
+    let _ = AgentCli::new("My App", "Test CLI").skill();
+}
+
+#[test]
+#[should_panic(expected = "CLI name \"a/b\" is not a slug")]
+fn a_name_with_a_path_separator_cannot_register_the_skill() {
+    // `--install` would write a nested `a/b/SKILL.md`.
+    let _ = AgentCli::new("a/b", "Test CLI").skill();
+}
+
 #[tokio::test]
 async fn install_into_an_unwritable_path_reports_write_failed() {
     let dir = scratch_dir("unwritable");

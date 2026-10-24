@@ -183,7 +183,7 @@ async fn a_help_flag_behind_a_global_flag_still_belongs_to_the_command() {
 async fn a_short_help_flag_behind_a_global_flag_belongs_to_the_command() {
     let (execution, seen) = run(
         &raw_cli(ExitCode::SUCCESS),
-        &["app", "--quiet", "grep", "-h", "pat"],
+        &["app", "--json", "grep", "-h", "pat"],
     )
     .await;
 
@@ -255,6 +255,190 @@ async fn a_non_boolean_before_the_name_is_refused_like_anywhere_else() {
 }
 
 #[tokio::test]
+async fn an_unknown_flag_before_the_name_is_refused_like_anywhere_else() {
+    // An undeclared flag is UNKNOWN_FLAG on every other line; before a raw
+    // command's name it used to be dropped and the command run.
+    let (execution, seen) = run(
+        &raw_cli(ExitCode::SUCCESS),
+        &["app", "--bogus=1", "grep", "pat"],
+    )
+    .await;
+
+    assert!(!execution.is_raw());
+    assert!(seen.is_empty(), "the handler ran");
+    assert_eq!(execution.exit_code(), ExitCode::USAGE);
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(json["error"]["code"], json!("UNKNOWN_FLAG"), "{json}");
+    assert_eq!(json["error"]["message"], json!("unknown flag(s): --bogus"));
+    assert_eq!(json["command"], json!("app --bogus=1 grep pat"));
+}
+
+#[tokio::test]
+async fn json_before_the_name_still_runs_the_command() {
+    // `--json` changes nothing anywhere, so it is accepted; every other
+    // reserved flag there is refused (below).
+    let (execution, seen) = run(
+        &raw_cli(ExitCode::SUCCESS),
+        &["app", "--json", "grep", "pat"],
+    )
+    .await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen, ["pat"]);
+
+    let (execution, seen) = run(
+        &raw_cli(ExitCode::SUCCESS),
+        &["app", "--quiet", "grep", "pat"],
+    )
+    .await;
+    assert!(!execution.is_raw());
+    assert!(seen.is_empty(), "the handler ran");
+}
+
+#[tokio::test]
+async fn dry_run_before_the_name_is_refused_and_nothing_runs() {
+    // A raw handler receives only the tokens after its name, so a
+    // `--dry-run` before it used to be dropped and the command run for real.
+    let (execution, seen) = run(
+        &raw_cli(ExitCode::SUCCESS),
+        &["app", "--dry-run", "grep", "pat"],
+    )
+    .await;
+
+    assert!(!execution.is_raw());
+    assert!(seen.is_empty(), "the handler ran");
+    assert_eq!(execution.exit_code(), ExitCode::USAGE);
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(
+        json["error"]["code"],
+        json!("DRY_RUN_UNSUPPORTED"),
+        "{json}"
+    );
+    assert!(
+        json["fix"]
+            .as_str()
+            .unwrap()
+            .contains("receives only the tokens after its name"),
+        "{json}"
+    );
+    assert_eq!(
+        json["next_actions"][0]["command"],
+        json!("app grep [rg-flags...] <pattern> [path...]"),
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn a_reserved_flag_before_the_name_is_refused_as_undeliverable() {
+    for argv in [
+        &["app", "--yes", "grep", "pat"][..],
+        &["app", "--select=x", "--json", "grep", "pat"],
+        &["app", "--no-color=false", "grep", "pat"],
+    ] {
+        let fixture = raw_cli(ExitCode::SUCCESS);
+        let (execution, seen) = run(&fixture, argv).await;
+
+        assert!(!execution.is_raw(), "{argv:?}");
+        assert!(seen.is_empty(), "the handler ran: {argv:?}");
+        assert_eq!(execution.exit_code(), ExitCode::USAGE, "{argv:?}");
+        let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+        assert_eq!(json["error"]["code"], json!("INVALID_FLAG"), "{json}");
+        assert_eq!(json["command"], json!(argv.join(" ")), "{argv:?}");
+    }
+
+    let (execution, _) = run(
+        &raw_cli(ExitCode::SUCCESS),
+        &["app", "--yes", "grep", "pat"],
+    )
+    .await;
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(
+        json["error"]["message"],
+        json!(
+            "flag --yes does not reach raw command `grep`: it receives only the tokens after \
+             its name"
+        )
+    );
+    assert_eq!(
+        json["fix"],
+        json!("Drop it, or pass it after `grep` if that command takes it.")
+    );
+}
+
+#[tokio::test]
+async fn a_nested_raw_command_is_named_by_its_path() {
+    let seen = Seen::default();
+    let cli = AgentCli::new("app", "Test CLI").command(
+        Command::new("code", "Code tools")
+            .usage("app code <subcommand>")
+            .subcommand(
+                Command::new("grep", "Search")
+                    .usage("app code grep [args...]")
+                    .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+            ),
+    );
+    let (execution, seen) = run(
+        &Fixture { cli, seen },
+        &["app", "--stdin", "code", "grep", "pat"],
+    )
+    .await;
+
+    assert!(seen.is_empty(), "the handler ran");
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(
+        json["error"]["message"],
+        json!(
+            "flag --stdin does not reach raw command `code grep`: it receives only the tokens \
+             after its name"
+        )
+    );
+}
+
+#[tokio::test]
+async fn without_reserved_flags_a_reserved_name_before_the_name_is_not_gated() {
+    let seen = Seen::default();
+    let cli = AgentCli::new("app", "Test CLI")
+        .without_reserved_flags()
+        .command(
+            Command::new("grep", "Search the index (ripgrep-compatible output)")
+                .usage("app grep [rg-flags...] <pattern> [path...]")
+                .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+        );
+    let (execution, seen) = run(
+        &Fixture { cli, seen },
+        &["app", "--dry-run=1", "grep", "pat"],
+    )
+    .await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen, ["pat"]);
+}
+
+#[tokio::test]
+async fn an_unknown_flag_after_the_name_is_the_commands() {
+    let (execution, seen) = run(&raw_cli(ExitCode::SUCCESS), &["app", "grep", "--bogus"]).await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen, ["--bogus"]);
+}
+
+#[tokio::test]
+async fn without_reserved_flags_an_unknown_flag_before_the_name_is_not_gated() {
+    let seen = Seen::default();
+    let cli = AgentCli::new("app", "Test CLI")
+        .without_reserved_flags()
+        .command(
+            Command::new("grep", "Search the index (ripgrep-compatible output)")
+                .usage("app grep [rg-flags...] <pattern> [path...]")
+                .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+        );
+    let (execution, seen) = run(&Fixture { cli, seen }, &["app", "--bogus=1", "grep", "pat"]).await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen, ["pat"]);
+}
+
+#[tokio::test]
 async fn a_malformed_token_before_the_name_is_the_frameworks_parse_error() {
     // The command owns a malformed token after its name
     // (`a_line_the_parser_rejects_still_reaches_the_handler`); before it,
@@ -284,12 +468,21 @@ async fn a_line_the_parser_rejects_still_reaches_the_handler() {
 
 #[tokio::test]
 async fn a_value_flag_may_repeat_the_command_name() {
-    // `--select` eats the first `grep` as its value; the second is the
+    // `--profile` eats the first `grep` as its value; the second is the
     // command. Splitting argv by searching for the command name would hand the
     // handler ["grep", "pat"]; the parser's positional indices get it right.
+    // Without the reserved flags no flag before the name is refused.
+    let seen = Seen::default();
+    let cli = AgentCli::new("app", "Test CLI")
+        .without_reserved_flags()
+        .command(
+            Command::new("grep", "Search the index (ripgrep-compatible output)")
+                .usage("app grep [rg-flags...] <pattern> [path...]")
+                .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+        );
     let (execution, seen) = run(
-        &raw_cli(ExitCode::SUCCESS),
-        &["app", "--select", "grep", "grep", "pat"],
+        &Fixture { cli, seen },
+        &["app", "--profile", "grep", "grep", "pat"],
     )
     .await;
 
@@ -298,15 +491,20 @@ async fn a_value_flag_may_repeat_the_command_name() {
 }
 
 #[tokio::test]
-async fn an_undeclared_flag_may_repeat_the_command_name() {
+async fn an_undeclared_flag_eating_a_repeated_name_is_refused() {
+    // `--unknownflag` takes the first `grep` as its value, so the second is
+    // the command. The flag is still unknown, and before the name it is the
+    // framework's to refuse, not grep's to run without.
     let (execution, seen) = run(
         &raw_cli(ExitCode::SUCCESS),
         &["app", "--unknownflag", "grep", "grep", "pat"],
     )
     .await;
 
-    assert!(execution.is_raw());
-    assert_eq!(seen, ["pat"]);
+    assert!(!execution.is_raw());
+    assert!(seen.is_empty(), "the handler ran");
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(json["error"]["code"], json!("UNKNOWN_FLAG"), "{json}");
 }
 
 #[tokio::test]
@@ -572,7 +770,7 @@ fn stdout_is_raw_end_to_end() {
     // before the command name, `--help`, and a line the parser rejects.
     for args in [
         vec!["--json", "echo", "--help"],
-        vec!["--quiet", "echo", "-h"],
+        vec!["--json", "echo", "-h"],
         vec!["--json", "echo", "--=x"],
     ] {
         let out = run_app(&args);

@@ -79,7 +79,9 @@ pub(crate) fn render(cli: &AgentCli) -> String {
     if any_raw(&docs) {
         out.push_str(
             "- A command marked raw prints its own output and exits with its own code: no \
-             envelope and no `next_actions`. Read its stdout as that tool's output.\n",
+             envelope and no `next_actions`. Read its stdout as that tool's output. It \
+             receives only the tokens after its name: put its flags there. Before the name, \
+             a reserved flag other than `--json` is refused.\n",
         );
     }
     let _ = writeln!(

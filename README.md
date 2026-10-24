@@ -593,7 +593,7 @@ Every command accepts these flags without declaring them:
 | Flag | What happens |
 |------|--------------|
 | `--select=<a,b,c>` | The result is projected to these top-level keys or `a.b` dot paths, mapped over arrays. A miss is reported in `select_warning`, below. |
-| `--compact` | `null` values and empty containers are dropped from the result, or only the command's `CommandOutput::compact_fields` are kept. Beside `--select` it only drops nulls and empty containers from the selection. |
+| `--compact` | `null` values and empty containers are dropped from the result, or only the command's `CommandOutput::compact_fields` are kept. Beside `--select` it only drops nulls and empty containers from the selection; when that would empty the selection, the selection is returned uncompacted with a `select_warning`. |
 | `--quiet` | A successful answer has no `next_actions`. Errors keep theirs: they are how the agent recovers. |
 | `--dry-run` | Refused with `DRY_RUN_UNSUPPORTED` unless the command declares `handles_dry_run()`. The handler reads `req.dry_run()`. |
 | `--yes`, `--no-input` | Read by the handler with `req.assume_yes()`. |
@@ -683,6 +683,10 @@ assert_eq!(refused.error.code, ErrorCode::DRY_RUN_UNSUPPORTED);
 - **`--dry-run` is a promise**: preview, change nothing. The framework cannot
   know whether a handler keeps it, so it refuses the flag, and runs nothing,
   unless the command or one of its parents declares `handles_dry_run()`.
+- **Before a raw command's name they are refused**, because a raw handler
+  receives only the tokens after its name: `--dry-run` is
+  `DRY_RUN_UNSUPPORTED`, and the rest but `--json` are `INVALID_FLAG` (see
+  [Raw commands](#raw-commands)).
 - **`--select` and `--compact` never touch the `doctor` report**, so a
   projection cannot hide a failing check's fix.
 - **The booleans take only boolean spellings**: `true`/`false`, `1`/`0`,
@@ -952,8 +956,8 @@ What the framework skips for a raw command, and why that matters:
 | Flag parsing | `-C 3`, `-t rust`, `-g '*.rs'`, `--` and patterns that start with `-` arrive untouched and in order. |
 | Unknown-flag rejection | An unknown flag is the handler's business. |
 | Positional checks | No `EXTRA_ARG` on a long argument list. |
-| The `--dry-run` gate | The token is passed through like any other. |
-| `--select`, `--compact`, `--quiet` | There is no envelope to project. |
+| The `--dry-run` gate | After the name, the token is passed through like any other. Before the name it is `DRY_RUN_UNSUPPORTED`, below. |
+| `--select`, `--compact`, `--quiet` | There is no envelope to project. Before the name they are `INVALID_FLAG`, below. |
 | The envelope and `next_actions` | Stdout carries exactly what the handler printed. |
 
 The command still appears in the tree (marked `"raw": true`), in help, and in
@@ -965,11 +969,22 @@ The command still appears in the tree (marked `"raw": true`), in help, and in
   name belong to the command. Before the name, the tokens are the framework's:
   `app --help grep` answers help for `grep` (as `app help grep` does),
   `app -V grep` the version, `app --quiet=maybe grep pat` is `INVALID_FLAG`,
-  and `app --=x grep pat` is `PARSE_ERROR`.
+  `app --=x grep pat` is `PARSE_ERROR`, and `app --bogus=1 grep pat` is
+  `UNKNOWN_FLAG`.
+- A raw handler receives only the tokens after its name, so a reserved agent
+  flag before the name could reach nothing, and is refused instead of dropped.
+  Nothing runs. `app --dry-run grep pat` is `DRY_RUN_UNSUPPORTED`: if `grep`
+  has a preview flag of its own, pass that after its name. Every other
+  reserved flag there (`--select`, `--compact`, `--quiet`, `--yes`,
+  `--no-input`, `--no-cache`, `--no-color`, `--stdin`) is `INVALID_FLAG`:
+  drop it, or pass it after the name if the command takes it. Only `--json`,
+  which changes nothing anywhere, `--help` and `--version` are accepted
+  before the name. Under `without_reserved_flags()`, no flag there is
+  refused.
 - One shape cannot work. A flag before the name that the framework does not
   know as a boolean takes the next token as its value, so
   `app --profile grep pat` reads `grep` as the value of `--profile` and names no
-  raw command. Write `--profile=<value>`, or put such flags after the name.
+  raw command. Put such flags after the name, where they are the command's.
 - To forward a child process's status, convert `status.code()` with
   `ExitCode::try_from`. It is `None` when a signal killed the child; what that
   means is the command's to decide.

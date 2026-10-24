@@ -121,7 +121,7 @@ pub(crate) fn compact(value: &Value) -> Value {
 
 /// True for values that carry no signal once compacted: `null` and empty
 /// containers. Empty strings and falsy scalars are retained on purpose.
-fn is_droppable(value: &Value) -> bool {
+pub(crate) fn is_droppable(value: &Value) -> bool {
     match value {
         Value::Null => true,
         Value::Object(map) => map.is_empty(),

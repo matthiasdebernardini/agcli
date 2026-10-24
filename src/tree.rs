@@ -27,9 +27,14 @@ impl AgentCli {
     }
 
     /// The `UNKNOWN_FLAG` answer for a framework-rendered tree (root or
-    /// version) carrying a flag the framework does not reserve: those answers
-    /// declare no flags of their own.
-    fn framework_flag_error(&self, invocation: &Invocation, clock: &ClockFn) -> Option<Execution> {
+    /// version), or the tokens before a raw command's name, carrying a flag
+    /// the framework does not reserve: none of them declare flags of their
+    /// own.
+    pub(crate) fn framework_flag_error(
+        &self,
+        invocation: &Invocation,
+        clock: &ClockFn,
+    ) -> Option<Execution> {
         let error = self.unknown_flag_error(invocation, &HashSet::new(), invocation.program())?;
         Some(self.error_execution(
             invocation.command_line().to_string(),

@@ -295,13 +295,26 @@ impl Command {
     /// with their own tokens. `--help`, `-h`, `--version` and `-V` are the
     /// command's too; ask the framework with `app help grep` instead.
     ///
+    /// The tokens before the command's name are the framework's. A help or
+    /// version flag there is answered, a reserved boolean given a value that
+    /// is not a boolean is `INVALID_FLAG`, a malformed token is
+    /// `PARSE_ERROR`, and a flag that is neither reserved nor the framework's
+    /// own is `UNKNOWN_FLAG`: `app --bogus=1 grep pat` does not run the
+    /// handler. The handler receives only the tokens after its name, so a
+    /// reserved agent flag before the name could reach nothing and is refused
+    /// instead: `--dry-run` is `DRY_RUN_UNSUPPORTED` (pass the command's own
+    /// preview flag after its name, if it has one), and every other one but
+    /// `--json` is `INVALID_FLAG`. Nothing runs. Under
+    /// [`AgentCli::without_reserved_flags`](crate::AgentCli::without_reserved_flags)
+    /// no flag there is refused.
+    ///
     /// One shape cannot work: a flag before the command's name that the
     /// framework does not know as a boolean (not a reserved flag, not a
     /// `[--flag]` in a usage string) takes the next token as its value, as
     /// `--key value` always does. `app --profile grep pat` reads `grep` as the
     /// value of `--profile`, so no raw command is named and the line goes to
-    /// normal dispatch. Write `--profile=<value>`, or put such flags after
-    /// the command's name, where they are the handler's.
+    /// normal dispatch. Put such flags after the command's name, where they
+    /// are the handler's.
     ///
     /// The command still appears in the root command tree (marked
     /// `"raw": true`), in `help`, and in

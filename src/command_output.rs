@@ -395,6 +395,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_that_empties_the_selection_keeps_it_with_a_warning() {
+        // `--select=note --compact` on a null `note` used to answer
+        // `result: {}` without a word, as if `note` did not exist.
+        let cli = AgentCli::new("app", "x").command(Command::new("get", "get").handler(
+            |_req| async move {
+                Ok(
+                    CommandOutput::new(json!({ "id": 1, "name": "x", "note": null, "tags": [] }))
+                        .compact_fields(["id", "name"]),
+                )
+            },
+        ));
+        let run = cli
+            .run(["app", "get", "--select=note,tags", "--compact"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result, json!({ "note": null, "tags": [] }));
+        assert_eq!(
+            envelope.select_warning.as_deref(),
+            Some(
+                "--compact removed every selected field because they were null or empty. \
+                 Returning the selection uncompacted."
+            )
+        );
+
+        // Beside a partial miss, both warnings are kept.
+        let run = cli
+            .run(["app", "get", "--select=note,zzz", "--compact"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result, json!({ "note": null }));
+        let warning = envelope.select_warning.as_deref().unwrap();
+        assert!(warning.contains("zzz"), "{warning}");
+        assert!(
+            warning.ends_with("Returning the selection uncompacted."),
+            "{warning}"
+        );
+    }
+
+    #[tokio::test]
     async fn list_of_non_objects_has_no_fields_or_select_action() {
         let items = vec![json!("alpha"), json!("beta")];
         let run = list_cli(items, false).run(["app", "ls"]).await;

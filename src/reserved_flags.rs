@@ -26,9 +26,14 @@ const RESERVED_VALUE_FLAG: &str = "select";
 /// reports a usage that declares one.
 pub(crate) const FRAMEWORK_FLAG_NAMES: &[&str] = &["help", "h", "version", "V"];
 
+/// True for any reserved agent flag, the value flag included.
+pub(crate) fn is_reserved(flag: &str) -> bool {
+    RESERVED_FLAG_NAMES.contains(&flag)
+}
+
 /// True for a reserved agent flag the parser reads as a boolean.
 pub(crate) fn is_reserved_bool(flag: &str) -> bool {
-    flag != RESERVED_VALUE_FLAG && RESERVED_FLAG_NAMES.contains(&flag)
+    flag != RESERVED_VALUE_FLAG && is_reserved(flag)
 }
 
 /// True for one of the framework's own flags ([`FRAMEWORK_FLAG_NAMES`]).
@@ -109,7 +114,7 @@ pub(crate) const RESERVED_FLAG_DOCS: &[(&str, &str)] = &[
     ),
     (
         "--compact",
-        "Drop null values and empty containers from the result, or keep only the fields the command declares with `compact_fields`. Beside `--select` it only drops nulls and empty containers from the selection.",
+        "Drop null values and empty containers from the result, or keep only the fields the command declares with `compact_fields`. Beside `--select` it only drops nulls and empty containers from the selection, and when that would empty the selection it returns the selection uncompacted with a `select_warning`.",
     ),
     (
         "--quiet",

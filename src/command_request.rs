@@ -165,14 +165,15 @@ impl CommandRequest {
     }
 
     /// Parse flag `key` into `T` when present. `Ok(None)` when the flag is
-    /// absent; `INVALID_FLAG` when present but unparseable or non-finite
-    /// (see [`Self::arg_parse`]).
+    /// absent; `INVALID_FLAG` when given bare, with no value, or present but
+    /// unparseable or non-finite (see [`Self::arg_parse`]).
     ///
     /// # Errors
     ///
-    /// `INVALID_FLAG` (exit code [`ExitCode::USAGE`]) when the flag is present
-    /// but does not parse as `T` (the message carries `T`'s parse error), or
-    /// parses to an infinite or NaN float.
+    /// `INVALID_FLAG` (exit code [`ExitCode::USAGE`]) when the flag is given
+    /// with no value (`--limit` alone, which [`Self::flag`] reads as
+    /// `"true"`), when it does not parse as `T` (the message carries `T`'s
+    /// parse error), or when it parses to an infinite or NaN float.
     pub fn flag_parse<T>(&self, key: &str) -> Result<Option<T>, CommandError>
     where
         T: FromStr + Any,
@@ -182,6 +183,15 @@ impl CommandRequest {
             None => Ok(None),
             Some(raw) => {
                 let flag = usage::flag_display(key);
+                // A bare flag reads as "true" but carries no value.
+                if !raw.is_empty() && self.invocation.value_flag(key) == Some("") {
+                    return Err(CommandError::new(
+                        ErrorCode::INVALID_FLAG,
+                        format!("flag {flag} was given no value"),
+                        format!("Pass a value: {flag}=<value>"),
+                    )
+                    .exit_code(ExitCode::USAGE));
+                }
                 let value = raw.parse::<T>().map_err(|err| {
                     CommandError::new(
                         ErrorCode::INVALID_FLAG,
@@ -446,6 +456,39 @@ mod tests {
             .flag_parse::<usize>("lines")
             .unwrap_err();
         assert_eq!(error.fix, "Pass a valid value for --lines.");
+    }
+
+    #[test]
+    fn flag_parse_refuses_a_bare_flag_as_given_no_value() {
+        // A bare value flag reads as "true"; the error used to blame that
+        // value, which nobody typed.
+        let error = request(&["app", "--limit"])
+            .flag_parse::<usize>("limit")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::INVALID_FLAG);
+        assert_eq!(error.exit_code, Some(ExitCode::USAGE));
+        assert_eq!(error.message, "flag --limit was given no value");
+        assert_eq!(error.fix, "Pass a value: --limit=<value>");
+
+        let error = request(&["app", "-n"])
+            .flag_parse::<usize>("n")
+            .unwrap_err();
+        assert_eq!(error.message, "flag -n was given no value");
+        assert_eq!(error.fix, "Pass a value: -n=<value>");
+
+        // A typed value is still the one parsed, even when it spells "true".
+        assert_eq!(
+            request(&["app", "--name=true"])
+                .flag_parse::<String>("name")
+                .unwrap(),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            request(&["app", "--limit", "5"])
+                .flag_parse::<usize>("limit")
+                .unwrap(),
+            Some(5)
+        );
     }
 
     // --- Standard flag accessors ---

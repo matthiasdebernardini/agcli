@@ -432,6 +432,36 @@ On the wire, for agents and the programs that read agcli output:
     the full command tree", like every other root action.
 - **The pre-commit hooks and `just publish-check` build through `mbx`**, like
     the gate.
+- **An unknown flag before a raw command's name is `UNKNOWN_FLAG`**, with
+    the fix the root line gives, and the handler does not run. Under
+    `without_reserved_flags()` nothing is refused. Flags after the name stay
+    the command's.
+
+    `app --bogus=1 grep pat` ran grep with `pat` and dropped `--bogus=1`; it
+    is now `UNKNOWN_FLAG`.
+- **A reserved agent flag before a raw command's name is refused, not
+    dropped.** A raw handler receives only the tokens after its name, so the
+    flag could reach nothing. `--dry-run` there is `DRY_RUN_UNSUPPORTED`, and
+    every other reserved flag but `--json` is `INVALID_FLAG`; nothing runs.
+    `--json`, `--help` and `--version` stay accepted, and under
+    `without_reserved_flags()` nothing is refused.
+
+    `app --dry-run grep pat` ran grep for real with `pat`; it is now
+    `DRY_RUN_UNSUPPORTED`. `app --yes grep pat` ran grep without the `--yes`;
+    it is now `INVALID_FLAG` "flag --yes does not reach raw command `grep`".
+- **`--compact` beside `--select` no longer empties the selection in
+    silence.** When every selected field is null or empty, the selection is
+    returned uncompacted with a `select_warning`.
+
+    `app get 1 --select=note --compact` on a null `note` answered
+    `result: {}` with no warning; it now answers `result: {"note": null}` and
+    a `select_warning` saying `--compact` removed every selected field.
+- **`flag_parse` refuses a bare value flag as given no value.** A bare
+    `--limit` reads as `"true"`, and the error blamed that value.
+
+    `req.flag_parse::<usize>("limit")` on `app get 1 --limit` gave
+    `flag --limit is not valid: "true"`; it now gives `INVALID_FLAG`
+    `flag --limit was given no value`, fix `Pass a value: --limit=<value>`.
 
 ### Internal
 

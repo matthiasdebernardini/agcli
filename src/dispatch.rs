@@ -231,9 +231,10 @@ impl AgentCli {
     /// Run the raw command that claimed argv from `args_start` on, once the
     /// framework has answered for its own tokens: `prefix`, the parsed line up
     /// to the command's name, when the name was not the leading token. A help
-    /// or version flag there is answered, and a value that is not a boolean
-    /// is refused, as on any other line. The command's own tokens, after its
-    /// name, are never read.
+    /// or version flag there is answered, a value that is not a boolean is
+    /// refused, a flag the framework does not reserve is unknown, as on the
+    /// root line, and a reserved flag that cannot reach the handler is
+    /// refused. The command's own tokens, after its name, are never read.
     async fn raw_execution(
         &self,
         handler: &RawCommandHandler,
@@ -252,8 +253,63 @@ impl AgentCli {
             if let Some(execution) = self.framework_route(prefix, &**clock) {
                 return execution;
             }
+            if let Some(execution) = self.framework_flag_error(prefix, &**clock) {
+                return execution;
+            }
+            if let Some(execution) = self.undeliverable_prefix_flag(prefix, &**clock) {
+                return execution;
+            }
         }
         self.run_raw(handler, argv, args_start, clock, mode).await
+    }
+
+    /// The refusal of a reserved agent flag before a raw command's name. A
+    /// raw handler receives only the tokens after its name, so a flag there
+    /// can reach neither it nor an envelope: `--dry-run` is
+    /// `DRY_RUN_UNSUPPORTED`, and every other one but `--json`, which changes
+    /// nothing anywhere, is `INVALID_FLAG`. Nothing is refused when the
+    /// reserved flags are off.
+    fn undeliverable_prefix_flag(&self, prefix: &Invocation, clock: &ClockFn) -> Option<Execution> {
+        if !self.reserved_flags {
+            return None;
+        }
+        let resolved = self.resolve_command(prefix.positionals())?;
+        let path = path_refs(resolved.path);
+        let name = path.join(" ");
+        let error = if reserved_flags::bool_flag_on(prefix.flag("dry-run")) {
+            CommandError::new(
+                ErrorCode::DRY_RUN_UNSUPPORTED,
+                format!("`{name}` does not support --dry-run before its name"),
+                format!(
+                    "Nothing was run. A raw command receives only the tokens after its name: \
+                     drop --dry-run, or if `{name}` has its own preview flag, pass that after \
+                     `{name}`."
+                ),
+            )
+        } else {
+            let mut reserved: Vec<&str> = prefix
+                .flags()
+                .keys()
+                .map(String::as_str)
+                .filter(|&flag| reserved_flags::is_reserved(flag) && flag != "json")
+                .collect();
+            reserved.sort_unstable();
+            let flag = usage::flag_display(reserved.first()?);
+            CommandError::new(
+                ErrorCode::INVALID_FLAG,
+                format!(
+                    "flag {flag} does not reach raw command `{name}`: it receives only the \
+                     tokens after its name"
+                ),
+                format!("Drop it, or pass it after `{name}` if that command takes it."),
+            )
+            .exit_code(ExitCode::USAGE)
+        };
+        Some(self.error_execution(
+            prefix.command_line().to_string(),
+            clock,
+            error.next_actions(self.default_command_actions(&path, resolved.command)),
+        ))
     }
 
     /// Run a normal or streaming handler on `request`, under the panic hook
@@ -723,13 +779,31 @@ impl AgentCli {
                 // it --compact only drops nulls and empty containers: keeping
                 // the command's `compact_fields` instead could empty the
                 // selection without a word.
-                result = match &compact_fields {
+                match &compact_fields {
                     Some(fields) if selected.is_none() => {
                         let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
-                        project::select(&result, &refs)
+                        result = project::select(&result, &refs);
                     }
-                    _ => project::compact(&result),
-                };
+                    _ => {
+                        let compacted = project::compact(&result);
+                        // A selection --compact empties is kept as selected,
+                        // with a word, the way a --select miss is.
+                        if selected.is_some()
+                            && project::is_droppable(&compacted)
+                            && !project::is_droppable(&result)
+                        {
+                            let warning = "--compact removed every selected field because they \
+                                           were null or empty. Returning the selection \
+                                           uncompacted.";
+                            select_warning = Some(select_warning.map_or_else(
+                                || warning.to_string(),
+                                |previous| format!("{previous} {warning}"),
+                            ));
+                        } else {
+                            result = compacted;
+                        }
+                    }
+                }
             }
         }
         if self.reserved_flags && reserved_flags::bool_flag_on(invocation.flag("quiet")) {
