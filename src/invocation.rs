@@ -264,6 +264,28 @@ impl Invocation {
             help_requested: parser.help_requested,
         })
     }
+
+    /// Parse the first `count` tokens of `argv` (program first) as the
+    /// framework's own, while [`Invocation::command_line`] still names the
+    /// whole line. The tokens from `count` on belong to a raw command, which
+    /// the framework does not parse, but the envelope that answers for the
+    /// prefix reruns the line as given.
+    ///
+    /// # Errors
+    ///
+    /// As [`Invocation::parse`], for the prefix.
+    pub(crate) fn parse_prefix<F>(
+        argv: &[String],
+        count: usize,
+        is_bool: F,
+    ) -> Result<Self, ParseInvocationError>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut prefix = Self::parse(argv[..count].iter().map(String::as_str), is_bool)?;
+        prefix.command_line = render_command_line(&argv[0], &argv[1..]);
+        Ok(prefix)
+    }
 }
 
 /// The token-by-token state of [`Invocation::parse`].

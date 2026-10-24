@@ -15,6 +15,7 @@ use crate::invocation::Invocation;
 use crate::next_action::NextAction;
 use crate::reserved_flags::RESERVED_FLAG_DOCS;
 use crate::suggest;
+use crate::usage::Arity;
 
 impl AgentCli {
     /// The root command tree as doc entries, for the skill renderer.
@@ -37,27 +38,69 @@ impl AgentCli {
         ))
     }
 
-    /// Answer `--version` / `-V` (wherever it sits) and the `version`
-    /// positional with just `{name, version}` instead of the full command
-    /// tree. `version` is omitted when the CLI set none. Flags are checked
-    /// against the schema of the command the positionals name, the way
-    /// running it would check them, or against the root's when they name none.
-    pub(crate) fn version_execution(&self, invocation: &Invocation, clock: &ClockFn) -> Execution {
-        if let Some(resolved) = self.resolve_command(invocation.positionals()) {
-            let path_strs = dispatch::path_refs(resolved.path);
-            if let Some(declared) = Self::declared_flags(&self.path_command_refs(resolved.path))
-                && let Some(error) =
-                    self.unknown_flag_error(invocation, &declared, &path_strs.join(" "))
-            {
-                return self.error_execution(
-                    invocation.command_line().to_string(),
-                    clock,
-                    error.next_actions(self.default_command_actions(&path_strs, resolved.command)),
-                );
-            }
-        } else if let Some(error) = self.framework_flag_error(invocation, clock) {
-            return error;
+    /// Answer `--version` / `-V`, wherever it sits, when the positionals name
+    /// a command or nothing. Flags are checked against the schema of the
+    /// command they name, the way running it would check them, or against
+    /// the root's when they name none. A first positional that names no
+    /// command is `UNKNOWN_COMMAND`, as it is for `--help`: the version is
+    /// not an answer to `app nope --version`.
+    pub(crate) fn version_flag_execution(
+        &self,
+        invocation: &Invocation,
+        clock: &ClockFn,
+    ) -> Execution {
+        let Some(resolved) = self.resolve_command(invocation.positionals()) else {
+            return match invocation.positionals() {
+                [unknown, ..] => self.unknown_command_execution(invocation, clock, unknown),
+                [] => self
+                    .framework_flag_error(invocation, clock)
+                    .unwrap_or_else(|| self.version_answer(invocation, clock)),
+            };
+        };
+        let path_strs = dispatch::path_refs(resolved.path);
+        if let Some(declared) = Self::declared_flags(&self.path_command_refs(resolved.path))
+            && let Some(error) =
+                self.unknown_flag_error(invocation, &declared, &path_strs.join(" "))
+        {
+            return self.error_execution(
+                invocation.command_line().to_string(),
+                clock,
+                error.next_actions(self.default_command_actions(&path_strs, resolved.command)),
+            );
         }
+        self.version_answer(invocation, clock)
+    }
+
+    /// Answer the `version` positional, the spelling of `--version` for an
+    /// agent that guesses a command. It takes no argument: `version extra` is
+    /// `EXTRA_ARG` naming `extra`, not the version with `extra` dropped.
+    pub(crate) fn version_alias_execution(
+        &self,
+        invocation: &Invocation,
+        clock: &ClockFn,
+    ) -> Execution {
+        let given = &invocation.positionals()[1..];
+        if !given.is_empty() {
+            let usage = format!("{} version", self.name);
+            let arity = Arity {
+                required: 0,
+                optional: 0,
+            };
+            return self.error_execution(
+                invocation.command_line().to_string(),
+                clock,
+                dispatch::extra_arg_error("version", &usage, arity, given)
+                    .next_actions(self.root_actions()),
+            );
+        }
+        // `version` names no command, so the flags are checked as the root's.
+        self.framework_flag_error(invocation, clock)
+            .unwrap_or_else(|| self.version_answer(invocation, clock))
+    }
+
+    /// `{name, version}` instead of the full command tree, `version` omitted
+    /// when the CLI set none. The callers have checked the flags.
+    fn version_answer(&self, invocation: &Invocation, clock: &ClockFn) -> Execution {
         let mut result = Map::new();
         result.insert("name".to_string(), Value::String(self.name.clone()));
         if let Some(version) = &self.version {

@@ -127,6 +127,9 @@ impl ErrorCode {
     pub const SERIALIZATION_FAILED: Self = Self::new("SERIALIZATION_FAILED");
     /// The framework could not write a file the command was asked to produce.
     pub const WRITE_FAILED: Self = Self::new("WRITE_FAILED");
+    /// The CLI's name is not a slug, so `skill --install` cannot name the
+    /// skill's directory. A bug in the CLI definition.
+    pub const SKILL_NAME_INVALID: Self = Self::new("SKILL_NAME_INVALID");
 
     /// The error code `code`, conventionally `SCREAMING_SNAKE_CASE`.
     #[must_use]
@@ -233,6 +236,10 @@ pub(crate) const ERROR_CODE_DOCS: &[(ErrorCode, &str)] = &[
     (
         ErrorCode::WRITE_FAILED,
         "the framework could not write a file the command was asked to produce",
+    ),
+    (
+        ErrorCode::SKILL_NAME_INVALID,
+        "the CLI's name is not a slug, so `skill --install` cannot name the skill's directory; a bug in the CLI definition, not the invocation",
     ),
 ];
 

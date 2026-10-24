@@ -191,6 +191,83 @@ async fn a_short_help_flag_behind_a_global_flag_belongs_to_the_command() {
 }
 
 #[tokio::test]
+async fn a_help_flag_before_the_name_is_the_frameworks() {
+    // `app --help grep` used to run grep with no arguments, and `app -h grep
+    // pat` ran it with `pat`: the tokens before the name are the framework's.
+    for argv in [
+        &["app", "--help", "grep"][..],
+        &["app", "-h", "grep", "pat"],
+    ] {
+        let fixture = raw_cli(ExitCode::SUCCESS);
+        let (execution, seen) = run(&fixture, argv).await;
+
+        assert!(!execution.is_raw(), "{argv:?}");
+        assert!(seen.is_empty(), "the handler ran: {argv:?}");
+        let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+        assert_eq!(json["ok"], json!(true), "{argv:?}: {json}");
+        assert_eq!(json["result"]["name"], json!("grep"), "{argv:?}: {json}");
+        // The envelope names the whole line, not only the framework's part.
+        assert_eq!(json["command"], json!(argv.join(" ")), "{argv:?}");
+    }
+
+    // After the name, the same flags are the command's.
+    let (execution, seen) = run(
+        &raw_cli(ExitCode::SUCCESS),
+        &["app", "--json", "grep", "-h", "pat"],
+    )
+    .await;
+    assert!(execution.is_raw());
+    assert_eq!(seen, ["-h", "pat"]);
+}
+
+#[tokio::test]
+async fn a_version_flag_before_the_name_is_the_frameworks() {
+    let (execution, seen) = run(&raw_cli(ExitCode::SUCCESS), &["app", "-V", "grep", "pat"]).await;
+
+    assert!(!execution.is_raw());
+    assert!(seen.is_empty(), "the handler ran");
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(json["result"], json!({ "name": "app" }), "{json}");
+}
+
+#[tokio::test]
+async fn a_non_boolean_before_the_name_is_refused_like_anywhere_else() {
+    // `--quiet=maybe` is INVALID_FLAG on every other line; before a raw
+    // command's name it used to be dropped and the command run.
+    let (execution, seen) = run(
+        &raw_cli(ExitCode::SUCCESS),
+        &["app", "--quiet=maybe", "grep", "pat"],
+    )
+    .await;
+
+    assert!(!execution.is_raw());
+    assert!(seen.is_empty(), "the handler ran");
+    assert_eq!(execution.exit_code(), ExitCode::USAGE);
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(json["error"]["code"], json!("INVALID_FLAG"), "{json}");
+    assert_eq!(json["command"], json!("app --quiet=maybe grep pat"));
+    assert_eq!(
+        json["next_actions"][0]["command"],
+        json!("app grep [rg-flags...] <pattern> [path...]"),
+        "the raw command's own template: {json}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_token_before_the_name_is_the_frameworks_parse_error() {
+    // The command owns a malformed token after its name
+    // (`a_line_the_parser_rejects_still_reaches_the_handler`); before it,
+    // the token is the framework's, and the framework refuses it.
+    let (execution, seen) = run(&raw_cli(ExitCode::SUCCESS), &["app", "--=x", "grep", "pat"]).await;
+
+    assert!(!execution.is_raw());
+    assert!(seen.is_empty(), "the handler ran");
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(json["error"]["code"], json!("PARSE_ERROR"), "{json}");
+    assert_eq!(json["error"]["message"], json!("invalid flag syntax: --=x"));
+}
+
+#[tokio::test]
 async fn a_line_the_parser_rejects_still_reaches_the_handler() {
     // `--=x` is a parse error. Judging a raw command's syntax is exactly what
     // the framework promised not to do, so the handler gets it anyway.

@@ -141,6 +141,77 @@ async fn version_flags_answer_wherever_they_appear() {
 }
 
 #[tokio::test]
+async fn a_version_flag_beside_an_unknown_command_names_the_command() {
+    // `calc --version nope` used to answer the version and drop `nope`. As
+    // with `--help`, a first positional that names no command is the error.
+    for argv in [&["calc", "--version", "nope"][..], &["calc", "nope", "-V"]] {
+        let run = cli().run(argv.iter().copied()).await;
+        assert_eq!(usage_error_code(&run), "UNKNOWN_COMMAND", "{argv:?}");
+        assert_eq!(
+            parse(&run)["error"]["message"],
+            json!("unknown command: nope"),
+            "{argv:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_version_alias_takes_no_argument() {
+    // `calc version extra` used to be `UNKNOWN_COMMAND: version`, pointing at
+    // the wrong token.
+    let run = cli().run(["calc", "version", "extra"]).await;
+    assert_eq!(usage_error_code(&run), "EXTRA_ARG");
+    let envelope = parse(&run);
+    assert_eq!(
+        envelope["error"]["message"],
+        json!(
+            "unexpected extra argument(s): \"extra\" (`version` takes 0 positional argument(s); got 1)"
+        )
+    );
+    assert!(
+        envelope["fix"]
+            .as_str()
+            .is_some_and(|fix| fix.contains("`calc version`")),
+        "{envelope}"
+    );
+}
+
+#[tokio::test]
+async fn a_group_without_a_usage_string_refuses_unknown_flags() {
+    // A group never runs, so it has no handler to leave an undeclared flag
+    // to: `app db --bogus` used to answer the group's tree, flag dropped.
+    let cli = AgentCli::new("app", "Grouped").clock(|| 0).command(
+        Command::new("db", "Database commands").subcommand(
+            Command::new("migrate", "Run migrations")
+                .usage("app db migrate")
+                .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) }),
+        ),
+    );
+    for argv in [
+        &["app", "db", "--bogus"][..],
+        &["app", "help", "db", "--bogus"],
+        &["app", "db", "--help", "--bogus"],
+    ] {
+        let run = cli.run(argv.iter().copied()).await;
+        assert_eq!(usage_error_code(&run), "UNKNOWN_FLAG", "{argv:?}");
+        assert!(
+            parse(&run)["fix"]
+                .as_str()
+                .is_some_and(|fix| fix.starts_with("`db` takes no flags of its own.")),
+            "{argv:?}: {}",
+            run.to_json()
+        );
+    }
+    // The reserved flags still pass, and the tree still answers.
+    let envelope = parse(&cli.run(["app", "db", "--quiet"]).await);
+    assert_eq!(envelope["ok"], json!(true), "{envelope}");
+    assert_eq!(
+        envelope["result"]["subcommands"][0]["name"],
+        json!("migrate")
+    );
+}
+
+#[tokio::test]
 async fn reserved_booleans_accept_only_boolean_spellings() {
     // Off spellings, in any case, keep the next actions.
     for value in ["false", "0", "no", "off", "OFF"] {

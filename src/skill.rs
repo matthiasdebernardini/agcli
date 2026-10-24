@@ -296,6 +296,13 @@ impl AgentCli {
             );
         }
 
+        // The name is the directory written under `dir`, so a name that is
+        // not a slug would nest (`a/b`) or escape (`..`) instead of naming a
+        // skill. `audit()` reports the same mistake before anything runs.
+        if !is_slug(&self.name) {
+            return self.skill_name_invalid(invocation, clock);
+        }
+
         // Absolute, so the reported path means the same thing to a caller with
         // a different working directory.
         let relative = Path::new(dir).join(&self.name).join("SKILL.md");
@@ -306,8 +313,21 @@ impl AgentCli {
 
         let markdown = self.skill_markdown();
         let bytes = markdown.len();
-        let dry_run =
-            self.reserved_flags && reserved_flags::bool_flag_on(invocation.flag("dry-run"));
+        // `skill` previews its own write, so `--dry-run` is read whether or
+        // not the reserved flags are on; with them off the framework has not
+        // checked that its value is a boolean, so that is checked here.
+        let dry_run = if let Some(value) = invocation.flag("dry-run") {
+            let Some(on) = reserved_flags::parse_bool(value) else {
+                return self.error_execution(
+                    invocation.command_line().to_string(),
+                    clock,
+                    reserved_flags::not_a_boolean("dry-run", value).next_action(root_action()),
+                );
+            };
+            on
+        } else {
+            false
+        };
         if !dry_run {
             if let Some(parent) = file.parent()
                 && let Err(error) = fs::create_dir_all(parent)
@@ -337,6 +357,37 @@ impl AgentCli {
             Value::Object(result),
             vec![root_action()],
         )
+    }
+
+    /// `skill --install` refused because the CLI's name is not a slug. A bug
+    /// in the CLI definition, not the invocation, so it carries
+    /// [`ExitCode::ERROR`], not a usage code.
+    fn skill_name_invalid(&self, invocation: &Invocation, clock: &ClockFn) -> Execution {
+        Execution {
+            envelope: self
+                .build_error_envelope(
+                    invocation.command_line().to_string(),
+                    clock(),
+                    CommandError::new(
+                        ErrorCode::SKILL_NAME_INVALID,
+                        format!(
+                            "CLI name {:?} is not a slug (lowercase letters, digits, and single \
+                             hyphens between them), so it cannot name the skill's directory",
+                            self.name
+                        ),
+                        "Nothing was written. This is a bug in the CLI definition, not the \
+                         invocation: rename the CLI to a slug. `audit()` reports it as \
+                         SKILL_NAME_INVALID.",
+                    )
+                    .exit_code(ExitCode::ERROR)
+                    .next_action(NextAction::new(
+                        self.name.clone(),
+                        "Inspect the full command tree",
+                    )),
+                )
+                .into(),
+            output: Output::Envelope,
+        }
     }
 
     /// The `skill --install` write failed. Filesystem trouble is the caller's

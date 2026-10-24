@@ -132,7 +132,25 @@ impl AgentCli {
         };
 
         let invocation = match self.parse_argv(&argv) {
-            ParsedArgv::Raw(handler, args_start) => {
+            ParsedArgv::Raw {
+                handler,
+                args_start,
+                prefix,
+            } => {
+                // The tokens before a raw command's name are the framework's:
+                // a help or version flag there is answered, and a value that
+                // is not a boolean is refused, as on any other line. The
+                // command's own tokens, after its name, are never read.
+                if let Some(prefix) = &prefix {
+                    if let Some((name, value)) =
+                        reserved_flags::invalid_bool_flag(prefix.flags(), self.reserved_flags)
+                    {
+                        return self.invalid_bool_execution(prefix, &*clock, name, value);
+                    }
+                    if let Some(execution) = self.framework_route(prefix, &*clock) {
+                        return execution;
+                    }
+                }
                 return self.run_raw(handler, &argv, args_start, &clock, mode).await;
             }
             ParsedArgv::Failed(error) => {
@@ -293,37 +311,55 @@ impl AgentCli {
 
     /// Parse argv, unless a raw command claims it first. A raw command can
     /// claim argv at three points: before parsing, when parsing fails, and
-    /// after parsing when its name was not the leading token.
+    /// after parsing when its name was not the leading token. In the last two
+    /// the tokens before its name are parsed as the framework's prefix.
     fn parse_argv(&self, argv: &[String]) -> ParsedArgv<'_> {
         // Pass 0: a raw command claims its argv before anything reads it. The
-        // scan is purely lexical — no flag parsing, no `--help` interception —
-        // because parsing is exactly what the command opted out of.
+        // scan is purely lexical, with no flag parsing and no `--help`
+        // interception, because parsing is exactly what the command opted
+        // out of.
         if let Some((handler, args_start)) = self.resolve_raw_command(argv, 1) {
-            return ParsedArgv::Raw(handler, args_start);
+            return ParsedArgv::Raw {
+                handler,
+                args_start,
+                prefix: None,
+            };
         }
 
         let preliminary_path = self.preliminary_command_path(argv);
         let bool_flags = Self::path_bool_flag_set(&preliminary_path);
-        let invocation = match Invocation::parse(argv.iter().map(String::as_str), |flag| {
-            self.parses_as_bool(&bool_flags, flag)
-        }) {
+        let is_bool = |flag: &str| self.parses_as_bool(&bool_flags, flag);
+        let raw_claim = |handler, args_start| {
+            // The tokens up to the command's name are the framework's. They
+            // parse whenever the whole line did; after a parse failure, a
+            // prefix that fails to parse is the framework's own error.
+            Invocation::parse_prefix(argv, args_start, is_bool).map_or_else(
+                ParsedArgv::Failed,
+                |prefix| ParsedArgv::Raw {
+                    handler,
+                    args_start,
+                    prefix: Some(prefix),
+                },
+            )
+        };
+        let invocation = match Invocation::parse(argv.iter().map(String::as_str), is_bool) {
             Ok(value) => value,
             Err(error) => {
                 // A raw command still owns its argv when a *later* token
                 // fails to parse (`app --json grep --=x`): the syntax the
                 // parser rejected was never the framework's to judge.
                 if let Some((handler, args_start)) = self.find_raw_command(argv) {
-                    return ParsedArgv::Raw(handler, args_start);
+                    return raw_claim(handler, args_start);
                 }
                 return ParsedArgv::Failed(error);
             }
         };
 
         // Pass 1 for a raw command: its name was not the leading token, so the
-        // lexical scan missed it (`app --json grep -h pat`). This has to come
-        // before the `--help` and `version` interceptions — `-h` belongs to
-        // the command, not to the framework — and the parsed positionals give
-        // the exact argv index its own arguments start at.
+        // lexical scan missed it (`app --json grep -h pat`). The parsed
+        // positionals give the exact argv index its own arguments start at,
+        // and only the tokens before that index are the framework's to
+        // answer: a `-h` after the name belongs to the command.
         if let Some(resolved) = self.resolve_command(invocation.positionals()) {
             let path_cmds = self.path_command_refs(resolved.path);
             // First raw command on the walk wins, exactly as in Pass 0.
@@ -333,7 +369,7 @@ impl AgentCli {
                 .find_map(|(depth, cmd)| cmd.raw().map(|handler| (depth, handler)))
                 && let Some(args_start) = raw::args_start(&invocation, depth + 1)
             {
-                return ParsedArgv::Raw(handler, args_start);
+                return raw_claim(handler, args_start);
             }
         }
 
@@ -380,7 +416,7 @@ impl AgentCli {
             return Some(self.help_execution(invocation, clock, invocation.positionals()));
         }
 
-        // `<tool> help [command...]` — the alias every agent guesses first.
+        // `<tool> help [command...]`: the alias every agent guesses first.
         // Skipped when the CLI defines its own `help` command.
         if invocation.positionals().first().map(String::as_str) == Some("help")
             && !self.commands.contains_key("help")
@@ -393,22 +429,21 @@ impl AgentCli {
         if reserved_flags::bool_flag_on(invocation.flag("version"))
             || reserved_flags::bool_flag_on(invocation.flag("V"))
         {
-            return Some(self.version_execution(invocation, clock));
+            return Some(self.version_flag_execution(invocation, clock));
         }
 
-        // `<tool> version` — the positional spelling of `--version`. Skipped
+        // `<tool> version`: the positional spelling of `--version`. Skipped
         // when the CLI defines its own `version` command.
-        if invocation.positionals().len() == 1
-            && invocation.positionals()[0] == "version"
+        if invocation.positionals().first().map(String::as_str) == Some("version")
             && !self.commands.contains_key("version")
         {
-            return Some(self.version_execution(invocation, clock));
+            return Some(self.version_alias_execution(invocation, clock));
         }
         None
     }
 
     /// The answer when the first positional, `unknown`, names no command.
-    fn unknown_command_execution(
+    pub(crate) fn unknown_command_execution(
         &self,
         invocation: &Invocation,
         clock: &ClockFn,
@@ -460,12 +495,16 @@ impl AgentCli {
     }
 
     /// The flags the command at the end of `path_cmds` declares, the union
-    /// across the path, when unknown flags are rejected for it at all: only
-    /// when its usage string (the flag schema) exists and no command on the
-    /// path opted out via `allow_unknown_flags()`.
+    /// across the path, when unknown flags are rejected for it at all. `None`
+    /// when a command on the path opted out via `allow_unknown_flags()`, and
+    /// for a command that runs without a usage string: it has no flag schema
+    /// to check against. A group never runs, so without a usage string it
+    /// declares nothing, and its tree answer refuses a flag nobody declared
+    /// instead of dropping it.
     pub(crate) fn declared_flags(path_cmds: &[&Command]) -> Option<HashSet<String>> {
         let leaf = path_cmds.last()?;
-        if leaf.usage.is_none() || path_cmds.iter().any(|c| c.allow_unknown_flags) {
+        let runs_unchecked = leaf.usage.is_none() && leaf.handler.is_some();
+        if runs_unchecked || path_cmds.iter().any(|c| c.allow_unknown_flags) {
             return None;
         }
         let mut declared = HashSet::new();
@@ -575,34 +614,12 @@ impl AgentCli {
         if self.reserved_flags
             && !gate.path_cmds.iter().any(|c| c.allow_extra_args)
             && let Some(usage) = &gate.command.usage
-            && let Some(Arity { required, optional }) = usage::positional_arity(usage)
-            && resolved.remaining.len() > required + optional
+            && let Some(arity) = usage::positional_arity(usage)
+            && resolved.remaining.len() > arity.required + arity.optional
         {
-            let extras = &resolved.remaining[required + optional..];
-            let extra_list = extras
-                .iter()
-                .map(|a| format!("{a:?}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let expected = match optional {
-                0 => format!("{required}"),
-                _ => format!("{required} to {}", required + optional),
-            };
             return Some(self.gate_error(
                 gate,
-                CommandError::new(
-                    ErrorCode::EXTRA_ARG,
-                    format!(
-                        "unexpected extra argument(s): {extra_list} (`{}` takes {expected} \
-                         positional argument(s); got {})",
-                        gate.path_strs.join(" "),
-                        resolved.remaining.len()
-                    ),
-                    format!(
-                        "Nothing was run. Re-invoke matching the usage template `{usage}`, \
-                         or drop the extra argument(s)."
-                    ),
-                ),
+                extra_arg_error(&gate.path_strs.join(" "), usage, arity, resolved.remaining),
             ));
         }
         None
@@ -833,6 +850,38 @@ impl AgentCli {
     }
 }
 
+/// The `EXTRA_ARG` error for `given`, the positionals after the command
+/// `scope`, when there are more of them than `arity` allows for its `usage`.
+pub(crate) fn extra_arg_error(
+    scope: &str,
+    usage: &str,
+    arity: Arity,
+    given: &[String],
+) -> CommandError {
+    let Arity { required, optional } = arity;
+    let extra_list = given[required + optional..]
+        .iter()
+        .map(|a| format!("{a:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expected = match optional {
+        0 => format!("{required}"),
+        _ => format!("{required} to {}", required + optional),
+    };
+    CommandError::new(
+        ErrorCode::EXTRA_ARG,
+        format!(
+            "unexpected extra argument(s): {extra_list} (`{scope}` takes {expected} positional \
+             argument(s); got {})",
+            given.len()
+        ),
+        format!(
+            "Nothing was run. Re-invoke matching the usage template `{usage}`, or drop the \
+             extra argument(s)."
+        ),
+    )
+}
+
 /// `args` as UTF-8 strings, or the index of the first argument that is not
 /// valid UTF-8. Never lossy.
 fn utf8_argv(args: impl IntoIterator<Item = OsString>) -> Result<Vec<String>, usize> {
@@ -873,11 +922,19 @@ struct Gate<'run> {
 
 /// What [`AgentCli::parse_argv`] made of argv.
 enum ParsedArgv<'cli> {
-    /// A raw command's handler owns argv from this index on.
-    Raw(&'cli RawCommandHandler, usize),
+    /// A raw command's handler owns argv from `args_start` on.
+    Raw {
+        handler: &'cli RawCommandHandler,
+        args_start: usize,
+        /// The framework's tokens before the command's name, parsed, when
+        /// the name was not the leading token. `None` when it was: there is
+        /// nothing before it to answer for.
+        prefix: Option<Invocation>,
+    },
     /// argv parsed into a normal invocation.
     Invocation(Invocation),
-    /// argv failed to parse and names no raw command.
+    /// argv failed to parse and names no raw command, or the framework's own
+    /// tokens before a raw command's name failed to parse.
     Failed(ParseInvocationError),
 }
 

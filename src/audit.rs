@@ -263,6 +263,22 @@ impl AgentCli {
                 ),
             );
         }
+        // The tree and every gate error advertise the usage as the command's
+        // template, so its command tokens must name this command: a template
+        // for `app fetch <id>` on the command `get` runs as UNKNOWN_COMMAND.
+        let named = self.usage_command_tokens(usage).join(" ");
+        if named != path {
+            report.push(
+                AuditSeverity::Error,
+                "USAGE_PATH_MISMATCH",
+                path,
+                format!(
+                    "usage `{usage}` names the command `{named}`, not `{path}`; the tree and \
+                     every next_action advertise it as this command's template, so an agent \
+                     copying it runs a command that does not exist"
+                ),
+            );
+        }
         // Raw commands are exempt: the framework parses none of their
         // flags, so "redeclared" and "intercepted" mean nothing there.
         if command.is_raw() {
@@ -318,6 +334,18 @@ impl AgentCli {
                 );
             }
         }
+    }
+
+    /// The command path a usage string names: its tokens after the program
+    /// name, up to the first placeholder or flag (`<arg>`, `[--flag]`, `-x`).
+    fn usage_command_tokens<'usage>(&self, usage: &'usage str) -> Vec<&'usage str> {
+        let mut tokens = usage.split_whitespace().peekable();
+        if tokens.peek() == Some(&self.name.as_str()) {
+            tokens.next();
+        }
+        tokens
+            .take_while(|token| !token.starts_with(['<', '[', '-']))
+            .collect()
     }
 
     /// True if the leading command tokens of a `next_action` template resolve
@@ -494,6 +522,65 @@ mod tests {
                 .iter()
                 .any(|f| f.code == "USAGE_PROGRAM_MISMATCH")
         );
+    }
+
+    #[test]
+    fn audit_flags_a_usage_naming_another_command() {
+        // The tree advertised `app fetch <id>` for `get`, which runs as
+        // UNKNOWN_COMMAND, and the audit was clean.
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("get", "Get")
+                .usage("app fetch <id>")
+                .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) }),
+        );
+        let report = cli.audit();
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.code == "USAGE_PATH_MISMATCH")
+            .unwrap_or_else(|| panic!("{:?}", report.findings));
+        assert_eq!(finding.severity, AuditSeverity::Error);
+        assert_eq!(finding.command, "get");
+        assert!(finding.message.contains("`fetch`"), "{}", finding.message);
+        assert!(!report.is_clean());
+
+        // A nested command must name its whole path.
+        let nested = AgentCli::new("app", "x").command(
+            Command::new("db", "Database").subcommand(
+                Command::new("migrate", "Migrate")
+                    .usage("app migrate")
+                    .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) }),
+            ),
+        );
+        assert!(
+            nested
+                .audit()
+                .findings
+                .iter()
+                .any(|f| f.code == "USAGE_PATH_MISMATCH" && f.command == "db migrate"),
+            "{:?}",
+            nested.audit().findings
+        );
+
+        // The right path is clean, with or without the program name in front
+        // (which is its own warning), and with flags and placeholders after.
+        for usage in ["app db migrate [--dry-run] <target>", "db migrate <target>"] {
+            let cli = AgentCli::new("app", "x").command(
+                Command::new("db", "Database").subcommand(
+                    Command::new("migrate", "Migrate")
+                        .usage(usage)
+                        .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) }),
+                ),
+            );
+            assert!(
+                !cli.audit()
+                    .findings
+                    .iter()
+                    .any(|f| f.code == "USAGE_PATH_MISMATCH"),
+                "{usage}: {:?}",
+                cli.audit().findings
+            );
+        }
     }
 
     #[test]

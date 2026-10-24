@@ -170,6 +170,60 @@ async fn install_under_dry_run_reports_the_path_and_writes_nothing() {
 }
 
 #[tokio::test]
+async fn dry_run_is_honored_without_the_reserved_flags() {
+    // `skill` previews its own write, so it reads `--dry-run` whether or not
+    // the reserved flags are on. With them off, the file used to be written.
+    let dir = scratch_dir("dryrun-unreserved");
+    let flag = format!("--install={}", dir.display());
+    let cli = AgentCli::new("app", "Test CLI")
+        .without_reserved_flags()
+        .skill();
+    let run = cli.run(["app", "skill", &flag, "--dry-run"]).await;
+    assert_eq!(run.exit_code(), ExitCode::SUCCESS, "{}", run.to_json());
+    let envelope = success(&run);
+    assert_eq!(envelope.result["dry_run"], json!(true));
+    assert!(!dir.join("app").exists(), "the skill was written anyway");
+
+    // The framework has not checked the value, so `skill` does.
+    let run = cli.run(["app", "skill", &flag, "--dry-run=maybe"]).await;
+    let Envelope::Error(envelope) = run.envelope() else {
+        panic!("expected an error envelope, got {}", run.to_json());
+    };
+    assert_eq!(envelope.error.code, ErrorCode::INVALID_FLAG);
+    assert_eq!(run.exit_code(), ExitCode::USAGE);
+    assert!(!dir.join("app").exists(), "the skill was written anyway");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn install_refuses_a_name_that_is_not_a_slug() {
+    // The name is the directory under `--install`: `a/b` would nest, and
+    // `..` would escape. The audit reports the name; the command refuses it.
+    let dir = scratch_dir("slug");
+    let flag = format!("--install={}", dir.display());
+    let cli = AgentCli::new("a/b", "Test CLI").skill();
+    let run = cli.run(["a/b", "skill", &flag]).await;
+    let Envelope::Error(envelope) = run.envelope() else {
+        panic!("expected an error envelope, got {}", run.to_json());
+    };
+    assert_eq!(envelope.error.code, ErrorCode::SKILL_NAME_INVALID);
+    assert_eq!(run.exit_code(), ExitCode::ERROR);
+    assert!(
+        envelope.fix.contains("Nothing was written"),
+        "{}",
+        envelope.fix
+    );
+    assert!(!dir.join("a").exists(), "a nested directory was written");
+
+    // The document itself is still readable.
+    let run = cli.run(["a/b", "skill"]).await;
+    assert!(success(&run).result["markdown"].is_string());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn a_bare_install_flag_is_rejected() {
     // `--install` with no value parses as the boolean sentinel "true"; writing
     // ./true/app/SKILL.md and reporting success would be a wrong answer.
