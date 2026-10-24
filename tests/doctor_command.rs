@@ -7,7 +7,7 @@
 //! flag and hand it to the checks, and the sugar `doctor(checks)` must keep
 //! behaving exactly as it did.
 
-use agcli::{AgentCli, Check, CheckResult, Command, Envelope, ExitCode};
+use agcli::{AgentCli, Check, CheckResult, Command, Envelope, ErrorCode, ExitCode};
 use serde_json::json;
 
 /// A `doctor` that declares `--profile` and reports which profile it checked —
@@ -17,9 +17,9 @@ fn profile_cli() -> AgentCli {
         Command::new("doctor", "Check the active or named profile")
             .usage("app doctor [--profile=<name>]"),
         vec![
-            Check::with_request("profile", |req| {
+            Check::new("profile", |req| {
                 let profile = req.flag("profile").unwrap_or("active").to_string();
-                Box::pin(async move { CheckResult::pass_with(format!("checked {profile}")) })
+                async move { CheckResult::pass_with(format!("checked {profile}")) }
             })
             .exit_code(ExitCode::AUTH),
         ],
@@ -45,20 +45,20 @@ async fn a_declared_flag_reaches_the_check() {
     let cli = profile_cli();
     // Before the command name — the form that used to exit 2 UNKNOWN_FLAG,
     // because the hardcoded usage string was the flag schema.
-    let run = cli.run_argv(["app", "--profile", "ci", "doctor"]).await;
+    let run = cli.run(["app", "--profile", "ci", "doctor"]).await;
     assert_eq!(run.exit_code(), ExitCode::SUCCESS);
     assert_eq!(success(&run).result["healthy"], json!(true));
     assert_eq!(first_detail(&run), "checked ci");
 
     // After it, and in `--flag=value` form: same flag, same check.
-    let run = cli.run_argv(["app", "doctor", "--profile=ci"]).await;
+    let run = cli.run(["app", "doctor", "--profile=ci"]).await;
     assert_eq!(run.exit_code(), ExitCode::SUCCESS);
     assert_eq!(first_detail(&run), "checked ci");
 }
 
 #[tokio::test]
 async fn an_absent_flag_leaves_the_check_its_default() {
-    let run = profile_cli().run_argv(["app", "doctor"]).await;
+    let run = profile_cli().run(["app", "doctor"]).await;
     assert_eq!(run.exit_code(), ExitCode::SUCCESS);
     assert_eq!(first_detail(&run), "checked active");
 }
@@ -68,14 +68,14 @@ async fn an_undeclared_flag_is_still_rejected() {
     // The sugar `doctor(checks)` declares no flags, so unknown-flag rejection
     // must still fire: declaring the flag is what makes it legal, not the mere
     // existence of a request-aware check.
-    let cli = AgentCli::new("app", "Test CLI").doctor(vec![Check::new("ping", || {
-        Box::pin(async { CheckResult::pass() })
+    let cli = AgentCli::new("app", "Test CLI").doctor(vec![Check::new("ping", |_req| async {
+        CheckResult::pass()
     })]);
-    let run = cli.run_argv(["app", "--profile", "ci", "doctor"]).await;
+    let run = cli.run(["app", "--profile", "ci", "doctor"]).await;
     let Envelope::Error(envelope) = run.envelope() else {
         panic!("expected error envelope");
     };
-    assert_eq!(envelope.error.code, "UNKNOWN_FLAG");
+    assert_eq!(envelope.error.code, ErrorCode::UNKNOWN_FLAG);
     assert_eq!(run.exit_code(), ExitCode::USAGE);
 }
 
@@ -83,12 +83,12 @@ async fn an_undeclared_flag_is_still_rejected() {
 async fn a_request_check_reads_positionals_too() {
     let cli = AgentCli::new("app", "Test CLI").doctor_with(
         Command::new("doctor", "Check one subsystem").usage("app doctor [<subsystem>]"),
-        vec![Check::with_request("subsystem", |req| {
+        vec![Check::new("subsystem", |req| {
             let subsystem = req.arg(0).unwrap_or("all").to_string();
-            Box::pin(async move { CheckResult::pass_with(subsystem) })
+            async move { CheckResult::pass_with(subsystem) }
         })],
     );
-    let run = cli.run_argv(["app", "doctor", "storage"]).await;
+    let run = cli.run(["app", "doctor", "storage"]).await;
     assert_eq!(first_detail(&run), "storage");
 }
 
@@ -98,16 +98,16 @@ async fn a_failing_request_check_drives_the_exit_code() {
         Command::new("doctor", "Check the active or named profile")
             .usage("app doctor [--profile=<name>]"),
         vec![
-            Check::with_request("profile", |req| {
+            Check::new("profile", |req| {
                 let profile = req.flag("profile").unwrap_or("active").to_string();
-                Box::pin(async move {
+                async move {
                     CheckResult::fail(format!("profile {profile} has no token"), "Run `app login`")
-                })
+                }
             })
             .exit_code(ExitCode::AUTH),
         ],
     );
-    let run = cli.run_argv(["app", "doctor", "--profile=ci"]).await;
+    let run = cli.run(["app", "doctor", "--profile=ci"]).await;
     // Still an ok:true envelope — the report ran — carrying the typed code.
     assert_eq!(success(&run).result["healthy"], json!(false));
     assert_eq!(run.exit_code(), ExitCode::AUTH);
@@ -119,16 +119,14 @@ async fn bare_and_request_checks_run_side_by_side() {
     let cli = AgentCli::new("app", "Test CLI").doctor_with(
         Command::new("doctor", "Health").usage("app doctor [--profile=<name>]"),
         vec![
-            Check::new("ping", || {
-                Box::pin(async { CheckResult::pass_with("pong") })
-            }),
-            Check::with_request("profile", |req| {
+            Check::new("ping", |_req| async { CheckResult::pass_with("pong") }),
+            Check::new("profile", |req| {
                 let profile = req.flag("profile").unwrap_or("active").to_string();
-                Box::pin(async move { CheckResult::skip(format!("{profile} not configured")) })
+                async move { CheckResult::skip(format!("{profile} not configured")) }
             }),
         ],
     );
-    let run = cli.run_argv(["app", "doctor", "--profile=ci"]).await;
+    let run = cli.run(["app", "doctor", "--profile=ci"]).await;
     let result = &success(&run).result;
     assert_eq!(result["healthy"], json!(true));
     assert_eq!(result["skipped"], json!(1));
@@ -141,7 +139,7 @@ async fn bare_and_request_checks_run_side_by_side() {
 async fn the_consumers_description_and_usage_reach_the_command_tree() {
     // The prose an agent reads about `doctor` is the consumer's, not a
     // framework default it had to smuggle into a `root_field`.
-    let run = profile_cli().run_argv(["app"]).await;
+    let run = profile_cli().run(["app"]).await;
     let commands = success(&run).result["commands"]
         .as_array()
         .expect("root lists commands")
@@ -161,16 +159,14 @@ async fn the_consumers_description_and_usage_reach_the_command_tree() {
 async fn the_command_may_be_named_anything() {
     let cli = AgentCli::new("app", "Test CLI").doctor_with(
         Command::new("health", "Run environment health checks"),
-        vec![Check::new("ping", || {
-            Box::pin(async { CheckResult::pass() })
-        })],
+        vec![Check::new("ping", |_req| async { CheckResult::pass() })],
     );
-    let run = cli.run_argv(["app", "health"]).await;
+    let run = cli.run(["app", "health"]).await;
     assert_eq!(success(&run).result["healthy"], json!(true));
 
     // No usage string given, so the framework fills in `<cli> <name>` — which
     // keeps flag validation on rather than silently disabling it.
-    let run = cli.run_argv(["app"]).await;
+    let run = cli.run(["app"]).await;
     let commands = success(&run).result["commands"].clone();
     let health = commands
         .as_array()
@@ -187,14 +183,14 @@ async fn the_report_is_still_exempt_from_narrowing() {
     let cli = AgentCli::new("app", "Test CLI").doctor_with(
         Command::new("doctor", "Health").usage("app doctor [--profile=<name>]"),
         vec![
-            Check::with_request("auth", |_req| {
-                Box::pin(async { CheckResult::fail("no token", "Set API_TOKEN") })
+            Check::new("auth", |_req| async {
+                CheckResult::fail("no token", "Set API_TOKEN")
             })
             .exit_code(ExitCode::AUTH),
         ],
     );
     let run = cli
-        .run_argv(["app", "doctor", "--profile=ci", "--select=healthy"])
+        .run(["app", "doctor", "--profile=ci", "--select=healthy"])
         .await;
     let result = &success(&run).result;
     assert_eq!(result["checks"][0]["fix"], json!("Set API_TOKEN"));
@@ -212,12 +208,12 @@ async fn checks_run_in_registration_order() {
     let cli = AgentCli::new("app", "Test CLI").doctor_with(
         Command::new("doctor", "Health").usage("app doctor"),
         vec![
-            Check::new("first", || Box::pin(async { CheckResult::pass() })),
-            Check::with_request("second", |_req| Box::pin(async { CheckResult::pass() })),
-            Check::new("third", || Box::pin(async { CheckResult::pass() })),
+            Check::new("first", |_req| async { CheckResult::pass() }),
+            Check::new("second", |_req| async { CheckResult::pass() }),
+            Check::new("third", |_req| async { CheckResult::pass() }),
         ],
     );
-    let run = cli.run_argv(["app", "doctor"]).await;
+    let run = cli.run(["app", "doctor"]).await;
     let names: Vec<&str> = success(&run).result["checks"]
         .as_array()
         .expect("checks array")
@@ -225,4 +221,16 @@ async fn checks_run_in_registration_order() {
         .filter_map(|c| c["name"].as_str())
         .collect();
     assert_eq!(names, ["first", "second", "third"]);
+}
+
+#[tokio::test]
+async fn the_check_running_handler_replaces_a_raw_one() {
+    let cli = AgentCli::new("app", "Test CLI").doctor_with(
+        Command::new("doctor", "Run environment health checks")
+            .raw_handler(|_args| async move { ExitCode::new(9) }),
+        vec![Check::new("ping", |_req| async { CheckResult::pass() })],
+    );
+    let run = cli.run(["app", "doctor"]).await;
+    assert!(!run.is_raw());
+    assert_eq!(success(&run).result["healthy"], json!(true));
 }

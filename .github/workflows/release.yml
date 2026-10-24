@@ -24,7 +24,7 @@ jobs:
     outputs:
       version: ${{ steps.extract.outputs.version }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -39,32 +39,18 @@ jobs:
             echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
             exit 1
           fi
+          if ! awk -v heading="## [$TAG_VERSION]" 'index($0, heading) == 1 { found = 1 } END { exit !found }' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$TAG_VERSION]' heading"
+            exit 1
+          fi
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
 
   test:
     name: Test
     needs: [verify]
-    runs-on: ubuntu-latest
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          components: rustfmt, clippy
-
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -W clippy::all -W clippy::pedantic -D warnings
-
-      - name: Install nextest
-        uses: taiki-e/install-action@70e00552f3196d9a4c7dde7c57ef4c4830d422dd # v2.68.2
-        with:
-          tool: cargo-nextest
-
-      - run: cargo nextest run
+    uses: ./.github/workflows/ci.yml
 
   publish:
     name: Publish to crates.io
@@ -75,36 +61,17 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Authenticate with crates.io
-        uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1.0.3
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
 
-      - name: Publish
-        run: |
-          name=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          # Crates.io sparse-index path for this crate name.
-          len=${#name}
-          if [ "$len" -le 2 ]; then
-            path="$len/$name"
-          elif [ "$len" -eq 3 ]; then
-            path="3/${name:0:1}/$name"
-          else
-            path="${name:0:2}/${name:2:2}/$name"
-          fi
-          # Idempotent: if this version is already on crates.io, skip instead of
-          # failing the run (e.g. after an out-of-band manual publish).
-          if curl -sf "https://index.crates.io/$path" | jq -r '.vers' | grep -qx "$version"; then
-            echo "::notice::$name $version is already on crates.io — skipping publish."
-          else
-            cargo publish
-          fi
+      - run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
@@ -115,21 +82,26 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Install git-cliff
-        uses: taiki-e/install-action@70e00552f3196d9a4c7dde7c57ef4c4830d422dd # v2.68.2
-        with:
-          tool: git-cliff
-
-      - name: Generate release notes
-        run: git cliff --latest --strip header --output RELEASE_NOTES.md
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          awk -v heading="## [$VERSION]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if ! grep -q '[^[:space:]]' RELEASE_NOTES.md; then
+            echo "::error::CHANGELOG.md section '## [$VERSION]' is missing or empty"
+            exit 1
+          fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           body_path: RELEASE_NOTES.md
           generate_release_notes: false

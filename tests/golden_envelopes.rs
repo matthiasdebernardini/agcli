@@ -4,29 +4,26 @@
 //! agents feel instantly — these tests turn schema drift into a red test
 //! instead of a downstream agent outage, and double as a living spec.
 //!
-//! Timestamps are pinned via `SOURCE_DATE_EPOCH=0` (set per test process;
-//! `cargo nextest` runs each test in its own process).
+//! Timestamps are pinned with `AgentCli::clock(|| 0)`.
 
-use agcli::{ActionParam, AgentCli, Command, CommandError, CommandOutput, ExitCode, NextAction};
+use agcli::{
+    ActionParam, AgentCli, Command, CommandError, CommandOutput, ErrorCode, ExitCode, NextAction,
+};
 use serde_json::json;
 
-fn pin_clock() {
-    // SAFETY: nextest runs each test in its own process; no other thread is
-    // reading the environment concurrently at this point.
-    unsafe { std::env::set_var("SOURCE_DATE_EPOCH", "0") };
-}
-
-/// The fixed calc-shaped CLI every golden case runs against.
+/// The fixed calc-shaped CLI every golden case runs against, its clock
+/// pinned to the epoch.
 fn golden_cli() -> AgentCli {
     AgentCli::new("calc", "Agent-native calculator")
         .version("1.0.0")
+        .clock(|| 0)
         .command(
             Command::new("add", "Add two numbers")
                 .usage("calc add <a> <b>")
-                .handler(|req, _ctx| {
+                .handler(|req| {
                     let a = req.arg_parse::<f64>(0, "a");
                     let b = req.arg_parse::<f64>(1, "b");
-                    Box::pin(async move {
+                    async move {
                         let sum = a? + b?;
                         Ok(CommandOutput::new(json!({
                             "operation": "add",
@@ -37,35 +34,32 @@ fn golden_cli() -> AgentCli {
                                 .with_param("a", ActionParam::new().value(json!(sum)))
                                 .with_param("b", ActionParam::new().required(true)),
                         ))
-                    })
+                    }
                 }),
         )
         .command(
             Command::new("fail", "Always fails with a typed error")
                 .usage("calc fail")
-                .handler(|_req, _ctx| {
-                    Box::pin(async move {
-                        Err::<CommandOutput, _>(
-                            CommandError::new(
-                                "the thing was not found",
-                                "NOT_FOUND",
-                                "Create the thing first with `calc add <a> <b>`.",
-                            )
-                            .exit_code(ExitCode::NOT_FOUND),
+                .handler(|_req| async move {
+                    Err::<CommandOutput, _>(
+                        CommandError::new(
+                            ErrorCode::new("NOT_FOUND"),
+                            "the thing was not found",
+                            "Create the thing first with `calc add <a> <b>`.",
                         )
-                    })
+                        .exit_code(ExitCode::NOT_FOUND),
+                    )
                 }),
         )
 }
 
 async fn run(args: &[&str]) -> String {
-    pin_clock();
-    golden_cli().run_argv(args.iter().copied()).await.to_json()
+    golden_cli().run(args.iter().copied()).await.to_json()
 }
 
 /// Each case: (name, argv, expected exact JSON line).
-/// Regenerate an entry by running the invocation under `SOURCE_DATE_EPOCH=0`
-/// and reading stdout — but treat any diff as a schema break to justify.
+/// Regenerate an entry by running the invocation against `golden_cli()` and
+/// reading stdout — but treat any diff as a schema break to justify.
 macro_rules! golden {
     ($name:ident, $args:expr, $expected:expr) => {
         #[tokio::test]
@@ -109,7 +103,7 @@ golden!(
 golden!(
     invalid_arg_error,
     &["calc", "add", "foo", "bar"],
-    r#"{"ok":false,"command":"calc add foo bar","timestamp":"1970-01-01T00:00:00Z","exit_code":2,"error":{"message":"argument <a> is not valid: \"foo\"","code":"INVALID_ARG","retryable":false},"fix":"Pass a valid value for <a>.","next_actions":[{"command":"calc add <a> <b>","description":"Run this command template","params":{"a":{"required":true},"b":{"required":true}}},{"command":"calc","description":"Inspect the full command tree"}]}"#
+    r#"{"ok":false,"command":"calc add foo bar","timestamp":"1970-01-01T00:00:00Z","exit_code":2,"error":{"message":"argument <a> is not valid: \"foo\" (invalid float literal)","code":"INVALID_ARG","retryable":false},"fix":"Pass a valid value for <a>.","next_actions":[{"command":"calc add <a> <b>","description":"Run this command template","params":{"a":{"required":true},"b":{"required":true}}},{"command":"calc","description":"Inspect the full command tree"}]}"#
 );
 
 golden!(
@@ -127,7 +121,7 @@ golden!(
 golden!(
     unknown_flag_error,
     &["calc", "add", "1", "2", "--bogus"],
-    r#"{"ok":false,"command":"calc add 1 2 --bogus","timestamp":"1970-01-01T00:00:00Z","exit_code":2,"error":{"message":"unknown flag(s): --bogus","code":"UNKNOWN_FLAG","retryable":false},"fix":"`add` takes no flags of its own. Reserved agent flags (--select, --compact, --quiet, --dry-run, --yes, --no-input, --no-cache, --no-color, --stdin, --json, --version) are accepted on every command.","next_actions":[{"command":"calc add <a> <b>","description":"Run this command template","params":{"a":{"required":true},"b":{"required":true}}},{"command":"calc","description":"Inspect the full command tree"}]}"#
+    r#"{"ok":false,"command":"calc add 1 2 --bogus","timestamp":"1970-01-01T00:00:00Z","exit_code":2,"error":{"message":"unknown flag(s): --bogus","code":"UNKNOWN_FLAG","retryable":false},"fix":"`add` takes no flags of its own. Reserved agent flags (--select, --compact, --quiet, --dry-run, --yes, --no-input, --no-cache, --no-color, --stdin, --json) are accepted on every command, as are --help and --version.","next_actions":[{"command":"calc add <a> <b>","description":"Run this command template","params":{"a":{"required":true},"b":{"required":true}}},{"command":"calc","description":"Inspect the full command tree"}]}"#
 );
 
 golden!(
@@ -139,7 +133,7 @@ golden!(
 golden!(
     select_no_match_warns_instead_of_wiping,
     &["calc", "add", "1", "2", "--select=bogus"],
-    r#"{"ok":true,"command":"calc add 1 2 --select=bogus","timestamp":"1970-01-01T00:00:00Z","exit_code":0,"result":{"operation":"add","result":3.0,"select_warning":"--select=bogus matched no fields. Available top-level fields: operation, result. Returning the full result; re-run --select with a valid field name."},"next_actions":[{"command":"calc add <a> <b>","description":"Add two more numbers","params":{"a":{"value":3.0},"b":{"required":true}}}]}"#
+    r#"{"ok":true,"command":"calc add 1 2 --select=bogus","timestamp":"1970-01-01T00:00:00Z","exit_code":0,"result":{"operation":"add","result":3.0},"select_warning":"--select=bogus matched no fields. Available top-level fields: operation, result. Returning the full result; re-run --select with a valid field name.","next_actions":[{"command":"calc add <a> <b>","description":"Add two more numbers","params":{"a":{"value":3.0},"b":{"required":true}}}]}"#
 );
 
 golden!(
@@ -165,16 +159,15 @@ golden!(
 fn list_golden_cli() -> AgentCli {
     AgentCli::new("notes", "Agent-native notes")
         .version("1.0.0")
+        .clock(|| 0)
         .command(
             Command::new("ls", "List notes")
                 .usage("notes ls")
-                .handler(|_req, _ctx| {
-                    Box::pin(async move {
-                        Ok(CommandOutput::list(vec![
-                            json!({ "id": 1, "title": "first", "done": false }),
-                            json!({ "id": 2, "title": "second", "done": true }),
-                        ]))
-                    })
+                .handler(|_req| async move {
+                    Ok(CommandOutput::list(vec![
+                        json!({ "id": 1, "title": "first", "done": false }),
+                        json!({ "id": 2, "title": "second", "done": true }),
+                    ]))
                 }),
         )
 }
@@ -184,8 +177,7 @@ fn list_golden_cli() -> AgentCli {
 /// `--select` advertisement that re-runs this invocation projected.
 #[tokio::test]
 async fn list_envelope() {
-    pin_clock();
-    let actual = list_golden_cli().run_argv(["notes", "ls"]).await.to_json();
+    let actual = list_golden_cli().run(["notes", "ls"]).await.to_json();
     assert_eq!(
         actual,
         r#"{"ok":true,"command":"notes ls","timestamp":"1970-01-01T00:00:00Z","exit_code":0,"result":{"count":2,"fields":["items.done","items.id","items.title"],"items":[{"done":false,"id":1,"title":"first"},{"done":true,"id":2,"title":"second"}],"total":2,"truncated":false},"next_actions":[{"command":"notes ls","description":"Run this command template"},{"command":"notes","description":"Inspect the full command tree"},{"command":"notes ls --select=<fields>","description":"Re-run projected to only the fields you need — smaller result, same data","params":{"fields":{"description":"Comma-separated subset of: items.done, items.id, items.title (dot paths project each row)","required":true}}}]}"#,
@@ -215,4 +207,23 @@ async fn root_tree_structure_and_determinism() {
             "root tree lost its `{key}` section"
         );
     }
+}
+
+/// 1970-03-02 is the civil-date edge: the day after February in the first
+/// year, where a slip in the days-to-date arithmetic renders the impossible
+/// `1970-02-30`. Common epochs (2020, 2024) do not tell the two apart.
+#[tokio::test]
+async fn timestamp_renders_the_day_after_the_first_february() {
+    let cli = AgentCli::new("t", "t").clock(|| 5_184_000).command(
+        Command::new("ping", "p")
+            .handler(|_r| async move { Ok(CommandOutput::new(json!({"ok": true}))) }),
+    );
+
+    let exec = cli.run(["ping"]).await;
+    let env: serde_json::Value = serde_json::from_str(&exec.to_json()).unwrap();
+
+    assert_eq!(
+        env["timestamp"], "1970-03-02T00:00:00Z",
+        "timestamp must be 1970-03-02, never the impossible 1970-02-30"
+    );
 }

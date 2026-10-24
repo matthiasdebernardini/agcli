@@ -1,353 +1,137 @@
-use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+//! The JSON envelopes every command answers with.
 
+#[cfg(feature = "deserialize")]
+use serde::de;
+use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-/// Latest epoch second representable as a four-digit-year RFC 3339 timestamp
-/// (9999-12-31T23:59:59Z). Larger pins would emit a string the crate's own
-/// [`parse_rfc3339_utc`] rejects, breaking round-trips of our own output.
-const MAX_RFC3339_EPOCH: u64 = 253_402_300_799;
+use crate::codes::{ErrorCode, ExitCode};
+use crate::command_error::CommandError;
+use crate::next_action::NextAction;
+use crate::timestamp::Timestamp;
 
-fn epoch_secs() -> u64 {
-    // SOURCE_DATE_EPOCH (the reproducible-builds convention) pins the envelope
-    // timestamp so two runs of the same command can be byte-compared. Per the
-    // spec a malformed value must not fall back to the wall clock — that would
-    // silently defeat the pin — so it clamps to 0; negative values clamp to 0;
-    // values past the four-digit-year ceiling clamp to MAX_RFC3339_EPOCH.
-    if let Ok(raw) = std::env::var("SOURCE_DATE_EPOCH") {
-        return pin_from_source_date_epoch(&raw);
-    }
-    // Never panic on a misconfigured clock: a timestamp of 0 keeps the
-    // envelope valid and JSON-emittable, honoring the "JSON always" contract
-    // even on a machine whose wall clock is set before 1970.
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Resolve a `SOURCE_DATE_EPOCH` value to a usable epoch second. Malformed
-/// and negative values clamp to 0 (never the wall clock — that would silently
-/// defeat the pin); oversized values clamp to [`MAX_RFC3339_EPOCH`].
-fn pin_from_source_date_epoch(raw: &str) -> u64 {
-    match raw.trim().parse::<i128>() {
-        Ok(n) if n < 0 => 0,
-        Ok(n) => u64::try_from(n)
-            .unwrap_or(MAX_RFC3339_EPOCH)
-            .min(MAX_RFC3339_EPOCH),
-        Err(_) => 0,
-    }
-}
-
-/// Format epoch seconds as an RFC 3339 UTC timestamp (`2026-06-10T14:42:17Z`).
-///
-/// Hand-rolled (Howard Hinnant's civil-from-days algorithm) so the dependency
-/// set stays serde/serde_json/tokio. Envelopes serialize `timestamp` through
-/// this so agents read the current date directly instead of epoch seconds.
-pub(crate) fn rfc3339_utc(epoch: u64) -> String {
-    let secs_of_day = epoch % 86_400;
-    let (hh, mm, ss) = (
-        secs_of_day / 3_600,
-        secs_of_day % 3_600 / 60,
-        secs_of_day % 60,
-    );
-
-    // epoch is unsigned, so plain division suffices: no pre-1970 date can
-    // reach here (epoch_secs clamps a misconfigured clock to 0).
-    let z = epoch / 86_400 + 719_468;
-    let era = z / 146_097;
-    let doe = z % 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
-
-    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
-
-/// Parse exactly the shape [`rfc3339_utc`] emits (`YYYY-MM-DDTHH:MM:SSZ`)
-/// back to epoch seconds. Returns `None` for anything else, including
-/// pre-1970 dates and non-UTC offsets.
-#[cfg(any(feature = "deserialize", test))]
-pub(crate) fn parse_rfc3339_utc(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    if b.len() != 20
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-        || b[19] != b'Z'
-    {
-        return None;
-    }
-    let num = |range: std::ops::Range<usize>| s[range].parse::<u64>().ok();
-    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    if hh > 23 || mm > 59 || ss > 59 {
-        return None;
-    }
-
-    // Hinnant's days_from_civil, the inverse of rfc3339_utc above.
-    let y = year - u64::from(month <= 2);
-    let era = y / 400;
-    let yoe = y % 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
-}
-
-/// Accept `timestamp` as either the RFC 3339 string current envelopes emit or
-/// the legacy epoch integer (pre-0.11 captures). Unparseable values fold to 0
-/// — the same lenient default as a missing field.
-#[cfg(feature = "deserialize")]
-pub(crate) fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Repr {
-        Epoch(u64),
-        Rfc3339(String),
-        Other(serde::de::IgnoredAny),
-    }
-    Ok(match Repr::deserialize(deserializer)? {
-        Repr::Epoch(n) => n,
-        Repr::Rfc3339(s) => parse_rfc3339_utc(&s).unwrap_or(0),
-        Repr::Other(_) => 0,
-    })
-}
-
-/// Mask an exit code into the 0–255 range a Unix process status occupies.
-///
-/// `std::process::exit` truncates to the low 8 bits, so an out-of-range code
-/// would make the serialized `exit_code` field disagree with the real process
-/// status (`exit(256)` → status `0`). Masking keeps the JSON field equal to
-/// what the shell observes via `$?`.
-///
-/// This masks silently: it runs in the framework's post-handler path, *after*
-/// the handler panic guard, so an assertion here would unwind past the
-/// envelope machinery and print nothing to stdout — the exact non-JSON
-/// failure the framework exists to prevent. The development-time
-/// `debug_assert` for out-of-range codes lives in
-/// [`crate::CommandOutput::exit_code`] / [`crate::CommandError::exit_code`]
-/// instead, where a panic is caught and folded into a `HANDLER_PANIC`
-/// envelope.
-pub(crate) fn normalize_exit_code(code: i32) -> i32 {
-    code & 0xff
-}
-
-/// Typed process exit codes for agent self-correction.
-///
-/// Agents (and shells) branch on the integer exit status without parsing
-/// error text. The taxonomy mirrors the conventions popularized by
-/// agent-native CLI generators: a distinct code per failure class so a
-/// caller can decide whether to retry, re-authenticate, or fix arguments.
-///
-/// Each envelope carries the code in two places that always agree: the
-/// serialized `exit_code` JSON field and the process status returned by
-/// [`crate::Execution::exit_code`]. Use these constants with
-/// [`crate::CommandError::exit_code`] and [`crate::CommandOutput::exit_code`]
-/// — they all fall inside the maskable 0–255 range.
-pub struct ExitCode;
-
-impl ExitCode {
-    /// Command succeeded.
-    pub const SUCCESS: i32 = 0;
-    /// Generic, unclassified failure (the default for handler errors).
-    pub const ERROR: i32 = 1;
-    /// Bad invocation: unknown command, bad flag, missing argument.
-    pub const USAGE: i32 = 2;
-    /// A requested resource does not exist.
-    pub const NOT_FOUND: i32 = 3;
-    /// Authentication or authorization failure.
-    pub const AUTH: i32 = 4;
-    /// An upstream/API call failed.
-    pub const API: i32 = 5;
-    /// The caller is being rate limited and should back off.
-    pub const RATE_LIMITED: i32 = 7;
-}
-
-/// HATEOAS action template that tells an agent what to run next.
-#[derive(Clone, Debug, Serialize, PartialEq)]
-#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
-pub struct NextAction {
-    pub command: String,
-    pub description: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<BTreeMap<String, ActionParam>>,
-}
-
-impl NextAction {
-    pub fn new(command: impl Into<String>, description: impl Into<String>) -> Self {
-        Self {
-            command: command.into(),
-            description: description.into(),
-            params: None,
-        }
-    }
-
-    pub fn with_param(mut self, name: impl Into<String>, param: ActionParam) -> Self {
-        self.params
-            .get_or_insert_with(BTreeMap::new)
-            .insert(name.into(), param);
-        self
-    }
-}
-
-/// Metadata for a templated `next_action` parameter.
-#[derive(Clone, Debug, Serialize, PartialEq)]
-#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
-pub struct ActionParam {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default: Option<Value>,
-    #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
-    pub enum_values: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub required: Option<bool>,
-}
-
-impl ActionParam {
-    pub fn new() -> Self {
-        Self {
-            description: None,
-            value: None,
-            default: None,
-            enum_values: None,
-            required: None,
-        }
-    }
-
-    pub fn description(mut self, description: impl Into<String>) -> Self {
-        self.description = Some(description.into());
-        self
-    }
-
-    pub fn value(mut self, value: impl Into<Value>) -> Self {
-        self.value = Some(value.into());
-        self
-    }
-
-    pub fn default(mut self, value: impl Into<Value>) -> Self {
-        self.default = Some(value.into());
-        self
-    }
-
-    pub fn enum_values<I, S>(mut self, values: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.enum_values = Some(values.into_iter().map(Into::into).collect());
-        self
-    }
-
-    pub fn required(mut self, required: bool) -> Self {
-        self.required = Some(required);
-        self
-    }
-}
-
-impl Default for ActionParam {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Machine-readable error payload.
+/// Machine-readable error payload: the envelope's `error` object, with its
+/// keys in this order.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
+#[non_exhaustive]
 pub struct ErrorBody {
+    /// What went wrong, for the agent to read.
     pub message: String,
-    pub code: String,
+    /// The failure class, for the agent to branch on.
+    pub code: ErrorCode,
+    /// Whether the same invocation can succeed later.
     pub retryable: bool,
-}
-
-impl ErrorBody {
-    pub fn new(message: impl Into<String>, code: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            code: code.into(),
-            retryable: false,
-        }
-    }
-
-    pub fn retryable(mut self, retryable: bool) -> Self {
-        self.retryable = retryable;
-        self
-    }
 }
 
 /// Success response envelope.
 ///
 /// Always serializes with `"ok": true`. The `ok` field is not stored;
 /// it is injected at serialization time and validated at deserialization time.
+///
+/// The framework builds every envelope; read one from
+/// [`Execution::envelope`](crate::Execution::envelope), or decode one with
+/// the `deserialize` feature.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct SuccessEnvelope {
+    /// The invocation as one shell line that reruns as printed: the program's
+    /// file name, then every argument, single-quoted where it needs to be.
     pub command: String,
-    pub timestamp: u64,
+    /// The run's clock, read when the envelope was built. Serialized as the
+    /// `timestamp` key, an RFC 3339 UTC string.
+    pub timestamp: Timestamp,
+    /// The CLI's [`AgentCli::schema_version`](crate::AgentCli::schema_version),
+    /// when it set one.
     pub schema_version: Option<String>,
+    /// The command's payload, after `--select` and `--compact`.
     pub result: Value,
+    /// Set when the reserved `--select` projection could not do what it was
+    /// asked (no field names, or names that match nothing): what went wrong
+    /// and which fields exist. Serialized as the `select_warning` key, beside
+    /// `result` rather than inside it, and omitted when `None`.
+    pub select_warning: Option<String>,
+    /// What the agent can run next. Empty under `--quiet`.
     pub next_actions: Vec<NextAction>,
     /// Process exit code. Defaults to [`ExitCode::SUCCESS`]. A handler may
     /// override it (e.g. a `doctor` command reporting an unhealthy system
     /// while still producing a valid `ok: true` envelope). Serialized as the
-    /// `exit_code` field and masked to 0–255 so it equals the process status.
-    pub exit_code: i32,
+    /// `exit_code` field, equal to the process status.
+    pub exit_code: ExitCode,
 }
 
 impl SuccessEnvelope {
-    pub fn new(command: impl Into<String>, result: Value, next_actions: Vec<NextAction>) -> Self {
+    pub(crate) fn new(
+        command: String,
+        timestamp: Timestamp,
+        result: Value,
+        next_actions: Vec<NextAction>,
+    ) -> Self {
         Self {
-            command: command.into(),
-            timestamp: epoch_secs(),
+            command,
+            timestamp,
             schema_version: None,
             result,
+            select_warning: None,
             next_actions,
             exit_code: ExitCode::SUCCESS,
         }
     }
 
-    pub fn schema_version(mut self, version: impl Into<String>) -> Self {
-        self.schema_version = Some(version.into());
+    #[must_use]
+    pub(crate) fn select_warning(mut self, warning: Option<String>) -> Self {
+        self.select_warning = warning;
         self
     }
 
-    pub fn exit_code(mut self, code: i32) -> Self {
-        self.exit_code = normalize_exit_code(code);
+    #[must_use]
+    pub(crate) fn schema_version(mut self, version: &str) -> Self {
+        self.schema_version = Some(version.to_string());
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn exit_code(mut self, code: ExitCode) -> Self {
+        self.exit_code = code;
         self
     }
 }
 
 impl Serialize for SuccessEnvelope {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let field_count = 6 + usize::from(self.schema_version.is_some());
-        let mut s = serializer.serialize_struct("SuccessEnvelope", field_count)?;
-        s.serialize_field("ok", &true)?;
-        s.serialize_field("command", &self.command)?;
-        s.serialize_field("timestamp", &rfc3339_utc(self.timestamp))?;
-        s.serialize_field("exit_code", &self.exit_code)?;
-        if let Some(ref sv) = self.schema_version {
-            s.serialize_field("schema_version", sv)?;
+        self.serialize_framed(serializer, None)
+    }
+}
+
+impl SuccessEnvelope {
+    /// Serialize the envelope, led by a `type` key when it is a stream's
+    /// terminal line.
+    fn serialize_framed<S: Serializer>(
+        &self,
+        serializer: S,
+        stream_type: Option<&str>,
+    ) -> Result<S::Ok, S::Error> {
+        let field_count = 6
+            + usize::from(stream_type.is_some())
+            + usize::from(self.schema_version.is_some())
+            + usize::from(self.select_warning.is_some());
+        let mut s = serializer.serialize_map(Some(field_count))?;
+        if let Some(kind) = stream_type {
+            s.serialize_entry("type", kind)?;
         }
-        s.serialize_field("result", &self.result)?;
-        s.serialize_field("next_actions", &self.next_actions)?;
+        s.serialize_entry("ok", &true)?;
+        s.serialize_entry("command", &self.command)?;
+        s.serialize_entry("timestamp", &self.timestamp)?;
+        s.serialize_entry("exit_code", &self.exit_code)?;
+        if let Some(ref version) = self.schema_version {
+            s.serialize_entry("schema_version", version)?;
+        }
+        s.serialize_entry("result", &self.result)?;
+        if let Some(ref warning) = self.select_warning {
+            s.serialize_entry("select_warning", warning)?;
+        }
+        s.serialize_entry("next_actions", &self.next_actions)?;
         s.end()
     }
 }
@@ -362,26 +146,23 @@ impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
         struct Raw {
             ok: bool,
             command: String,
-            #[serde(default, deserialize_with = "deserialize_timestamp")]
-            timestamp: u64,
-            #[serde(default)]
-            exit_code: i32,
-            #[serde(default)]
+            timestamp: Timestamp,
+            exit_code: ExitCode,
             schema_version: Option<String>,
             result: Value,
+            select_warning: Option<String>,
             next_actions: Vec<NextAction>,
         }
         let raw = Raw::deserialize(deserializer)?;
         if !raw.ok {
-            return Err(serde::de::Error::custom(
-                "expected ok=true for SuccessEnvelope",
-            ));
+            return Err(de::Error::custom("expected ok=true for SuccessEnvelope"));
         }
         Ok(SuccessEnvelope {
             command: raw.command,
             timestamp: raw.timestamp,
             schema_version: raw.schema_version,
             result: raw.result,
+            select_warning: raw.select_warning,
             next_actions: raw.next_actions,
             exit_code: raw.exit_code,
         })
@@ -392,86 +173,101 @@ impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
 ///
 /// Always serializes with `"ok": false`. The `ok` field is not stored;
 /// it is injected at serialization time and validated at deserialization time.
+///
+/// Built by the framework from a [`CommandError`]; read one from
+/// [`Execution::envelope`](crate::Execution::envelope), or decode one with
+/// the `deserialize` feature.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ErrorEnvelope {
+    /// The invocation as one shell line that reruns as printed, as in
+    /// [`SuccessEnvelope::command`].
     pub command: String,
-    pub timestamp: u64,
+    /// The run's clock, read when the envelope was built. Serialized as the
+    /// `timestamp` key, an RFC 3339 UTC string.
+    pub timestamp: Timestamp,
+    /// The CLI's [`AgentCli::schema_version`](crate::AgentCli::schema_version),
+    /// when it set one.
     pub schema_version: Option<String>,
+    /// What went wrong, its class, and whether a retry can work.
     pub error: ErrorBody,
+    /// How to recover.
     pub fix: String,
+    /// What the agent can run to recover. `--quiet` leaves them in: they are
+    /// the way out.
     pub next_actions: Vec<NextAction>,
-    /// Process exit code. Defaults to [`ExitCode::ERROR`]. Serialized as the
-    /// `exit_code` field (alongside the failure class in `error.code`) and
-    /// masked to 0–255 so it equals the process status.
-    pub exit_code: i32,
-    /// Optional structured payload describing the failure — the rejected
+    /// Process exit code: the error's own, else [`ExitCode::ERROR`].
+    /// Serialized as the `exit_code` field (alongside the failure class in
+    /// `error.code`), equal to the process status.
+    pub exit_code: ExitCode,
+    /// Optional structured payload describing the failure: the rejected
     /// rows, the upstream reply, the conflicting id. Serialized as the `data`
-    /// key and omitted entirely when `None`, so an error that has nothing
-    /// structured to add keeps the envelope it always had.
+    /// key, between `fix` and `next_actions`, and left out when `None`.
     pub data: Option<Value>,
 }
 
 impl ErrorEnvelope {
-    pub fn new(
-        command: impl Into<String>,
-        message: impl Into<String>,
-        code: impl Into<String>,
-        fix: impl Into<String>,
-        next_actions: Vec<NextAction>,
-    ) -> Self {
+    /// The envelope reporting `error` for the run of `command` at
+    /// `timestamp`.
+    pub(crate) fn new(command: String, timestamp: Timestamp, error: CommandError) -> Self {
         Self {
-            command: command.into(),
-            timestamp: epoch_secs(),
+            command,
+            timestamp,
             schema_version: None,
-            error: ErrorBody::new(message, code),
-            fix: fix.into(),
-            next_actions,
-            exit_code: ExitCode::ERROR,
-            data: None,
+            error: ErrorBody {
+                message: error.message,
+                code: error.code,
+                retryable: error.retryable,
+            },
+            fix: error.fix,
+            next_actions: error.next_actions,
+            exit_code: error.exit_code.unwrap_or(ExitCode::ERROR),
+            data: error.data.map(|payload| *payload),
         }
     }
 
-    pub fn retryable(mut self, retryable: bool) -> Self {
-        self.error.retryable = retryable;
-        self
-    }
-
-    /// Attach the structured `data` payload. See [`crate::CommandError::data`].
-    pub fn data(mut self, data: impl Into<Value>) -> Self {
-        self.data = Some(data.into());
-        self
-    }
-
-    pub fn schema_version(mut self, version: impl Into<String>) -> Self {
-        self.schema_version = Some(version.into());
-        self
-    }
-
-    pub fn exit_code(mut self, code: i32) -> Self {
-        self.exit_code = normalize_exit_code(code);
+    #[must_use]
+    pub(crate) fn schema_version(mut self, version: &str) -> Self {
+        self.schema_version = Some(version.to_string());
         self
     }
 }
 
 impl Serialize for ErrorEnvelope {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let field_count =
-            7 + usize::from(self.schema_version.is_some()) + usize::from(self.data.is_some());
-        let mut s = serializer.serialize_struct("ErrorEnvelope", field_count)?;
-        s.serialize_field("ok", &false)?;
-        s.serialize_field("command", &self.command)?;
-        s.serialize_field("timestamp", &rfc3339_utc(self.timestamp))?;
-        s.serialize_field("exit_code", &self.exit_code)?;
-        if let Some(ref sv) = self.schema_version {
-            s.serialize_field("schema_version", sv)?;
+        self.serialize_framed(serializer, None)
+    }
+}
+
+impl ErrorEnvelope {
+    /// Serialize the envelope, led by a `type` key when it is a stream's
+    /// terminal line.
+    fn serialize_framed<S: Serializer>(
+        &self,
+        serializer: S,
+        stream_type: Option<&str>,
+    ) -> Result<S::Ok, S::Error> {
+        let field_count = 7
+            + usize::from(stream_type.is_some())
+            + usize::from(self.schema_version.is_some())
+            + usize::from(self.data.is_some());
+        let mut s = serializer.serialize_map(Some(field_count))?;
+        if let Some(kind) = stream_type {
+            s.serialize_entry("type", kind)?;
         }
-        s.serialize_field("error", &self.error)?;
-        s.serialize_field("fix", &self.fix)?;
+        s.serialize_entry("ok", &false)?;
+        s.serialize_entry("command", &self.command)?;
+        s.serialize_entry("timestamp", &self.timestamp)?;
+        s.serialize_entry("exit_code", &self.exit_code)?;
+        if let Some(ref version) = self.schema_version {
+            s.serialize_entry("schema_version", version)?;
+        }
+        s.serialize_entry("error", &self.error)?;
+        s.serialize_entry("fix", &self.fix)?;
         if let Some(ref data) = self.data {
-            s.serialize_field("data", data)?;
+            s.serialize_entry("data", data)?;
         }
-        s.serialize_field("next_actions", &self.next_actions)?;
+        s.serialize_entry("next_actions", &self.next_actions)?;
         s.end()
     }
 }
@@ -482,30 +278,21 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
     where
         D: serde::Deserializer<'de>,
     {
-        fn default_error_exit_code() -> i32 {
-            ExitCode::ERROR
-        }
         #[derive(serde::Deserialize)]
         struct Raw {
             ok: bool,
             command: String,
-            #[serde(default, deserialize_with = "deserialize_timestamp")]
-            timestamp: u64,
-            #[serde(default = "default_error_exit_code")]
-            exit_code: i32,
-            #[serde(default)]
+            timestamp: Timestamp,
+            exit_code: ExitCode,
             schema_version: Option<String>,
             error: ErrorBody,
             fix: String,
-            #[serde(default)]
             data: Option<Value>,
             next_actions: Vec<NextAction>,
         }
         let raw = Raw::deserialize(deserializer)?;
         if raw.ok {
-            return Err(serde::de::Error::custom(
-                "expected ok=false for ErrorEnvelope",
-            ));
+            return Err(de::Error::custom("expected ok=false for ErrorEnvelope"));
         }
         Ok(ErrorEnvelope {
             command: raw.command,
@@ -520,11 +307,17 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
     }
 }
 
-/// Unified envelope enum.
+/// Either answer a run gives: a success or an error envelope.
+///
+/// Read it from [`Execution::envelope`](crate::Execution::envelope);
+/// [`Envelope::ok`] tells which it is. It serializes as the envelope itself,
+/// and decodes (with the `deserialize` feature) by its `ok` key.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum Envelope {
+    /// `"ok": true`: the command ran and answered.
     Success(SuccessEnvelope),
+    /// `"ok": false`: the command, or the framework on its behalf, failed.
     Error(ErrorEnvelope),
 }
 
@@ -538,20 +331,22 @@ impl<'de> serde::Deserialize<'de> for Envelope {
         let ok = value
             .get("ok")
             .and_then(Value::as_bool)
-            .ok_or_else(|| serde::de::Error::custom("missing or invalid `ok` field"))?;
+            .ok_or_else(|| de::Error::custom("missing or invalid `ok` field"))?;
         if ok {
             serde_json::from_value(value)
                 .map(Envelope::Success)
-                .map_err(serde::de::Error::custom)
+                .map_err(de::Error::custom)
         } else {
             serde_json::from_value(value)
                 .map(Envelope::Error)
-                .map_err(serde::de::Error::custom)
+                .map_err(de::Error::custom)
         }
     }
 }
 
 impl Envelope {
+    /// The envelope's `command`: the invocation as one shell line.
+    #[must_use]
     pub fn command(&self) -> &str {
         match self {
             Self::Success(value) => &value.command,
@@ -559,27 +354,78 @@ impl Envelope {
         }
     }
 
+    /// True for a success envelope, the value of its `ok` key.
+    #[must_use]
     pub fn ok(&self) -> bool {
         matches!(self, Self::Success(_))
     }
 
-    pub fn exit_code(&self) -> i32 {
+    /// The envelope's `exit_code`, equal to the process status.
+    #[must_use]
+    pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Success(value) => value.exit_code,
             Self::Error(value) => value.exit_code,
         }
     }
 
+    /// The envelope's timestamp.
+    #[must_use]
+    pub(crate) fn timestamp(&self) -> Timestamp {
+        match self {
+            Self::Success(value) => value.timestamp,
+            Self::Error(value) => value.timestamp,
+        }
+    }
+
+    /// Serialize the envelope to compact JSON. If `self` cannot serialize,
+    /// this returns a `SERIALIZATION_FAILED` error envelope instead, so the
+    /// caller always gets a JSON envelope.
+    ///
+    /// # Panics
+    ///
+    /// Only if that fallback error envelope itself fails to serialize, which
+    /// cannot happen: it holds only strings, integers and booleans, with no
+    /// non-string map keys and no non-finite floats.
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|e| {
-            serde_json::to_string(&self.serialization_fallback(e))
+            serde_json::to_string(&self.serialization_fallback(&e))
                 .expect("error-shaped fallback envelope always serializes")
         })
     }
 
+    /// Serialize the envelope to indented JSON, with the same fallback as
+    /// [`Envelope::to_json`].
+    ///
+    /// # Panics
+    ///
+    /// Only if the fallback error envelope fails to serialize, which cannot
+    /// happen (see [`Envelope::to_json`]).
+    #[must_use]
     pub fn to_json_pretty(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| {
-            serde_json::to_string_pretty(&self.serialization_fallback(e))
+            serde_json::to_string_pretty(&self.serialization_fallback(&e))
+                .expect("error-shaped fallback envelope always serializes")
+        })
+    }
+
+    /// Serialize the envelope as a stream's terminal line: the same JSON as
+    /// [`Envelope::to_json`] with `"type":"result"` or `"type":"error"` in
+    /// front, and the same fallback.
+    pub(crate) fn to_stream_json(&self) -> String {
+        serde_json::to_string(&StreamTerminal(self)).unwrap_or_else(|e| {
+            let fallback = Self::Error(self.serialization_fallback(&e));
+            serde_json::to_string(&StreamTerminal(&fallback))
+                .expect("error-shaped fallback envelope always serializes")
+        })
+    }
+
+    /// [`Envelope::to_stream_json`], indented.
+    pub(crate) fn to_stream_json_pretty(&self) -> String {
+        serde_json::to_string_pretty(&StreamTerminal(self)).unwrap_or_else(|e| {
+            let fallback = Self::Error(self.serialization_fallback(&e));
+            serde_json::to_string_pretty(&StreamTerminal(&fallback))
                 .expect("error-shaped fallback envelope always serializes")
         })
     }
@@ -589,14 +435,28 @@ impl Envelope {
     /// parses `error.code` / `error.retryable` still finds them here, instead
     /// of a bare `error` string with no `exit_code`. Serializing this fallback
     /// cannot itself fail (no non-string object keys, no NaN/Inf numbers).
-    fn serialization_fallback(&self, err: serde_json::Error) -> ErrorEnvelope {
+    fn serialization_fallback(&self, err: &serde_json::Error) -> ErrorEnvelope {
         ErrorEnvelope::new(
             self.command().to_string(),
-            format!("serialization failed: {err}"),
-            "SERIALIZATION_FAILED",
-            "Report this as a bug; the command produced a value that could not be serialized.",
-            Vec::new(),
+            self.timestamp(),
+            CommandError::new(
+                ErrorCode::SERIALIZATION_FAILED,
+                format!("serialization failed: {err}"),
+                "Report this as a bug; the command produced a value that could not be serialized.",
+            ),
         )
+    }
+}
+
+/// An envelope framed as the terminal line of an NDJSON stream.
+struct StreamTerminal<'envelope>(&'envelope Envelope);
+
+impl Serialize for StreamTerminal<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Envelope::Success(envelope) => envelope.serialize_framed(serializer, Some("result")),
+            Envelope::Error(envelope) => envelope.serialize_framed(serializer, Some("error")),
+        }
     }
 }
 
@@ -617,56 +477,33 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn source_date_epoch_pin_parses_and_clamps() {
-        // Normal value passes through.
-        assert_eq!(pin_from_source_date_epoch("1700000000"), 1_700_000_000);
-        assert_eq!(pin_from_source_date_epoch(" 0 "), 0);
-        // Malformed and negative values clamp to 0 per the
-        // reproducible-builds convention — never the wall clock.
-        assert_eq!(pin_from_source_date_epoch("not-a-number"), 0);
-        assert_eq!(pin_from_source_date_epoch(""), 0);
-        assert_eq!(pin_from_source_date_epoch("-5"), 0);
-        // Values past the four-digit-year ceiling clamp so the emitted
-        // timestamp stays parseable by our own parser.
-        assert_eq!(
-            pin_from_source_date_epoch("18446744073709551615"),
-            MAX_RFC3339_EPOCH
-        );
-        assert_eq!(
-            pin_from_source_date_epoch("999999999999999999999999"),
-            MAX_RFC3339_EPOCH
-        );
+    fn at(secs: u64) -> Timestamp {
+        Timestamp::from_epoch_secs(secs).expect("in range")
     }
 
-    #[test]
-    fn max_rfc3339_epoch_round_trips_through_own_parser() {
-        let rendered = rfc3339_utc(MAX_RFC3339_EPOCH);
-        assert_eq!(rendered, "9999-12-31T23:59:59Z");
-        assert_eq!(parse_rfc3339_utc(&rendered), Some(MAX_RFC3339_EPOCH));
+    fn success() -> SuccessEnvelope {
+        SuccessEnvelope::new(
+            "wokhei status".to_string(),
+            at(1_740_000_000),
+            json!({ "healthy": true }),
+            vec![NextAction::new("wokhei status", "Re-check health")],
+        )
+    }
+
+    fn error(code: ErrorCode) -> ErrorEnvelope {
+        ErrorEnvelope::new(
+            "wokhei publish".to_string(),
+            at(1_740_000_000),
+            CommandError::new(code, "invalid json", "Use valid JSON input"),
+        )
     }
 
     #[test]
     fn success_envelope_serializes_required_fields() {
-        let envelope = SuccessEnvelope::new(
-            "wokhei status",
-            json!({ "healthy": true }),
-            vec![NextAction::new("wokhei status", "Re-check health")],
-        );
-
-        let encoded = serde_json::to_value(&envelope).expect("must serialize");
+        let encoded = serde_json::to_value(success()).expect("must serialize");
         assert_eq!(encoded["ok"], Value::Bool(true));
-        assert_eq!(
-            encoded["command"],
-            Value::String("wokhei status".to_string())
-        );
-        let ts = encoded["timestamp"]
-            .as_str()
-            .expect("timestamp is a string");
-        assert!(
-            parse_rfc3339_utc(ts).is_some(),
-            "timestamp must be RFC 3339 UTC: {ts}"
-        );
+        assert_eq!(encoded["command"], json!("wokhei status"));
+        assert_eq!(encoded["timestamp"], json!("2025-02-19T21:20:00Z"));
         assert!(encoded["next_actions"].is_array());
         // exit_code is always present; success defaults to 0.
         assert_eq!(encoded["exit_code"], json!(0));
@@ -676,7 +513,7 @@ mod tests {
 
     #[test]
     fn success_envelope_serializes_overridden_exit_code() {
-        let envelope = SuccessEnvelope::new("cmd", json!(null), vec![]).exit_code(4);
+        let envelope = success().exit_code(ExitCode::AUTH);
         let encoded = serde_json::to_value(&envelope).expect("must serialize");
         assert_eq!(encoded["ok"], Value::Bool(true));
         assert_eq!(encoded["exit_code"], json!(4));
@@ -684,39 +521,20 @@ mod tests {
 
     #[test]
     fn success_envelope_with_schema_version() {
-        let envelope = SuccessEnvelope::new("cmd", json!(null), vec![]).schema_version("test.v1");
+        let envelope = success().schema_version("test.v1");
         let encoded = serde_json::to_value(&envelope).expect("must serialize");
         assert_eq!(encoded["schema_version"], json!("test.v1"));
     }
 
     #[test]
     fn error_envelope_serializes_fix() {
-        let envelope = ErrorEnvelope::new(
-            "wokhei publish",
-            "invalid json",
-            "INVALID_JSON",
-            "Use valid JSON input",
-            vec![],
-        );
-
-        let encoded = serde_json::to_value(&envelope).expect("must serialize");
+        let encoded =
+            serde_json::to_value(error(ErrorCode::new("INVALID_JSON"))).expect("must serialize");
         assert_eq!(encoded["ok"], Value::Bool(false));
-        assert_eq!(
-            encoded["error"]["code"],
-            Value::String("INVALID_JSON".to_string())
-        );
+        assert_eq!(encoded["error"]["code"], json!("INVALID_JSON"));
         assert_eq!(encoded["error"]["retryable"], Value::Bool(false));
-        let ts = encoded["timestamp"]
-            .as_str()
-            .expect("timestamp is a string");
-        assert!(
-            parse_rfc3339_utc(ts).is_some(),
-            "timestamp must be RFC 3339 UTC: {ts}"
-        );
-        assert_eq!(
-            encoded["fix"],
-            Value::String("Use valid JSON input".to_string())
-        );
+        assert_eq!(encoded["timestamp"], json!("2025-02-19T21:20:00Z"));
+        assert_eq!(encoded["fix"], json!("Use valid JSON input"));
         // exit_code is always present; errors default to 1.
         assert_eq!(encoded["exit_code"], json!(1));
         // schema_version omitted when None
@@ -724,194 +542,205 @@ mod tests {
     }
 
     #[test]
-    fn error_envelope_serializes_typed_exit_code() {
-        let envelope =
-            ErrorEnvelope::new("cmd", "missing", "NOT_FOUND", "check id", vec![]).exit_code(3);
+    fn error_envelope_carries_the_errors_exit_code_and_retry_hint() {
+        let envelope = ErrorEnvelope::new(
+            "cmd".to_string(),
+            Timestamp::UNIX_EPOCH,
+            CommandError::new(ErrorCode::new("NOT_FOUND"), "missing", "check id")
+                .exit_code(ExitCode::NOT_FOUND)
+                .retryable(true),
+        )
+        .schema_version("test.v1");
         let encoded = serde_json::to_value(&envelope).expect("must serialize");
         assert_eq!(encoded["exit_code"], json!(3));
-    }
-
-    #[test]
-    fn exit_code_in_range_matches_json_and_status() {
-        // The serialized exit_code field must equal what the process status
-        // will be (masked to the low 8 bits).
-        let e = ErrorEnvelope::new("cmd", "m", "C", "fix", vec![]).exit_code(7);
-        let encoded = serde_json::to_value(&e).expect("serialize");
-        assert_eq!(encoded["exit_code"], json!(7));
-        assert_eq!(e.exit_code, 7 & 0xff);
-    }
-
-    #[test]
-    fn exit_code_masked_to_process_status() {
-        // 261 (256 + 5) truncates to 5 under std::process::exit; the JSON field
-        // must agree. This setter runs in the framework's post-handler path
-        // (outside the handler panic guard), so it masks silently in every
-        // build — the development-time assert lives on the handler-side
-        // setters (`CommandOutput::exit_code` / `CommandError::exit_code`).
-        let e = SuccessEnvelope::new("cmd", json!(null), vec![]).exit_code(256 + 5);
-        assert_eq!(e.exit_code, 5);
-        let encoded = serde_json::to_value(&e).expect("serialize");
-        assert_eq!(encoded["exit_code"], json!(5));
-    }
-
-    #[test]
-    fn error_envelope_retryable() {
-        let envelope = ErrorEnvelope::new("cmd", "err", "E", "fix", vec![])
-            .retryable(true)
-            .schema_version("test.v1");
-        let encoded = serde_json::to_value(&envelope).expect("must serialize");
         assert_eq!(encoded["error"]["retryable"], Value::Bool(true));
         assert_eq!(encoded["schema_version"], json!("test.v1"));
     }
 
-    #[cfg(feature = "deserialize")]
-    #[test]
-    fn success_envelope_roundtrips() {
-        let original = SuccessEnvelope::new(
-            "test cmd",
-            json!({ "data": 42 }),
-            vec![NextAction::new("test cmd", "Run again")],
-        )
-        .schema_version("test.v1")
-        .exit_code(2);
-        let json = serde_json::to_string(&original).expect("must serialize");
-        let decoded: SuccessEnvelope = serde_json::from_str(&json).expect("must deserialize");
-        assert_eq!(original, decoded);
-        assert_eq!(decoded.exit_code, 2);
-    }
-
     #[test]
     fn error_envelope_data_serializes_only_when_set() {
-        let bare = serde_json::to_value(ErrorEnvelope::new("cmd", "m", "C", "fix", vec![]))
-            .expect("must serialize");
+        let bare = serde_json::to_value(error(ErrorCode::new("C"))).expect("must serialize");
         assert!(
             bare.get("data").is_none(),
             "an unset payload must not add a key: {bare}"
         );
 
-        let with_data = serde_json::to_value(
-            ErrorEnvelope::new("cmd", "m", "C", "fix", vec![]).data(json!({ "rejected": [91] })),
-        )
+        let with_data = serde_json::to_value(ErrorEnvelope::new(
+            "cmd".to_string(),
+            Timestamp::UNIX_EPOCH,
+            CommandError::new(ErrorCode::new("C"), "m", "fix").data(json!({ "rejected": [91] })),
+        ))
         .expect("must serialize");
         assert_eq!(with_data["data"], json!({ "rejected": [91] }));
     }
 
     #[cfg(feature = "deserialize")]
-    #[test]
-    fn error_envelope_data_roundtrips() {
-        let original = ErrorEnvelope::new("test cmd", "oops", "ERR", "fix it", vec![])
-            .data(json!({ "rejected": [{ "line": 91 }] }));
-        let json = serde_json::to_string(&original).expect("must serialize");
-        let decoded: ErrorEnvelope = serde_json::from_str(&json).expect("must deserialize");
-        assert_eq!(original, decoded);
-    }
+    mod strict {
+        use std::fmt;
 
-    #[cfg(feature = "deserialize")]
-    #[test]
-    fn error_envelope_roundtrips() {
-        let original = ErrorEnvelope::new("test cmd", "oops", "ERR", "fix it", vec![])
-            .retryable(true)
-            .schema_version("test.v1")
-            .exit_code(7);
-        let json = serde_json::to_string(&original).expect("must serialize");
-        let decoded: ErrorEnvelope = serde_json::from_str(&json).expect("must deserialize");
-        assert_eq!(original, decoded);
-        assert_eq!(decoded.exit_code, 7);
-    }
+        use serde::de::DeserializeOwned;
 
-    #[cfg(feature = "deserialize")]
-    #[test]
-    fn success_envelope_rejects_ok_false() {
-        let json = r#"{"ok":false,"command":"test","timestamp":0,"result":null,"next_actions":[]}"#;
-        let result: Result<SuccessEnvelope, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-    }
+        use super::*;
+        use crate::next_action::ActionParam;
 
-    #[cfg(feature = "deserialize")]
-    #[test]
-    fn error_envelope_rejects_ok_true() {
-        let json = r#"{"ok":true,"command":"test","timestamp":0,"error":{"message":"x","code":"X","retryable":false},"fix":"y","next_actions":[]}"#;
-        let result: Result<ErrorEnvelope, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-    }
+        /// Serialize `value`, decode it back as `T`, and assert nothing changed.
+        fn round_trip<T>(value: &T)
+        where
+            T: Serialize + DeserializeOwned + PartialEq + fmt::Debug,
+        {
+            let json = serde_json::to_string(value).expect("must serialize");
+            let decoded: T = serde_json::from_str(&json).expect("must deserialize");
+            assert_eq!(&decoded, value, "{json}");
+        }
 
-    #[test]
-    fn rfc3339_utc_formats_known_epochs() {
-        // Edge cases: epoch 0 (misconfigured-clock fallback), leap day,
-        // year boundary, and a post-2038 value (no 32-bit rollover).
-        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339_utc(1_709_164_800), "2024-02-29T00:00:00Z");
-        assert_eq!(rfc3339_utc(1_767_225_599), "2025-12-31T23:59:59Z");
-        assert_eq!(rfc3339_utc(1_767_225_600), "2026-01-01T00:00:00Z");
-        assert_eq!(rfc3339_utc(4_102_444_800), "2100-01-01T00:00:00Z");
-    }
+        /// `json` with the top-level `key` removed.
+        fn without(json: &Value, key: &str) -> String {
+            let mut value = json.clone();
+            value.as_object_mut().expect("object").remove(key);
+            value.to_string()
+        }
 
-    #[test]
-    fn rfc3339_utc_roundtrips_through_parser() {
-        for epoch in [
-            0,
-            1,
-            86_399,
-            86_400,
-            951_782_400,   // 2000-02-29 (divisible-by-400 leap year)
-            1_709_164_800, // 2024-02-29
-            1_740_000_000,
-            1_767_225_599,
-            2_147_483_648, // past the 32-bit signed rollover
-            4_102_444_800, // 2100
-        ] {
-            let formatted = rfc3339_utc(epoch);
-            assert_eq!(
-                parse_rfc3339_utc(&formatted),
-                Some(epoch),
-                "round-trip failed for {epoch} ({formatted})"
+        /// `json` with the top-level `key` set to `replacement`.
+        fn with(json: &Value, key: &str, replacement: Value) -> String {
+            let mut value = json.clone();
+            value[key] = replacement;
+            value.to_string()
+        }
+
+        fn full_param() -> ActionParam {
+            ActionParam::new()
+                .description("the id")
+                .value(json!(7))
+                .default(json!(1))
+                .enum_values(["1", "7"])
+                .required(true)
+        }
+
+        #[test]
+        fn wire_types_round_trip() {
+            round_trip(&ExitCode::RATE_LIMITED);
+            round_trip(&ErrorCode::UNKNOWN_FLAG);
+            round_trip(&full_param());
+            round_trip(&ActionParam::new());
+            round_trip(&NextAction::new("app get <id>", "Get one").with_param("id", full_param()));
+            round_trip(&NextAction::new("app", "Inspect the tree"));
+            round_trip(&error(ErrorCode::INVALID_ARG).error);
+            round_trip(
+                &success()
+                    .schema_version("test.v1")
+                    .exit_code(ExitCode::USAGE),
             );
+            round_trip(&success());
+            round_trip(&success().select_warning(Some("--select=x matched no fields".to_string())));
+            let full = ErrorEnvelope::new(
+                "test cmd".to_string(),
+                at(1_740_000_000),
+                CommandError::new(ErrorCode::new("ERR"), "oops", "fix it")
+                    .retryable(true)
+                    .exit_code(ExitCode::RATE_LIMITED)
+                    .data(json!({ "rejected": [{ "line": 91 }] }))
+                    .next_action(NextAction::new("test cmd", "Retry")),
+            )
+            .schema_version("test.v1");
+            round_trip(&full);
+            round_trip(&error(ErrorCode::PARSE_ERROR));
+            round_trip(&Envelope::Success(success()));
+            round_trip(&Envelope::Error(full));
+            round_trip(&Timestamp::MAX);
         }
-    }
 
-    #[test]
-    fn parse_rfc3339_utc_rejects_malformed_input() {
-        for bad in [
-            "",
-            "1740000000",
-            "2026-06-10",
-            "2026-06-10T14:42:17",       // missing Z
-            "2026-06-10T14:42:17+02:00", // non-UTC offset
-            "2026-13-01T00:00:00Z",      // month 13
-            "2026-06-10T24:00:00Z",      // hour 24
-            "1969-12-31T23:59:59Z",      // pre-epoch
-            "not a timestamp at allZ",
-        ] {
-            assert_eq!(parse_rfc3339_utc(bad), None, "must reject {bad:?}");
+        #[test]
+        fn envelope_dispatches_by_ok_field() {
+            let success_json = serde_json::to_string(&success()).unwrap();
+            let error_json = serde_json::to_string(&error(ErrorCode::new("E"))).unwrap();
+
+            let s: Envelope = serde_json::from_str(&success_json).expect("success");
+            assert!(matches!(s, Envelope::Success(_)));
+            let e: Envelope = serde_json::from_str(&error_json).expect("error");
+            assert!(matches!(e, Envelope::Error(_)));
         }
-    }
 
-    #[cfg(feature = "deserialize")]
-    #[test]
-    fn envelope_accepts_legacy_epoch_timestamp() {
-        // Pre-0.11 captures carry timestamp as epoch seconds.
-        let json =
-            r#"{"ok":true,"command":"cmd","timestamp":1740000000,"result":null,"next_actions":[]}"#;
-        let decoded: SuccessEnvelope = serde_json::from_str(json).expect("must deserialize");
-        assert_eq!(decoded.timestamp, 1_740_000_000);
+        #[test]
+        fn success_envelope_rejects_a_missing_or_malformed_field() {
+            let json = serde_json::to_value(success()).unwrap();
+            let rejects = |text: String| {
+                assert!(
+                    serde_json::from_str::<SuccessEnvelope>(&text).is_err(),
+                    "must reject {text}"
+                );
+            };
+            for key in [
+                "ok",
+                "command",
+                "timestamp",
+                "exit_code",
+                "result",
+                "next_actions",
+            ] {
+                rejects(without(&json, key));
+            }
+            rejects(with(&json, "ok", json!(false)));
+            // The epoch integer older captures carried is not a timestamp.
+            rejects(with(&json, "timestamp", json!(1_740_000_000)));
+            rejects(with(&json, "timestamp", json!("yesterday")));
+            rejects(with(&json, "exit_code", json!(256)));
+            rejects(with(&json, "exit_code", json!(-1)));
+            rejects(with(&json, "select_warning", json!(1)));
+        }
 
-        let json = r#"{"ok":false,"command":"cmd","timestamp":"2025-02-19T21:20:00Z","error":{"message":"x","code":"X","retryable":false},"fix":"y","next_actions":[]}"#;
-        let decoded: ErrorEnvelope = serde_json::from_str(json).expect("must deserialize");
-        assert_eq!(decoded.timestamp, 1_740_000_000);
-    }
+        #[test]
+        fn unknown_keys_are_ignored_so_a_newer_writer_stays_readable() {
+            // A later agcli may add a field; a reader on this version must
+            // still decode everything it knows.
+            let mut success_json = serde_json::to_value(success()).unwrap();
+            success_json["surprise"] = json!(1);
+            success_json["next_actions"][0]["surprise"] = json!(true);
+            let decoded: SuccessEnvelope =
+                serde_json::from_value(success_json).expect("extra keys are ignored");
+            assert_eq!(decoded, success());
 
-    #[cfg(feature = "deserialize")]
-    #[test]
-    fn envelope_dispatches_by_ok_field() {
-        let success_json =
-            serde_json::to_string(&SuccessEnvelope::new("cmd", json!(null), vec![])).unwrap();
-        let error_json =
-            serde_json::to_string(&ErrorEnvelope::new("cmd", "err", "E", "fix", vec![])).unwrap();
+            let mut error_json = serde_json::to_value(error(ErrorCode::new("E"))).unwrap();
+            error_json["surprise"] = json!(1);
+            error_json["error"]["extra"] = json!(1);
+            let decoded: Envelope =
+                serde_json::from_value(error_json).expect("extra keys are ignored");
+            assert_eq!(decoded, Envelope::Error(error(ErrorCode::new("E"))));
 
-        let s: Envelope = serde_json::from_str(&success_json).expect("must deserialize success");
-        assert!(matches!(s, Envelope::Success(_)));
+            let param: ActionParam =
+                serde_json::from_value(json!({ "required": true, "pattern": "^x" }))
+                    .expect("extra keys are ignored");
+            assert_eq!(param, ActionParam::new().required(true));
+        }
 
-        let e: Envelope = serde_json::from_str(&error_json).expect("must deserialize error");
-        assert!(matches!(e, Envelope::Error(_)));
+        #[test]
+        fn error_envelope_rejects_a_missing_or_malformed_field() {
+            let json = serde_json::to_value(error(ErrorCode::new("E"))).unwrap();
+            let rejects = |text: String| {
+                assert!(
+                    serde_json::from_str::<ErrorEnvelope>(&text).is_err(),
+                    "must reject {text}"
+                );
+            };
+            for key in [
+                "ok",
+                "command",
+                "timestamp",
+                "exit_code",
+                "error",
+                "fix",
+                "next_actions",
+            ] {
+                rejects(without(&json, key));
+            }
+            rejects(with(&json, "ok", json!(true)));
+            rejects(with(&json, "timestamp", json!("2025-02-19T21:20:00+00:00")));
+            rejects(with(&json, "error", json!({ "message": "x", "code": "X" })));
+            rejects(with(
+                &json,
+                "error",
+                json!({ "message": "x", "code": "X", "retryable": "no" }),
+            ));
+            rejects(with(&json, "next_actions", json!([{ "command": "app" }])));
+        }
     }
 }

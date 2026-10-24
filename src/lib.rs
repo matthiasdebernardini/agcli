@@ -1,56 +1,50 @@
-#![allow(clippy::pedantic)]
-//! Agent-native CLI primitives for Rust.
-//!
-//! This crate enforces an agent-first response model:
-//! - JSON envelopes for every command
-//! - HATEOAS `next_actions` for follow-up affordances
-//! - self-documenting command tree from root/help
-//! - NDJSON streaming helpers with terminal result/error events
-//! - context-safe truncation helpers for large output
-//!
-//! # Example
-//!
-//! ```ignore
-//! use agcli::{AgentCli, Command, CommandOutput, ExecutionContext, NextAction};
-//! use serde_json::json;
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!     let cli = AgentCli::new("ops", "Agent-native operations CLI")
-//!         .command(
-//!             Command::new("status", "System health")
-//!                 .usage("ops status")
-//!                 .handler(|_req, _ctx| Box::pin(async move {
-//!                     Ok(CommandOutput::new(json!({ "healthy": true })).next_action(
-//!                         NextAction::new("ops status", "Re-check health"),
-//!                     ))
-//!                 })),
-//!         );
-//!
-//!     let mut ctx = ExecutionContext::default();
-//!     let run = cli.run_argv_with_context(["ops", "status"], &mut ctx).await;
-//!     assert_eq!(run.exit_code(), 0);
-//! }
-//! ```
+#![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 
+mod agent_cli;
 mod audit;
-mod cli;
+mod clock;
+mod codes;
+mod command;
+mod command_error;
+mod command_output;
+mod command_request;
+mod dispatch;
 mod doctor;
 mod envelope;
+mod execution;
+mod invocation;
+mod next_action;
+mod panic_hook;
 mod project;
+mod raw;
+mod reserved_flags;
+mod select;
 mod skill;
 mod stream;
+mod suggest;
+#[cfg(test)]
+mod test_support;
+mod timestamp;
+mod tree;
 mod truncate;
+mod usage;
 
+pub use agent_cli::AgentCli;
 pub use audit::{AuditFinding, AuditReport, AuditSeverity};
-pub use cli::{
-    AgentCli, Command, CommandError, CommandOutput, CommandRequest, Execution, ExecutionContext,
-    Invocation, ParseInvocationError, parse_invocation, parse_invocation_with_bool_flags,
-    read_stdin, reserved_flag_names,
-};
+pub use codes::{ErrorCode, ExitCode};
+pub use command::Command;
+pub use command_error::CommandError;
+pub use command_output::CommandOutput;
+pub use command_request::CommandRequest;
 pub use doctor::{Check, CheckResult, CheckStatus};
-pub use envelope::{
-    ActionParam, Envelope, ErrorBody, ErrorEnvelope, ExitCode, NextAction, SuccessEnvelope,
-};
-pub use stream::{FlushPolicy, LogLevel, NdjsonEmitter, StepStatus, StreamEmitError, StreamEvent};
+pub use envelope::{Envelope, ErrorBody, ErrorEnvelope, SuccessEnvelope};
+pub use execution::Execution;
+pub use invocation::{Invocation, ParseInvocationError};
+pub use next_action::{ActionParam, NextAction};
+pub use reserved_flags::reserved_flag_names;
+#[cfg(feature = "deserialize")]
+pub use stream::StreamLine;
+pub use stream::{LogLevel, StepStatus, StreamEvent, StreamWriteError, StreamWriter};
+pub use timestamp::{ParseTimestampError, Timestamp};
 pub use truncate::{TruncatedEntries, truncate_lines_with_file};

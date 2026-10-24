@@ -9,8 +9,22 @@
 //! [`crate::AgentCli::skill_markdown`].
 
 use std::fmt::Write as _;
+use std::fs;
+use std::io;
+use std::path::{self, Path};
 
-use crate::cli::{AgentCli, CommandDoc, ERROR_CODE_DOCS, EXIT_CODE_DOCS, RESERVED_FLAG_DOCS};
+use serde_json::{Map, Value, json};
+
+use crate::agent_cli::AgentCli;
+use crate::clock::ClockFn;
+use crate::codes::{ERROR_CODE_DOCS, EXIT_CODE_DOCS, ErrorCode, ExitCode};
+use crate::command::{Builtin, Command};
+use crate::command_error::CommandError;
+use crate::execution::{Execution, Output};
+use crate::invocation::Invocation;
+use crate::next_action::NextAction;
+use crate::reserved_flags::{self, RESERVED_FLAG_DOCS};
+use crate::tree::CommandDoc;
 
 /// Render `cli` as a `SKILL.md` document.
 pub(crate) fn render(cli: &AgentCli) -> String {
@@ -29,12 +43,19 @@ pub(crate) fn render(cli: &AgentCli) -> String {
     }
 
     out.push_str("## Contract\n\n");
-    let _ = writeln!(
+    let _ = write!(
         out,
         "- Every `{name}` invocation prints one JSON envelope on stdout: `ok`, `command`, \
          `timestamp` (RFC 3339 UTC), `exit_code`, then `result` on success or `error` plus \
          `fix` on failure, then `next_actions`."
     );
+    if cli.reserved_flags {
+        out.push_str(
+            " When `--select` names fields that match nothing, a `select_warning` sits \
+             beside `result`.",
+        );
+    }
+    out.push('\n');
     out.push_str(
         "- Follow `next_actions`. When an action carries `params`, its `command` is a \
          template: fill every placeholder before you run it. With no `params`, run the \
@@ -45,13 +66,22 @@ pub(crate) fn render(cli: &AgentCli) -> String {
          it, and `error.retryable` says whether the same call can work later.\n",
     );
     out.push_str("- `exit_code` is both the process status and a field. Branch on it.\n");
+    let docs = cli.command_docs();
+    if any_stream(&docs) {
+        out.push_str(
+            "- A command marked stream prints NDJSON instead: event lines (`type` `start`, \
+             `step`, `progress`, `log` or `event`, each with a `ts`), then exactly one \
+             terminal line, the envelope with `type` `result` or `error`. Only the terminal \
+             line carries `ok`, and it is always last: read until it.\n",
+        );
+    }
     let _ = writeln!(
         out,
-        "- Run `{name}` alone for the full command tree. Run `{name} help <command>` for \
-         one command.\n"
+        "- Run `{name}` alone for the full command tree. Add `--help` to a command for that \
+         command alone. `--help`, `-h`, `--version` and `-V` are answered anywhere on the \
+         line, except on a raw command, which owns its own flags.\n"
     );
 
-    let docs = cli.command_docs();
     if !docs.is_empty() {
         out.push_str("## Commands\n\n");
         commands_into(&mut out, &docs, 0);
@@ -59,7 +89,10 @@ pub(crate) fn render(cli: &AgentCli) -> String {
     }
 
     if cli.reserved_flags {
-        out.push_str("## Agent flags\n\nAccepted on every command:\n\n");
+        out.push_str(
+            "## Agent flags\n\nAccepted on every command. A boolean flag takes no value, or \
+             one of true/false, 1/0, yes/no, on/off; any other value is `INVALID_FLAG`.\n\n",
+        );
         for (flag, description) in RESERVED_FLAG_DOCS {
             let _ = writeln!(out, "- `{flag}` — {description}");
         }
@@ -72,7 +105,10 @@ pub(crate) fn render(cli: &AgentCli) -> String {
     }
     out.push('\n');
 
-    out.push_str("## Error codes\n\nRead from `error.code`:\n\n");
+    out.push_str(
+        "## Error codes\n\nThe framework's codes, read from `error.code`. A command can add \
+         its own; every error also carries `retryable` and `fix`.\n\n",
+    );
     for (code, description) in ERROR_CODE_DOCS {
         let _ = writeln!(out, "- `{code}` — {description}");
     }
@@ -106,19 +142,27 @@ fn description_line(cli: &AgentCli) -> String {
 fn commands_into(out: &mut String, docs: &[CommandDoc], depth: usize) {
     for doc in docs {
         let indent = "  ".repeat(depth);
-        let raw = if doc.raw {
+        let contract = if doc.raw {
             " (raw: prints the tool's own output, not an envelope)"
+        } else if doc.stream {
+            " (stream: NDJSON event lines, then one terminal envelope line with `type`)"
         } else {
             ""
         };
         let _ = writeln!(
             out,
-            "{indent}- `{}` — {}{raw}",
+            "{indent}- `{}` — {}{contract}",
             doc.usage,
-            collapse(&doc.description)
+            collapse(doc.description)
         );
         commands_into(out, &doc.subcommands, depth + 1);
     }
+}
+
+/// True when any command in the tree streams.
+fn any_stream(docs: &[CommandDoc]) -> bool {
+    docs.iter()
+        .any(|doc| doc.stream || any_stream(&doc.subcommands))
 }
 
 /// Fold every run of whitespace into one space. A frontmatter line and a
@@ -147,4 +191,183 @@ fn yaml_scalar(value: &str) -> String {
     }
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
+}
+
+/// True when `name` matches `^[a-z0-9]+(-[a-z0-9]+)*$` — the slug shape an
+/// agent-skill harness accepts as a frontmatter `name` and a directory name.
+pub(crate) fn is_slug(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+impl AgentCli {
+    /// Register a built-in `skill` command that prints this CLI as an agent
+    /// skill: a `SKILL.md` document (YAML frontmatter plus markdown) generated
+    /// from the live command tree.
+    ///
+    /// Help becomes a skill. An agent that can run the binary once can learn
+    /// the whole surface (the envelope contract, every command template, the
+    /// reserved flags, the exit and error codes), and a harness can load the
+    /// file directly:
+    ///
+    /// ```bash
+    /// mycli skill                          # markdown in the envelope result
+    /// mycli skill --install=.claude/skills # writes .claude/skills/mycli/SKILL.md
+    /// ```
+    ///
+    /// The document is rendered when the command runs, from the finished tree,
+    /// so `.skill()` can sit anywhere in the builder chain. `--install` writes
+    /// `<dir>/<name>/SKILL.md` and answers with the absolute `path` and its
+    /// `bytes` instead of the markdown; under `--dry-run` it reports the path
+    /// it would write and writes nothing.
+    #[must_use]
+    pub fn skill(self) -> Self {
+        let usage = format!("{} skill [--install=<dir>]", self.name);
+        let mut command = Command::new("skill", "Print this CLI as an agent skill (SKILL.md)")
+            .usage(usage)
+            .handles_dry_run()
+            .default_next_action(NextAction::new(
+                self.name.clone(),
+                "Inspect the full command tree",
+            ));
+        command.builtin = Some(Builtin::Skill);
+        self.command(command)
+    }
+
+    /// This CLI rendered as an agent skill (`SKILL.md`): the same document
+    /// the built-in `skill` command returns. Useful in a downstream test that
+    /// pins the generated skill, or to write the file from your own code
+    /// without registering the command.
+    #[must_use]
+    pub fn skill_markdown(&self) -> String {
+        render(self)
+    }
+
+    /// Answer the built-in `skill` command: render the live command tree as a
+    /// `SKILL.md` document and, under `--install=<dir>`, write it to
+    /// `<dir>/<name>/SKILL.md`.
+    pub(crate) fn skill_execution(&self, invocation: &Invocation, clock: &ClockFn) -> Execution {
+        let root_action = || NextAction::new(self.name.clone(), "Inspect the full command tree");
+
+        // No `--install`: the document itself is the answer.
+        let Some(raw_dir) = invocation.flag("install") else {
+            let result = json!({
+                "markdown": self.skill_markdown(),
+                "skill_name": self.name,
+            });
+            return self.framework_success(invocation, clock, result, vec![root_action()]);
+        };
+
+        let dir = raw_dir.trim();
+        // A bare `--install` parses as the boolean sentinel `"true"`, which
+        // would write `./true/<name>/SKILL.md` — a wrong answer reported as a
+        // success. Refuse it, and tell the caller the spelling that works.
+        let bare = invocation.raw_args().iter().any(|arg| arg == "--install");
+        // `--install=~/skills` never reaches tilde expansion: a shell expands
+        // `~` only at the start of a word, not after `=`. A literal `~`
+        // directory is never what the caller meant.
+        let tilde = dir.split('/').next().is_some_and(|c| c.starts_with('~'));
+        if dir.is_empty() || (bare && dir == "true") || tilde {
+            let fix = if tilde {
+                format!(
+                    "Nothing was written. `~` is not expanded after `=` — pass an absolute \
+                     path: `{} skill --install=/absolute/path`.",
+                    self.name
+                )
+            } else {
+                format!(
+                    "Nothing was written. Pass the skills directory: \
+                     `{} skill --install=<dir>`.",
+                    self.name
+                )
+            };
+            return self.error_execution(
+                invocation.command_line().to_string(),
+                clock,
+                CommandError::new(
+                    ErrorCode::INVALID_FLAG,
+                    format!("--install needs a directory, got {raw_dir:?}"),
+                    fix,
+                )
+                .next_action(root_action()),
+            );
+        }
+
+        // Absolute, so the reported path means the same thing to a caller with
+        // a different working directory.
+        let relative = Path::new(dir).join(&self.name).join("SKILL.md");
+        let file = match path::absolute(&relative) {
+            Ok(file) => file,
+            Err(error) => return self.write_failed(invocation, clock, &relative, &error),
+        };
+
+        let markdown = self.skill_markdown();
+        let bytes = markdown.len();
+        let dry_run =
+            self.reserved_flags && reserved_flags::bool_flag_on(invocation.flag("dry-run"));
+        if !dry_run {
+            if let Some(parent) = file.parent()
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                return self.write_failed(invocation, clock, &file, &error);
+            }
+            if let Err(error) = fs::write(&file, markdown.as_bytes()) {
+                return self.write_failed(invocation, clock, &file, &error);
+            }
+        }
+
+        // The document is on disk (or would be): returning it inline again
+        // would double the envelope for nothing.
+        let mut result = Map::new();
+        result.insert(
+            "path".to_string(),
+            Value::String(file.display().to_string()),
+        );
+        result.insert("bytes".to_string(), Value::from(bytes));
+        result.insert("skill_name".to_string(), Value::String(self.name.clone()));
+        if dry_run {
+            result.insert("dry_run".to_string(), Value::Bool(true));
+        }
+        self.framework_success(
+            invocation,
+            clock,
+            Value::Object(result),
+            vec![root_action()],
+        )
+    }
+
+    /// The `skill --install` write failed. Filesystem trouble is the caller's
+    /// to fix, so it carries [`ExitCode::ERROR`], not a usage code.
+    fn write_failed(
+        &self,
+        invocation: &Invocation,
+        clock: &ClockFn,
+        file: &Path,
+        error: &io::Error,
+    ) -> Execution {
+        Execution {
+            envelope: self
+                .build_error_envelope(
+                    invocation.command_line().to_string(),
+                    clock(),
+                    CommandError::new(
+                        ErrorCode::WRITE_FAILED,
+                        format!("could not write {}: {error}", file.display()),
+                        "Check the directory exists and is writable.",
+                    )
+                    .exit_code(ExitCode::ERROR)
+                    .next_action(NextAction::new(
+                        self.name.clone(),
+                        "Inspect the full command tree",
+                    )),
+                )
+                .into(),
+            output: Output::Envelope,
+        }
+    }
 }

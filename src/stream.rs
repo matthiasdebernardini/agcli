@@ -1,725 +1,453 @@
-use std::io;
+//! NDJSON streaming: the events a [`Command::stream_handler`] writes, and the
+//! [`StreamWriter`] it writes them through.
+//!
+//! A stream is a sequence of event lines followed by exactly one terminal
+//! line, the command's envelope with `"type":"result"` or `"type":"error"` in
+//! front. Handlers write only events; the framework writes the terminal line.
+//!
+//! [`Command::stream_handler`]: crate::Command::stream_handler
+
+use std::error::Error;
+use std::fmt;
+use std::io::{self, Write};
+use std::mem;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::envelope::{ErrorBody, ErrorEnvelope, NextAction, SuccessEnvelope};
+use crate::clock::ClockFn;
+#[cfg(feature = "deserialize")]
+use crate::envelope::{ErrorEnvelope, SuccessEnvelope};
+use crate::timestamp::Timestamp;
 
-/// Step lifecycle status for stream events.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+/// Where a step of a streaming command is, serialized as the `step` event's
+/// lowercase `status`.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
 pub enum StepStatus {
+    /// The step began.
     Started,
+    /// The step finished.
     Completed,
+    /// The step stopped on an error.
     Failed,
 }
 
-/// Log level for stream events.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+/// Log level for stream events, ordered by severity (`Info < Warn < Error`).
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
+    /// Progress worth knowing.
     Info,
+    /// Something the agent may need to act on, though the command goes on.
     Warn,
+    /// A failure inside the command.
     Error,
 }
 
-/// Typed NDJSON stream event.
+/// One event line of an NDJSON stream, as a handler hands it to
+/// [`StreamWriter::emit`].
 ///
-/// Terminal variants (`Result`, `Error`) use custom serialization to inject
-/// `ok` as a fixed boolean and always include `timestamp` (emitted as an
-/// RFC 3339 UTC string). The `ok` field cannot be set incorrectly — it is
-/// derived from the variant. The `ts` on non-terminal variants is
-/// caller-supplied; use RFC 3339 UTC (`2026-06-10T14:42:17Z`) to match the
-/// terminal events.
-#[derive(Clone, Debug, PartialEq)]
+/// It serializes with its variant as the `type` key (`"start"`, `"step"`,
+/// and so on), its own keys, and then `ts`: the writer stamps every line with
+/// the run's clock as it writes it, in RFC 3339 UTC, so an event carries no
+/// timestamp of its own. There is no terminal variant. The framework writes
+/// the one terminal line from the handler's return value.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum StreamEvent {
+    /// The stream began.
     Start {
+        /// What is running, usually the command line.
         command: String,
-        ts: String,
     },
+    /// A step of the work started, finished or failed.
     Step {
+        /// The step's name, the same on its `started` and `completed` lines.
         name: String,
+        /// Where the step is.
         status: StepStatus,
+        /// How long the step took, on a `completed` or `failed` line.
+        #[serde(skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        /// What went wrong, on a `failed` line.
+        #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
-        ts: String,
     },
+    /// How far the work has got.
     Progress {
+        /// What is progressing.
         name: String,
+        /// The share done, from 0 to 100.
+        #[serde(skip_serializing_if = "Option::is_none")]
         percent: Option<u8>,
+        /// A short note on the progress.
+        #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
-        ts: String,
     },
+    /// A diagnostic message.
     Log {
+        /// How much the message matters.
         level: LogLevel,
+        /// The message.
         message: String,
-        ts: String,
     },
+    /// Something the command observed or emitted, with its data.
     Event {
+        /// What happened.
         name: String,
+        /// Its payload, any JSON.
         data: Value,
-        ts: String,
-    },
-    Result {
-        command: String,
-        timestamp: u64,
-        exit_code: i32,
-        schema_version: Option<String>,
-        result: Value,
-        next_actions: Vec<NextAction>,
-    },
-    Error {
-        command: String,
-        timestamp: u64,
-        exit_code: i32,
-        schema_version: Option<String>,
-        error: ErrorBody,
-        fix: String,
-        /// The failure's structured payload, mirroring
-        /// [`crate::ErrorEnvelope::data`]. The same failure must read the same
-        /// on both terminal channels: an agent that switched to NDJSON cannot
-        /// lose the facts the direct envelope would have handed it.
-        data: Option<Value>,
-        next_actions: Vec<NextAction>,
     },
 }
 
-impl Serialize for StreamEvent {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        match self {
-            Self::Start { command, ts } => {
-                let mut map = serializer.serialize_map(Some(3))?;
-                map.serialize_entry("type", "start")?;
-                map.serialize_entry("command", command)?;
-                map.serialize_entry("ts", ts)?;
-                map.end()
-            }
-            Self::Step {
-                name,
-                status,
-                duration_ms,
-                error,
-                ts,
-            } => {
-                let count = 4 + usize::from(duration_ms.is_some()) + usize::from(error.is_some());
-                let mut map = serializer.serialize_map(Some(count))?;
-                map.serialize_entry("type", "step")?;
-                map.serialize_entry("name", name)?;
-                map.serialize_entry("status", status)?;
-                if let Some(d) = duration_ms {
-                    map.serialize_entry("duration_ms", d)?;
-                }
-                if let Some(e) = error {
-                    map.serialize_entry("error", e)?;
-                }
-                map.serialize_entry("ts", ts)?;
-                map.end()
-            }
-            Self::Progress {
-                name,
-                percent,
-                message,
-                ts,
-            } => {
-                let count = 3 + usize::from(percent.is_some()) + usize::from(message.is_some());
-                let mut map = serializer.serialize_map(Some(count))?;
-                map.serialize_entry("type", "progress")?;
-                map.serialize_entry("name", name)?;
-                if let Some(p) = percent {
-                    map.serialize_entry("percent", p)?;
-                }
-                if let Some(m) = message {
-                    map.serialize_entry("message", m)?;
-                }
-                map.serialize_entry("ts", ts)?;
-                map.end()
-            }
-            Self::Log { level, message, ts } => {
-                let mut map = serializer.serialize_map(Some(4))?;
-                map.serialize_entry("type", "log")?;
-                map.serialize_entry("level", level)?;
-                map.serialize_entry("message", message)?;
-                map.serialize_entry("ts", ts)?;
-                map.end()
-            }
-            Self::Event { name, data, ts } => {
-                let mut map = serializer.serialize_map(Some(4))?;
-                map.serialize_entry("type", "event")?;
-                map.serialize_entry("name", name)?;
-                map.serialize_entry("data", data)?;
-                map.serialize_entry("ts", ts)?;
-                map.end()
-            }
-            Self::Result {
-                command,
-                timestamp,
-                exit_code,
-                schema_version,
-                result,
-                next_actions,
-            } => {
-                let count = 7 + usize::from(schema_version.is_some());
-                let mut map = serializer.serialize_map(Some(count))?;
-                map.serialize_entry("type", "result")?;
-                map.serialize_entry("ok", &true)?;
-                map.serialize_entry("command", command)?;
-                map.serialize_entry("timestamp", &crate::envelope::rfc3339_utc(*timestamp))?;
-                map.serialize_entry("exit_code", exit_code)?;
-                if let Some(sv) = schema_version {
-                    map.serialize_entry("schema_version", sv)?;
-                }
-                map.serialize_entry("result", result)?;
-                map.serialize_entry("next_actions", next_actions)?;
-                map.end()
-            }
-            Self::Error {
-                command,
-                timestamp,
-                exit_code,
-                schema_version,
-                error,
-                fix,
-                data,
-                next_actions,
-            } => {
-                let count = 8 + usize::from(schema_version.is_some()) + usize::from(data.is_some());
-                let mut map = serializer.serialize_map(Some(count))?;
-                map.serialize_entry("type", "error")?;
-                map.serialize_entry("ok", &false)?;
-                map.serialize_entry("command", command)?;
-                map.serialize_entry("timestamp", &crate::envelope::rfc3339_utc(*timestamp))?;
-                map.serialize_entry("exit_code", exit_code)?;
-                if let Some(sv) = schema_version {
-                    map.serialize_entry("schema_version", sv)?;
-                }
-                map.serialize_entry("error", error)?;
-                map.serialize_entry("fix", fix)?;
-                // Between `fix` and `next_actions`, matching ErrorEnvelope's
-                // key order — the two channels serialize the same shape.
-                if let Some(payload) = data {
-                    map.serialize_entry("data", payload)?;
-                }
-                map.serialize_entry("next_actions", next_actions)?;
-                map.end()
-            }
-        }
-    }
+/// An event as it goes on the wire: the event's own keys, then `ts`.
+#[derive(Serialize)]
+struct StampedEvent<'event> {
+    #[serde(flatten)]
+    event: &'event StreamEvent,
+    ts: Timestamp,
+}
+
+/// Any one line of an agcli NDJSON stream, for a consumer parsing one.
+///
+/// Event lines decode to [`StreamLine::Event`]; the terminal line decodes to
+/// the envelope it carries. Decoding is strict about what it knows: a
+/// missing or malformed known key, or an unknown `type`, is an error. A key it
+/// does not know is ignored, so a reader keeps working on the output of a
+/// later agcli that only added a field.
+#[cfg(feature = "deserialize")]
+#[derive(Clone, Debug, PartialEq)]
+pub enum StreamLine {
+    /// A non-terminal event line.
+    Event {
+        /// The event.
+        event: StreamEvent,
+        /// The second its `ts` names.
+        timestamp: Timestamp,
+    },
+    /// The terminal `"type":"result"` line.
+    Result(SuccessEnvelope),
+    /// The terminal `"type":"error"` line.
+    Error(ErrorEnvelope),
 }
 
 #[cfg(feature = "deserialize")]
-fn str_field(v: &Value, key: &str) -> String {
-    v.get(key).and_then(Value::as_str).unwrap_or("").to_owned()
-}
-
-#[cfg(feature = "deserialize")]
-fn opt_str_field(v: &Value, key: &str) -> Option<String> {
-    v.get(key).and_then(Value::as_str).map(str::to_owned)
-}
-
-/// Read a `timestamp` that may be the RFC 3339 string current emitters write
-/// or the legacy epoch integer (pre-0.11 captures).
-#[cfg(feature = "deserialize")]
-fn timestamp_field(v: &Value, key: &str, default: u64) -> u64 {
-    match v.get(key) {
-        Some(Value::Number(n)) => n.as_u64().unwrap_or(default),
-        Some(Value::String(s)) => crate::envelope::parse_rfc3339_utc(s).unwrap_or(default),
-        _ => default,
-    }
-}
-
-#[cfg(feature = "deserialize")]
-fn i32_field(v: &Value, key: &str, default: i32) -> i32 {
-    v.get(key)
-        .and_then(Value::as_i64)
-        .and_then(|n| i32::try_from(n).ok())
-        .unwrap_or(default)
-}
-
-#[cfg(feature = "deserialize")]
-fn value_field(v: &Value, key: &str) -> Value {
-    v.get(key).cloned().unwrap_or(Value::Null)
-}
-
-#[cfg(feature = "deserialize")]
-fn parse_field<T, E>(v: &Value, key: &str, default: Value) -> Result<T, E>
-where
-    T: serde::de::DeserializeOwned,
-    E: serde::de::Error,
-{
-    serde_json::from_value(v.get(key).cloned().unwrap_or(default)).map_err(E::custom)
-}
-
-#[cfg(feature = "deserialize")]
-impl<'de> serde::Deserialize<'de> for StreamEvent {
+impl<'de> serde::Deserialize<'de> for StreamLine {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let type_str = value
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| serde::de::Error::custom("missing or invalid `type` field"))?;
+        use serde::de::Error as _;
 
-        match type_str {
-            "start" => Ok(Self::Start {
-                command: str_field(&value, "command"),
-                ts: str_field(&value, "ts"),
-            }),
-            "step" => Ok(Self::Step {
-                name: str_field(&value, "name"),
-                status: parse_field(&value, "status", Value::Null)?,
-                duration_ms: value.get("duration_ms").and_then(Value::as_u64),
-                error: opt_str_field(&value, "error"),
-                ts: str_field(&value, "ts"),
-            }),
-            "progress" => Ok(Self::Progress {
-                name: str_field(&value, "name"),
-                percent: value
-                    .get("percent")
-                    .and_then(Value::as_u64)
-                    .and_then(|v| u8::try_from(v).ok()),
-                message: opt_str_field(&value, "message"),
-                ts: str_field(&value, "ts"),
-            }),
-            "log" => Ok(Self::Log {
-                level: parse_field(&value, "level", Value::Null)?,
-                message: str_field(&value, "message"),
-                ts: str_field(&value, "ts"),
-            }),
-            "event" => Ok(Self::Event {
-                name: str_field(&value, "name"),
-                data: value_field(&value, "data"),
-                ts: str_field(&value, "ts"),
-            }),
-            "result" => {
-                let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(true);
-                if !ok {
-                    return Err(serde::de::Error::custom(
-                        "expected ok=true for result stream event",
-                    ));
-                }
-                Ok(Self::Result {
-                    command: str_field(&value, "command"),
-                    timestamp: timestamp_field(&value, "timestamp", 0),
-                    exit_code: i32_field(&value, "exit_code", 0),
-                    schema_version: opt_str_field(&value, "schema_version"),
-                    result: value_field(&value, "result"),
-                    next_actions: parse_field(&value, "next_actions", Value::Array(vec![]))?,
-                })
+        let Value::Object(mut line) = Value::deserialize(deserializer)? else {
+            return Err(D::Error::custom("a stream line is a JSON object"));
+        };
+        match line.get("type").and_then(Value::as_str) {
+            Some("result") => {
+                line.remove("type");
+                serde_json::from_value(Value::Object(line))
+                    .map(Self::Result)
+                    .map_err(D::Error::custom)
             }
-            "error" => {
-                let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
-                if ok {
-                    return Err(serde::de::Error::custom(
-                        "expected ok=false for error stream event",
-                    ));
-                }
-                Ok(Self::Error {
-                    command: str_field(&value, "command"),
-                    timestamp: timestamp_field(&value, "timestamp", 0),
-                    exit_code: i32_field(&value, "exit_code", 1),
-                    schema_version: opt_str_field(&value, "schema_version"),
-                    error: parse_field(&value, "error", Value::Null)?,
-                    fix: str_field(&value, "fix"),
-                    data: value.get("data").cloned(),
-                    next_actions: parse_field(&value, "next_actions", Value::Array(vec![]))?,
-                })
+            Some("error") => {
+                line.remove("type");
+                serde_json::from_value(Value::Object(line))
+                    .map(Self::Error)
+                    .map_err(D::Error::custom)
             }
-            other => Err(serde::de::Error::custom(format!(
-                "unknown stream event type: {other}"
-            ))),
+            Some(_) => {
+                let ts = line
+                    .remove("ts")
+                    .ok_or_else(|| D::Error::missing_field("ts"))?;
+                let timestamp = Timestamp::deserialize(ts)
+                    .map_err(|e| D::Error::custom(format!("`ts`: {e}")))?;
+                let event =
+                    serde_json::from_value(Value::Object(line)).map_err(D::Error::custom)?;
+                Ok(Self::Event { event, timestamp })
+            }
+            None => Err(D::Error::custom("missing or invalid `type` field")),
         }
     }
 }
 
-impl StreamEvent {
-    pub fn result_from_envelope(envelope: SuccessEnvelope) -> Self {
-        Self::Result {
-            command: envelope.command,
-            timestamp: envelope.timestamp,
-            exit_code: envelope.exit_code,
-            schema_version: envelope.schema_version,
-            result: envelope.result,
-            next_actions: envelope.next_actions,
-        }
-    }
-
-    pub fn error_from_envelope(envelope: ErrorEnvelope) -> Self {
-        Self::Error {
-            command: envelope.command,
-            timestamp: envelope.timestamp,
-            exit_code: envelope.exit_code,
-            schema_version: envelope.schema_version,
-            error: envelope.error,
-            fix: envelope.fix,
-            data: envelope.data,
-            next_actions: envelope.next_actions,
-        }
-    }
-
-    fn is_terminal(&self) -> bool {
-        matches!(self, Self::Result { .. } | Self::Error { .. })
-    }
-}
-
-/// NDJSON emit failure.
+/// A failed [`StreamWriter::emit`].
 #[derive(Debug)]
-pub enum StreamEmitError {
+#[non_exhaustive]
+pub enum StreamWriteError {
+    /// Writing or flushing the line failed (`EPIPE` when the reader went
+    /// away). The writer is poisoned: a partial line may be on the wire.
     Io(io::Error),
+    /// The event could not be serialized. Nothing was written and the writer
+    /// stays usable.
     Json(serde_json::Error),
-    AlreadyTerminated,
+    /// An earlier write failed, so this one was refused rather than appended
+    /// to a possibly partial line.
+    Poisoned,
+    /// The handler already returned and the framework closed the stream, so
+    /// the terminal line stays last.
+    Closed,
 }
 
-impl std::fmt::Display for StreamEmitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for StreamWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "stream I/O error: {e}"),
             Self::Json(e) => write!(f, "stream JSON error: {e}"),
-            Self::AlreadyTerminated => write!(f, "stream already terminated"),
+            Self::Poisoned => write!(f, "stream poisoned by an earlier failed write"),
+            Self::Closed => write!(f, "stream closed: the handler already returned"),
         }
     }
 }
 
-impl std::error::Error for StreamEmitError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for StreamWriteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
             Self::Json(e) => Some(e),
-            Self::AlreadyTerminated => None,
+            Self::Poisoned | Self::Closed => None,
         }
     }
 }
 
-impl From<io::Error> for StreamEmitError {
-    fn from(value: io::Error) -> Self {
-        Self::Io(value)
-    }
+/// Where a stream's event lines go.
+enum Sink {
+    /// Written and flushed line by line: stdout under `run_env`.
+    Live(Box<dyn Write + Send>),
+    /// Kept for the [`Execution`](crate::Execution): in-process `run()`.
+    Captured(Vec<String>),
 }
 
-impl From<serde_json::Error> for StreamEmitError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
-    }
-}
-
-/// Controls when the emitter flushes the underlying writer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum FlushPolicy {
-    /// Flush after every emitted event (default). Ensures real-time visibility.
-    #[default]
-    Every,
-    /// Flush only after terminal events (result/error). Reduces I/O overhead
-    /// for high-throughput streaming workloads.
-    Terminal,
-    /// Never flush automatically; caller manages flushing via `into_inner()`.
-    Never,
-}
-
-/// Stateful NDJSON event emitter that enforces terminal `result`/`error` semantics.
-///
-/// Async since v0.8: the writer is `tokio::io::AsyncWrite`, and `emit`,
-/// `emit_result`, and `emit_error` are `async fn`s.
-pub struct NdjsonEmitter<W: AsyncWrite + Unpin> {
-    writer: W,
-    terminated: bool,
-    /// Set when a write/flush error may have left a partial line on the wire.
-    /// A poisoned emitter refuses further events so a retry cannot concatenate
-    /// onto a corrupt line. Distinct from `terminated` (a clean terminal event).
+struct StreamState {
+    sink: Sink,
     poisoned: bool,
-    flush_policy: FlushPolicy,
+    closed: bool,
 }
 
-impl<W: AsyncWrite + Unpin> NdjsonEmitter<W> {
-    pub fn new(writer: W) -> Self {
-        Self {
-            writer,
-            terminated: false,
+/// The handle a [`Command::stream_handler`](crate::Command::stream_handler)
+/// writes its NDJSON events through.
+///
+/// Synchronous: each [`StreamWriter::emit`] serializes one event, writes it
+/// as one line and flushes. Every event is stamped with the run's clock, read
+/// as the event is written. Under [`AgentCli::run_env`](crate::AgentCli::run_env)
+/// the line goes to stdout; under [`AgentCli::run`](crate::AgentCli::run) it
+/// is captured in the [`Execution`](crate::Execution).
+pub struct StreamWriter {
+    state: Arc<Mutex<StreamState>>,
+    /// The run's clock, read for every event's `ts`.
+    clock: Arc<ClockFn>,
+}
+
+impl fmt::Debug for StreamWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamWriter").finish_non_exhaustive()
+    }
+}
+
+impl StreamWriter {
+    /// A writer whose lines, stamped from `clock`, go straight to `writer`,
+    /// plus the framework's handle on it.
+    pub(crate) fn live(writer: Box<dyn Write + Send>, clock: Arc<ClockFn>) -> (Self, StreamHandle) {
+        Self::with_sink(Sink::Live(writer), clock)
+    }
+
+    /// A writer whose lines, stamped from `clock`, are captured, plus the
+    /// framework's handle on it.
+    pub(crate) fn captured(clock: Arc<ClockFn>) -> (Self, StreamHandle) {
+        Self::with_sink(Sink::Captured(Vec::new()), clock)
+    }
+
+    fn with_sink(sink: Sink, clock: Arc<ClockFn>) -> (Self, StreamHandle) {
+        let state = Arc::new(Mutex::new(StreamState {
+            sink,
             poisoned: false,
-            flush_policy: FlushPolicy::default(),
-        }
-    }
-
-    /// Set the flush policy for this emitter.
-    pub fn with_flush_policy(mut self, policy: FlushPolicy) -> Self {
-        self.flush_policy = policy;
-        self
-    }
-
-    pub async fn emit(&mut self, event: StreamEvent) -> Result<(), StreamEmitError> {
-        if self.terminated || self.poisoned {
-            return Err(StreamEmitError::AlreadyTerminated);
-        }
-
-        let terminal = event.is_terminal();
-        // Serialize fully into a buffer first so a *serde* failure cannot leave
-        // a partial line on the wire (it returns here with nothing written).
-        // This does NOT protect against I/O failures: write_all can commit a
-        // prefix of the buffer before erroring, so any write error past this
-        // point poisons the emitter (below) to stop compounding corruption.
-        let mut line = serde_json::to_vec(&event)?;
-        line.push(b'\n');
-        if let Err(e) = self.writer.write_all(&line).await {
-            // A partial line may now be on the wire. Refuse further events so a
-            // retry cannot concatenate onto the broken line.
-            self.poisoned = true;
-            return Err(StreamEmitError::Io(e));
-        }
-
-        // The line and its newline are fully committed. Mark a terminal event
-        // terminated NOW — before the flush — so a flush error cannot leave the
-        // emitter open to a second terminal event.
-        if terminal {
-            self.terminated = true;
-        }
-
-        let should_flush = match self.flush_policy {
-            FlushPolicy::Every => true,
-            FlushPolicy::Terminal => terminal,
-            FlushPolicy::Never => false,
+            closed: false,
+        }));
+        let handle = StreamHandle {
+            state: Arc::clone(&state),
         };
-        if should_flush && let Err(e) = self.writer.flush().await {
-            self.poisoned = true;
-            return Err(StreamEmitError::Io(e));
+        (Self { state, clock }, handle)
+    }
+
+    /// Write `event` as one NDJSON line stamped with the run's clock read now
+    /// as its `ts`, and flush it.
+    ///
+    /// # Errors
+    ///
+    /// - [`StreamWriteError::Json`] if `event` fails to serialize; nothing is
+    ///   written and the writer stays usable.
+    /// - [`StreamWriteError::Io`] if the write or flush fails; the writer is
+    ///   poisoned, since a partial line may be on the wire.
+    /// - [`StreamWriteError::Poisoned`] after an earlier I/O failure.
+    /// - [`StreamWriteError::Closed`] once the handler has returned.
+    ///
+    /// # Panics
+    ///
+    /// Only if a thread panicked while it held the writer's lock, which the
+    /// writer never does: it holds the lock only to check its flags and to
+    /// write one line.
+    pub fn emit(&mut self, event: &StreamEvent) -> Result<(), StreamWriteError> {
+        let stamped = StampedEvent {
+            event,
+            ts: (self.clock)(),
+        };
+        // Serialize before taking the lock: a serde failure leaves nothing on
+        // the wire and the writer usable.
+        let line = serde_json::to_string(&stamped).map_err(StreamWriteError::Json)?;
+        let mut state = lock(&self.state);
+        if state.closed {
+            return Err(StreamWriteError::Closed);
         }
-
-        Ok(())
+        if state.poisoned {
+            return Err(StreamWriteError::Poisoned);
+        }
+        match &mut state.sink {
+            Sink::Captured(lines) => {
+                lines.push(line);
+                Ok(())
+            }
+            Sink::Live(writer) => {
+                // One write for the line and its newline, so nothing another
+                // thread writes can land between them.
+                let mut framed = line;
+                framed.push('\n');
+                let written = writer
+                    .write_all(framed.as_bytes())
+                    .and_then(|()| writer.flush());
+                if let Err(error) = written {
+                    state.poisoned = true;
+                    return Err(StreamWriteError::Io(error));
+                }
+                Ok(())
+            }
+        }
     }
 
-    pub async fn emit_result(&mut self, envelope: SuccessEnvelope) -> Result<(), StreamEmitError> {
-        self.emit(StreamEvent::result_from_envelope(envelope)).await
+    /// True once a write failed: every later [`StreamWriter::emit`] is
+    /// refused with [`StreamWriteError::Poisoned`].
+    ///
+    /// # Panics
+    ///
+    /// Under the same impossible condition as [`StreamWriter::emit`].
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        lock(&self.state).poisoned
     }
+}
 
-    pub async fn emit_error(&mut self, envelope: ErrorEnvelope) -> Result<(), StreamEmitError> {
-        self.emit(StreamEvent::error_from_envelope(envelope)).await
-    }
+/// The framework's side of a [`StreamWriter`]: it closes the stream once the
+/// handler returns, so nothing can follow the terminal line.
+pub(crate) struct StreamHandle {
+    state: Arc<Mutex<StreamState>>,
+}
 
-    /// True once a terminal `result`/`error` line has been written — even if a
-    /// subsequent flush failed (the bytes are already committed). A caller can
-    /// gate further output on this without risking a second terminal event.
-    pub fn terminated(&self) -> bool {
-        self.terminated
+impl StreamHandle {
+    /// Close the stream and return the lines it captured (none for a live
+    /// stream, whose lines already went out).
+    pub(crate) fn close(&self) -> Vec<String> {
+        let mut state = lock(&self.state);
+        state.closed = true;
+        match &mut state.sink {
+            Sink::Captured(lines) => mem::take(lines),
+            Sink::Live(_) => Vec::new(),
+        }
     }
+}
 
-    /// True if a write or flush error may have left a partial line on the wire.
-    /// A poisoned emitter rejects further events with [`StreamEmitError::AlreadyTerminated`].
-    pub fn poisoned(&self) -> bool {
-        self.poisoned
-    }
-
-    pub fn into_inner(self) -> W {
-        self.writer
-    }
+/// Lock the shared stream state. Poisoning needs a panic while the lock is
+/// held, and nothing that runs under it panics, so this propagates one.
+fn lock(state: &Mutex<StreamState>) -> MutexGuard<'_, StreamState> {
+    state.lock().expect("stream writer lock poisoned")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::{ErrorEnvelope, SuccessEnvelope};
     use serde_json::json;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use tokio::io::AsyncWrite;
 
-    /// A writer test double that can short-write/error on `poll_write` and/or
-    /// error on `poll_flush`, and records every byte it accepts so a test can
-    /// inspect exactly what reached the wire.
+    /// A writer test double that errors on write after `cap` bytes, or on
+    /// flush, and shares every byte it accepted so a test can inspect exactly
+    /// what reached the wire.
     struct FailingWriter {
-        wire: Vec<u8>,
-        /// Max bytes accepted per `poll_write` before erroring (`None` = no cap).
+        wire: Arc<Mutex<Vec<u8>>>,
+        /// Max bytes accepted before every write errors (`None` = no cap).
         write_cap: Option<usize>,
-        /// Errors remaining to return from `poll_write` once the cap is hit.
-        write_errors: usize,
-        /// Errors remaining to return from `poll_flush`.
+        /// Errors remaining to return from `flush`.
         flush_errors: usize,
-        flushes: usize,
     }
 
-    impl FailingWriter {
-        fn write_cap(cap: usize, errors: usize) -> Self {
-            Self {
-                wire: Vec::new(),
-                write_cap: Some(cap),
-                write_errors: errors,
-                flush_errors: 0,
-                flushes: 0,
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut wire = self.wire.lock().unwrap();
+            let room = self.write_cap.map_or(buf.len(), |cap| cap - wire.len());
+            if room == 0 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom"));
             }
+            let take = buf.len().min(room);
+            wire.extend_from_slice(&buf[..take]);
+            Ok(take)
         }
 
-        fn flush_fail(errors: usize) -> Self {
-            Self {
-                wire: Vec::new(),
-                write_cap: None,
-                write_errors: 0,
-                flush_errors: errors,
-                flushes: 0,
-            }
-        }
-    }
-
-    impl AsyncWrite for FailingWriter {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            let cap = self.write_cap.unwrap_or(buf.len());
-            let take = buf.len().min(cap);
-            // Commit the accepted prefix to the wire (models a partial write).
-            self.wire.extend_from_slice(&buf[..take]);
-            if take < buf.len() && self.write_errors > 0 {
-                self.write_errors -= 1;
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom")));
-            }
-            Poll::Ready(Ok(take))
-        }
-
-        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.flushes += 1;
+        fn flush(&mut self) -> io::Result<()> {
             if self.flush_errors > 0 {
                 self.flush_errors -= 1;
-                return Poll::Ready(Err(io::Error::other("flush boom")));
+                return Err(io::Error::other("flush boom"));
             }
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+            Ok(())
         }
     }
 
-    #[tokio::test]
-    async fn emitter_writes_ndjson_lines() {
-        let buffer = Vec::<u8>::new();
-        let mut emitter = NdjsonEmitter::new(buffer);
-
-        emitter
-            .emit(StreamEvent::Start {
-                command: "wokhei status --follow".to_string(),
-                ts: "2026-02-25T20:00:00Z".to_string(),
-            })
-            .await
-            .expect("start event must emit");
-
-        emitter
-            .emit_result(SuccessEnvelope::new(
-                "wokhei status --follow",
-                json!({ "healthy": true }),
-                vec![],
-            ))
-            .await
-            .expect("terminal result must emit");
-
-        assert!(emitter.terminated());
-        let out = String::from_utf8(emitter.into_inner()).expect("utf8");
-        assert_eq!(out.lines().count(), 2);
-        assert!(out.contains("\"type\":\"start\""));
-        assert!(out.contains("\"type\":\"result\""));
+    fn failing(
+        write_cap: Option<usize>,
+        flush_errors: usize,
+    ) -> (StreamWriter, Arc<Mutex<Vec<u8>>>) {
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        let writer = FailingWriter {
+            wire: Arc::clone(&wire),
+            write_cap,
+            flush_errors,
+        };
+        let (out, _handle) = StreamWriter::live(Box::new(writer), Arc::new(|| at(1_740_000_000)));
+        (out, wire)
     }
 
-    #[tokio::test]
-    async fn emitter_rejects_events_after_terminal() {
-        let buffer = Vec::<u8>::new();
-        let mut emitter = NdjsonEmitter::new(buffer);
-        emitter
-            .emit_result(SuccessEnvelope::new(
-                "wokhei status",
-                json!({ "ok": true }),
-                vec![],
-            ))
-            .await
-            .expect("terminal result must emit");
+    fn at(secs: u64) -> Timestamp {
+        Timestamp::from_epoch_secs(secs).expect("in range")
+    }
 
-        let err = emitter
-            .emit(StreamEvent::Start {
-                command: "wokhei status".to_string(),
-                ts: "2026-02-25T20:00:00Z".to_string(),
-            })
-            .await
-            .expect_err("must reject further events");
-        assert!(matches!(err, StreamEmitError::AlreadyTerminated));
+    fn log(message: &str) -> StreamEvent {
+        StreamEvent::Log {
+            level: LogLevel::Info,
+            message: message.to_string(),
+        }
     }
 
     #[test]
-    fn result_from_envelope_carries_timestamp_and_schema_version() {
-        let envelope = SuccessEnvelope::new("wokhei status", json!({ "healthy": true }), vec![])
-            .schema_version("v1.0");
+    fn emit_writes_one_stamped_line_per_event() {
+        let (mut out, wire) = failing(None, 0);
+        out.emit(&StreamEvent::Start {
+            command: "app deploy".to_string(),
+        })
+        .expect("start must emit");
+        out.emit(&log("hello")).expect("log must emit");
 
-        let event = StreamEvent::result_from_envelope(envelope);
-        let encoded = serde_json::to_value(&event).expect("must serialize");
-        assert_eq!(encoded["type"], json!("result"));
-        assert_eq!(encoded["ok"], json!(true));
-        let ts = encoded["timestamp"]
-            .as_str()
-            .expect("timestamp is a string");
-        assert!(ts.ends_with('Z'), "timestamp must be RFC 3339 UTC: {ts}");
-        assert_eq!(encoded["schema_version"], json!("v1.0"));
-        assert_eq!(encoded["result"]["healthy"], json!(true));
-    }
-
-    #[test]
-    fn error_from_envelope_carries_timestamp_and_schema_version() {
-        let envelope =
-            ErrorEnvelope::new("wokhei publish", "bad json", "INVALID", "fix it", vec![])
-                .retryable(true)
-                .schema_version("v2.0");
-
-        let event = StreamEvent::error_from_envelope(envelope);
-        let encoded = serde_json::to_value(&event).expect("must serialize");
-        assert_eq!(encoded["type"], json!("error"));
-        assert_eq!(encoded["ok"], json!(false));
-        let ts = encoded["timestamp"]
-            .as_str()
-            .expect("timestamp is a string");
-        assert!(ts.ends_with('Z'), "timestamp must be RFC 3339 UTC: {ts}");
-        assert_eq!(encoded["schema_version"], json!("v2.0"));
-        assert_eq!(encoded["error"]["retryable"], json!(true));
-    }
-
-    #[test]
-    fn error_from_envelope_carries_the_structured_payload() {
-        // The two terminal channels must report the same failure the same way:
-        // an agent that switched to NDJSON cannot lose the facts the direct
-        // envelope would have given it.
-        let envelope = ErrorEnvelope::new("app post", "2 of 3 rejected", "PARTIAL", "fix", vec![])
-            .data(json!({ "rejected": [{ "line": 91 }] }));
-
-        let event = StreamEvent::error_from_envelope(envelope);
-        let encoded = serde_json::to_value(&event).expect("must serialize");
-        assert_eq!(encoded["data"]["rejected"][0]["line"], json!(91));
-
-        // Key order matches ErrorEnvelope: `data` sits between fix and
-        // next_actions.
-        let line = serde_json::to_string(&event).expect("must serialize");
-        let fix_at = line.find("\"fix\"").expect("fix key");
-        let data_at = line.find("\"data\"").expect("data key");
-        let actions_at = line.find("\"next_actions\"").expect("next_actions key");
-        assert!(fix_at < data_at && data_at < actions_at, "{line}");
-    }
-
-    #[test]
-    fn a_streamed_error_without_a_payload_has_no_data_key() {
-        // The shape existing NDJSON consumers already parse must not drift.
-        let envelope = ErrorEnvelope::new("cmd", "oops", "ERR", "fix it", vec![]);
-        let encoded = serde_json::to_value(StreamEvent::error_from_envelope(envelope))
-            .expect("must serialize");
-        assert!(
-            encoded.get("data").is_none(),
-            "unset payload must not add a key: {encoded}"
-        );
-    }
-
-    #[test]
-    fn result_without_schema_version_omits_field() {
-        let envelope = SuccessEnvelope::new("cmd", json!(null), vec![]);
-        let event = StreamEvent::result_from_envelope(envelope);
-        let encoded = serde_json::to_value(&event).expect("must serialize");
-        assert!(encoded.get("schema_version").is_none());
-        assert_eq!(encoded["ok"], json!(true));
+        let text = String::from_utf8(wire.lock().unwrap().clone()).expect("utf8");
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is JSON"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["type"], json!("start"));
+        assert_eq!(lines[0]["command"], json!("app deploy"));
+        assert_eq!(lines[1]["type"], json!("log"));
+        // Every event carries the clock's reading (a fixed clock here).
+        for line in &lines {
+            assert_eq!(line["ts"], json!("2025-02-19T21:20:00Z"), "{line}");
+        }
     }
 
     #[test]
@@ -729,7 +457,6 @@ mod tests {
             status: StepStatus::Completed,
             duration_ms: Some(3200),
             error: None,
-            ts: "2026-02-25T20:00:00Z".to_string(),
         };
         let encoded = serde_json::to_value(&step).expect("must serialize");
         assert_eq!(encoded["type"], json!("step"));
@@ -738,226 +465,148 @@ mod tests {
         assert!(encoded.get("error").is_none());
     }
 
-    #[tokio::test]
-    async fn flush_policy_terminal_only_flushes_on_terminal() {
-        // Use a Vec<u8> — its flush() is a no-op, but we can verify the data
-        // is written correctly and the emitter reaches terminal state.
-        let buffer = Vec::<u8>::new();
-        let mut emitter = NdjsonEmitter::new(buffer).with_flush_policy(FlushPolicy::Terminal);
-
-        emitter
-            .emit(StreamEvent::Log {
-                level: LogLevel::Info,
-                message: "buffered".to_string(),
-                ts: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .await
-            .expect("log event must emit");
-
-        emitter
-            .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
-            .await
-            .expect("terminal result must emit");
-
-        assert!(emitter.terminated());
-        let out = String::from_utf8(emitter.into_inner()).expect("utf8");
-        assert_eq!(out.lines().count(), 2);
-    }
-
-    #[tokio::test]
-    async fn flush_policy_never_still_writes_data() {
-        let buffer = Vec::<u8>::new();
-        let mut emitter = NdjsonEmitter::new(buffer).with_flush_policy(FlushPolicy::Never);
-
-        emitter
-            .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
-            .await
-            .expect("terminal result must emit");
-
-        assert!(emitter.terminated());
-        let out = String::from_utf8(emitter.into_inner()).expect("utf8");
-        assert!(out.contains("\"type\":\"result\""));
-    }
-
     #[test]
-    fn flush_policy_default_is_every() {
-        assert_eq!(FlushPolicy::default(), FlushPolicy::Every);
-    }
+    fn write_error_poisons_writer_and_rejects_retry() {
+        // Cap the wire at 10 bytes: the first emit commits a newline-less
+        // fragment and fails. The writer must poison itself so a retry cannot
+        // concatenate onto the broken line.
+        let (mut out, wire) = failing(Some(10), 0);
 
-    #[tokio::test]
-    async fn write_error_poisons_emitter_and_rejects_retry() {
-        // Cap the writer at 10 bytes then error: the first emit commits a
-        // newline-less fragment and fails. The emitter must poison itself so a
-        // retry cannot concatenate onto the broken line.
-        let writer = FailingWriter::write_cap(10, 1);
-        let mut emitter = NdjsonEmitter::new(writer);
+        let first = out.emit(&log("this line is longer than ten bytes"));
+        assert!(matches!(first, Err(StreamWriteError::Io(_))));
+        assert!(out.is_poisoned());
 
-        let first = emitter
-            .emit(StreamEvent::Start {
-                command: "app run".to_string(),
-                ts: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .await;
-        assert!(matches!(first, Err(StreamEmitError::Io(_))));
-        assert!(emitter.poisoned());
-        assert!(!emitter.terminated());
+        let retry = out.emit(&log("again"));
+        assert!(matches!(retry, Err(StreamWriteError::Poisoned)));
 
-        // A retry must be refused rather than appended to the partial line.
-        let retry = emitter
-            .emit(StreamEvent::Start {
-                command: "app run".to_string(),
-                ts: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .await;
-        assert!(matches!(retry, Err(StreamEmitError::AlreadyTerminated)));
-
-        // Exactly the accepted prefix is on the wire; nothing was concatenated.
-        let wire = emitter.into_inner().wire;
+        let wire = wire.lock().unwrap();
         assert_eq!(wire.len(), 10);
         assert!(!wire.ends_with(b"\n"));
     }
 
-    #[tokio::test]
-    async fn flush_failure_on_terminal_still_marks_terminated() {
-        // The terminal line is fully written, then flush fails. terminated()
-        // must report true so a caller cannot emit a second terminal event.
-        let writer = FailingWriter::flush_fail(1);
-        let mut emitter = NdjsonEmitter::new(writer);
-
-        let res = emitter
-            .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
-            .await;
-        assert!(matches!(res, Err(StreamEmitError::Io(_))));
-        assert!(emitter.terminated());
-
-        // A second terminal event is rejected.
-        let second = emitter
-            .emit_error(ErrorEnvelope::new("cmd", "x", "X", "fix", vec![]))
-            .await;
-        assert!(matches!(second, Err(StreamEmitError::AlreadyTerminated)));
-
-        // The full terminal line (with newline) did reach the wire.
-        let wire = emitter.into_inner().wire;
-        assert!(wire.ends_with(b"\n"));
-        assert!(String::from_utf8_lossy(&wire).contains("\"type\":\"result\""));
+    #[test]
+    fn flush_error_poisons_writer() {
+        let (mut out, wire) = failing(None, 1);
+        let res = out.emit(&log("flushed"));
+        assert!(matches!(res, Err(StreamWriteError::Io(_))));
+        assert!(out.is_poisoned());
+        // The full line did reach the wire before the flush failed.
+        assert!(wire.lock().unwrap().ends_with(b"\n"));
     }
 
-    #[tokio::test]
-    async fn flush_policy_never_does_not_flush() {
-        // FlushPolicy::Never must not call flush even on a terminal event — a
-        // flush-erroring writer would surface the error if it did.
-        let writer = FailingWriter::flush_fail(10);
-        let mut emitter = NdjsonEmitter::new(writer).with_flush_policy(FlushPolicy::Never);
-        emitter
-            .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
-            .await
-            .expect("Never policy must not flush, so no flush error surfaces");
-        assert!(emitter.terminated());
-        assert_eq!(emitter.into_inner().flushes, 0);
-    }
+    #[test]
+    fn closed_stream_refuses_events() {
+        let (mut out, handle) = StreamWriter::captured(Arc::new(|| Timestamp::UNIX_EPOCH));
+        out.emit(&log("before"))
+            .expect("open stream accepts events");
+        let captured = handle.close();
+        assert_eq!(captured.len(), 1);
 
-    #[tokio::test]
-    async fn flush_policy_terminal_flushes_only_on_terminal() {
-        // A non-terminal event must not flush; the terminal event must.
-        let writer = FailingWriter {
-            wire: Vec::new(),
-            write_cap: None,
-            write_errors: 0,
-            flush_errors: 0,
-            flushes: 0,
-        };
-        let mut emitter = NdjsonEmitter::new(writer).with_flush_policy(FlushPolicy::Terminal);
-        emitter
-            .emit(StreamEvent::Log {
-                level: LogLevel::Info,
-                message: "buffered".to_string(),
-                ts: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .await
-            .expect("log must emit");
-        // No flush yet for the non-terminal log.
-        // (Checked indirectly: a fresh emitter's flush count is observed below.)
-        emitter
-            .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
-            .await
-            .expect("terminal result must emit");
-        assert_eq!(emitter.into_inner().flushes, 1);
+        let late = out.emit(&log("after"));
+        assert!(matches!(late, Err(StreamWriteError::Closed)));
+        assert!(handle.close().is_empty(), "nothing lands after close");
     }
 
     #[cfg(feature = "deserialize")]
     #[test]
-    fn stream_result_roundtrips() {
-        let envelope =
-            SuccessEnvelope::new("test cmd", json!({ "data": 42 }), vec![]).schema_version("v1.0");
-        let event = StreamEvent::result_from_envelope(envelope);
-        let json = serde_json::to_string(&event).expect("must serialize");
-        let decoded: StreamEvent = serde_json::from_str(&json).expect("must deserialize");
-        assert_eq!(event, decoded);
-    }
-
-    #[cfg(feature = "deserialize")]
-    #[test]
-    fn stream_error_roundtrips() {
-        let envelope = ErrorEnvelope::new("test cmd", "oops", "ERR", "fix it", vec![])
-            .retryable(true)
-            .schema_version("v1.0");
-        let event = StreamEvent::error_from_envelope(envelope);
-        let json = serde_json::to_string(&event).expect("must serialize");
-        let decoded: StreamEvent = serde_json::from_str(&json).expect("must deserialize");
-        assert_eq!(event, decoded);
-    }
-
-    #[cfg(feature = "deserialize")]
-    #[test]
-    fn stream_result_accepts_legacy_epoch_timestamp() {
-        // Pre-0.11 captures carry timestamp as epoch seconds.
-        let json = r#"{"type":"result","ok":true,"command":"cmd","timestamp":1740000000,"exit_code":0,"result":null,"next_actions":[]}"#;
-        let decoded: StreamEvent = serde_json::from_str(json).expect("must deserialize");
-        assert!(matches!(
-            decoded,
-            StreamEvent::Result {
-                timestamp: 1_740_000_000,
-                ..
-            }
-        ));
-    }
-
-    #[cfg(feature = "deserialize")]
-    #[test]
-    fn stream_non_terminal_roundtrips() {
+    fn stream_events_roundtrip_through_stream_line() {
         let events = vec![
             StreamEvent::Start {
                 command: "cmd".to_string(),
-                ts: "2026-01-01T00:00:00Z".to_string(),
             },
             StreamEvent::Step {
                 name: "step1".to_string(),
                 status: StepStatus::Started,
                 duration_ms: None,
                 error: None,
-                ts: "2026-01-01T00:00:01Z".to_string(),
             },
             StreamEvent::Progress {
                 name: "step1".to_string(),
                 percent: Some(50),
                 message: Some("halfway".to_string()),
-                ts: "2026-01-01T00:00:02Z".to_string(),
             },
-            StreamEvent::Log {
-                level: LogLevel::Warn,
-                message: "watch out".to_string(),
-                ts: "2026-01-01T00:00:03Z".to_string(),
-            },
+            log("watch out"),
             StreamEvent::Event {
                 name: "thing".to_string(),
                 data: json!({"key": "val"}),
-                ts: "2026-01-01T00:00:04Z".to_string(),
             },
         ];
-        for event in events {
-            let json = serde_json::to_string(&event).expect("must serialize");
-            let decoded: StreamEvent = serde_json::from_str(&json).expect("must deserialize");
-            assert_eq!(event, decoded);
+        let (mut out, handle) = StreamWriter::captured(Arc::new(|| at(1_740_000_000)));
+        for event in &events {
+            out.emit(event).expect("must emit");
+        }
+        let lines = handle.close();
+        assert_eq!(lines.len(), events.len());
+        for (line, event) in lines.iter().zip(events) {
+            let decoded: StreamLine = serde_json::from_str(line).expect("must deserialize");
+            assert_eq!(
+                decoded,
+                StreamLine::Event {
+                    event,
+                    timestamp: at(1_740_000_000)
+                }
+            );
+        }
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn stream_line_rejects_a_malformed_ts() {
+        let line = r#"{"type":"log","level":"info","message":"x","ts":"yesterday"}"#;
+        let decoded: Result<StreamLine, _> = serde_json::from_str(line);
+        assert!(decoded.is_err());
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn stream_line_rejects_a_missing_key_and_ignores_an_extra_one() {
+        let extra =
+            r#"{"type":"log","level":"info","message":"x","ts":"2025-02-19T21:20:00Z","extra":1}"#;
+        let decoded: StreamLine = serde_json::from_str(extra).expect("an extra key is ignored");
+        assert_eq!(
+            decoded,
+            StreamLine::Event {
+                event: log("x"),
+                timestamp: at(1_740_000_000)
+            }
+        );
+        for line in [
+            // No `ts`.
+            r#"{"type":"log","level":"info","message":"x"}"#,
+            // No `message`.
+            r#"{"type":"log","level":"info","ts":"2025-02-19T21:20:00Z"}"#,
+            // No such event type.
+            r#"{"type":"heartbeat","ts":"2025-02-19T21:20:00Z"}"#,
+            // A terminal line missing its `exit_code`.
+            r#"{"type":"result","ok":true,"command":"app","timestamp":"2025-02-19T21:20:00Z","result":null,"next_actions":[]}"#,
+            // Not an object.
+            r#"["log"]"#,
+        ] {
+            let decoded: Result<StreamLine, _> = serde_json::from_str(line);
+            assert!(decoded.is_err(), "must reject {line}");
+        }
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn wire_enums_round_trip() {
+        for status in [
+            StepStatus::Started,
+            StepStatus::Completed,
+            StepStatus::Failed,
+        ] {
+            let json = serde_json::to_string(&status).expect("serialize");
+            assert_eq!(
+                serde_json::from_str::<StepStatus>(&json).expect("deserialize"),
+                status
+            );
+        }
+        for level in [LogLevel::Info, LogLevel::Warn, LogLevel::Error] {
+            let json = serde_json::to_string(&level).expect("serialize");
+            assert_eq!(
+                serde_json::from_str::<LogLevel>(&json).expect("deserialize"),
+                level
+            );
         }
     }
 }

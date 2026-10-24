@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 /// - **Array**: apply [`select`] to each element — the natural behavior for
 ///   list results like `[{id, name, body}, …]` projected to `id,name`.
 /// - **Anything else**: returned unchanged.
-pub fn select(value: &Value, fields: &[&str]) -> Value {
+pub(crate) fn select(value: &Value, fields: &[&str]) -> Value {
     match value {
         Value::Array(items) => {
             Value::Array(items.iter().map(|item| select(item, fields)).collect())
@@ -88,7 +88,7 @@ fn insert_path(source: &Map<String, Value>, path: &[&str], out: &mut Map<String,
 /// compaction. Falsy-but-meaningful values (`false`, `0`, `""`) are kept,
 /// and array elements keep their positions (only their contents compact) so
 /// indices stay stable.
-pub fn compact(value: &Value) -> Value {
+pub(crate) fn compact(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut out = Map::new();

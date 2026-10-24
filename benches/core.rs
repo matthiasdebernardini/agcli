@@ -1,9 +1,10 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::json;
+use tokio::runtime::Runtime;
 
 use agcli::{
-    AgentCli, Command, CommandOutput, FlushPolicy, NdjsonEmitter, NextAction, StreamEvent,
-    SuccessEnvelope, parse_invocation, truncate_lines_with_file,
+    AgentCli, Command, CommandOutput, ExitCode, Invocation, LogLevel, NextAction, StreamEvent,
+    truncate_lines_with_file,
 };
 
 // ---------------------------------------------------------------------------
@@ -18,12 +19,12 @@ fn build_flat_cli(n: usize) -> AgentCli {
         cli = cli.command(
             Command::new(name.clone(), desc)
                 .usage(format!("bench {name} <arg>"))
-                .handler(|req, _ctx| {
+                .handler(|req| {
                     let val = req.arg(0).unwrap_or("x").to_string();
-                    Box::pin(async move {
+                    async move {
                         Ok(CommandOutput::new(json!({ "echo": val }))
                             .next_action(NextAction::new("bench", "Inspect root")))
-                    })
+                    }
                 }),
         );
     }
@@ -62,15 +63,15 @@ fn build_nested_cli(breadth: usize, depth: usize) -> AgentCli {
 // ---------------------------------------------------------------------------
 
 fn bench_root_invocation(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("root_invocation");
     for n in [5, 20, 50] {
         let cli = build_flat_cli(n);
         group.bench_with_input(BenchmarkId::new("flat", n), &cli, |b, cli| {
             b.iter(|| {
                 rt.block_on(async {
-                    let run = cli.run_argv(["bench"]).await;
-                    assert_eq!(run.exit_code(), 0);
+                    let run = cli.run(["bench"]).await;
+                    assert_eq!(run.exit_code(), ExitCode::SUCCESS);
                 });
             });
         });
@@ -81,8 +82,8 @@ fn bench_root_invocation(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new(&label, breadth * depth), &cli, |b, cli| {
             b.iter(|| {
                 rt.block_on(async {
-                    let run = cli.run_argv(["bench"]).await;
-                    assert_eq!(run.exit_code(), 0);
+                    let run = cli.run(["bench"]).await;
+                    assert_eq!(run.exit_code(), ExitCode::SUCCESS);
                 });
             });
         });
@@ -95,7 +96,7 @@ fn bench_root_invocation(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_command_execution(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("command_execution");
     for n in [5, 20, 50] {
         let cli = build_flat_cli(n);
@@ -106,8 +107,8 @@ fn bench_command_execution(c: &mut Criterion) {
             |b, (cli, t)| {
                 b.iter(|| {
                     rt.block_on(async {
-                        let run = cli.run_argv(["bench", t, "hello"]).await;
-                        assert_eq!(run.exit_code(), 0);
+                        let run = cli.run(["bench", t, "hello"]).await;
+                        assert_eq!(run.exit_code(), ExitCode::SUCCESS);
                     });
                 });
             },
@@ -117,7 +118,7 @@ fn bench_command_execution(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: parse_invocation at various argv sizes
+// Benchmark: Invocation::parse at various argv sizes
 // ---------------------------------------------------------------------------
 
 fn bench_parse_invocation(c: &mut Criterion) {
@@ -133,7 +134,7 @@ fn bench_parse_invocation(c: &mut Criterion) {
         }
         group.bench_with_input(BenchmarkId::new("argv", n), &argv, |b, argv| {
             b.iter(|| {
-                let _ = parse_invocation(argv.clone());
+                let _ = Invocation::parse(argv.clone(), |_| false);
             });
         });
     }
@@ -145,16 +146,13 @@ fn bench_parse_invocation(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_truncate(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("truncate_lines_with_file");
 
     // No truncation path
     let small: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
     group.bench_function("no_truncation_10", |b| {
         b.iter(|| {
-            rt.block_on(async {
-                let _ = truncate_lines_with_file(small.clone(), 100, "bench").await;
-            });
+            let _ = truncate_lines_with_file(small.clone(), 100, "bench");
         });
     });
 
@@ -165,13 +163,10 @@ fn bench_truncate(c: &mut Criterion) {
             .collect();
         group.bench_with_input(BenchmarkId::new("truncated", total), &lines, |b, lines| {
             b.iter(|| {
-                rt.block_on(async {
-                    let result = truncate_lines_with_file(lines.clone(), 20, "bench")
-                        .await
-                        .expect("must work");
-                    // Clean up temp file to avoid disk bloat during benchmarks
-                    let _ = result.cleanup().await;
-                });
+                let result =
+                    truncate_lines_with_file(lines.clone(), 20, "bench").expect("must work");
+                // Clean up temp file to avoid disk bloat during benchmarks
+                result.cleanup().expect("must clean up");
             });
         });
     }
@@ -179,90 +174,43 @@ fn bench_truncate(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: NdjsonEmitter (stream serialization + flush)
+// Benchmark: a streaming command (event serialization + terminal line)
 // ---------------------------------------------------------------------------
 
-fn bench_ndjson_emitter(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let mut group = c.benchmark_group("ndjson_emitter");
-
-    // Single terminal event
-    group.bench_function("single_result", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let buf = Vec::with_capacity(512);
-                let mut emitter = NdjsonEmitter::new(buf);
-                emitter
-                    .emit_result(SuccessEnvelope::new(
-                        "bench cmd",
-                        json!({"ok": true}),
-                        vec![],
-                    ))
-                    .await
-                    .expect("must emit");
-                let _ = emitter.into_inner();
-            });
-        });
-    });
-
-    // Multi-event stream (5 progress + terminal)
-    group.bench_function("stream_6_events", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let buf = Vec::with_capacity(2048);
-                let mut emitter = NdjsonEmitter::new(buf);
-                for i in 0..5u8 {
-                    emitter
-                        .emit(StreamEvent::Progress {
-                            name: "download".to_string(),
-                            percent: Some(i * 20),
-                            message: None,
-                            ts: "2026-01-01T00:00:00Z".to_string(),
-                        })
-                        .await
-                        .expect("must emit");
+/// A CLI whose `stream` command writes `events` log events, then returns.
+fn build_stream_cli(events: u8) -> AgentCli {
+    AgentCli::new("bench", "Streaming benchmark CLI").command(
+        Command::new("stream", "Stream log events")
+            .usage("bench stream")
+            .stream_handler(move |_req, mut out| async move {
+                for i in 0..events {
+                    out.emit(&StreamEvent::Log {
+                        level: LogLevel::Info,
+                        message: format!("event {i}"),
+                    })?;
                 }
-                emitter
-                    .emit_result(SuccessEnvelope::new("bench cmd", json!(null), vec![]))
-                    .await
-                    .expect("must emit");
-                let _ = emitter.into_inner();
-            });
-        });
-    });
+                Ok(CommandOutput::new(json!({ "events": events })))
+            }),
+    )
+}
 
-    // Compare flush policies on a 10-event stream
-    for policy in [
-        FlushPolicy::Every,
-        FlushPolicy::Terminal,
-        FlushPolicy::Never,
-    ] {
-        let label = format!("{policy:?}");
-        group.bench_function(BenchmarkId::new("flush_policy_10", label), |b| {
+fn bench_stream(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("stream");
+    for events in [0u8, 5, 50] {
+        let cli = build_stream_cli(events);
+        group.bench_with_input(BenchmarkId::new("events", events), &cli, |b, cli| {
             b.iter(|| {
                 rt.block_on(async {
-                    let buf = Vec::with_capacity(4096);
-                    let mut emitter = NdjsonEmitter::new(buf).with_flush_policy(policy);
-                    for i in 0..9u8 {
-                        emitter
-                            .emit(StreamEvent::Log {
-                                level: agcli::LogLevel::Info,
-                                message: format!("event {i}"),
-                                ts: "2026-01-01T00:00:00Z".to_string(),
-                            })
-                            .await
-                            .expect("must emit");
-                    }
-                    emitter
-                        .emit_result(SuccessEnvelope::new("cmd", json!(null), vec![]))
-                        .await
-                        .expect("must emit");
-                    let _ = emitter.into_inner();
+                    // In-process: the events are captured, then rendered with
+                    // the terminal line the way `print` would.
+                    let run = cli.run(["bench", "stream"]).await;
+                    assert_eq!(run.stream_events().len(), usize::from(events));
+                    let _ = run.to_json();
                 });
             });
         });
     }
-
     group.finish();
 }
 
@@ -272,6 +220,6 @@ criterion_group!(
     bench_command_execution,
     bench_parse_invocation,
     bench_truncate,
-    bench_ndjson_emitter,
+    bench_stream,
 );
 criterion_main!(benches);

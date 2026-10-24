@@ -2,7 +2,421 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.17.0] - 2026-08-21
+## [Unreleased]
+
+This release redesigns the Rust API. Handlers are plain async closures, agcli
+no longer depends on tokio, the framework writes a streaming command's terminal
+line, and exit and error codes are types. The wire contract is stricter: a
+non-boolean value, a repeated flag or a malformed `SOURCE_DATE_EPOCH` is an
+error, not a guess. Breaking changes are a **minor** bump pre-1.0.
+
+### Breaking changes
+
+In Rust:
+
+- **Handlers are plain async closures over an owned `CommandRequest`.** The
+    request has no lifetime and is `Clone` and `Debug`, so a handler moves it
+    into its future, and the framework boxes the future.
+
+    `.handler(|req, _ctx| { let a = req.arg_parse::<f64>(0, "a"); Box::pin(async move { .. }) })`
+    becomes `.handler(|req| async move { let a: f64 = req.arg_parse(0, "a")?; .. })`.
+- **`ExecutionContext` is gone**, with `run_env_with_context` and
+    `run_argv_with_context`. Share state the way any closure does, by
+    capturing it.
+
+    `ctx.set("seen", value)` becomes a write through a captured
+    `Arc<Mutex<_>>`.
+- **`run_argv` is `run`.** It runs in-process and installs nothing: a
+    panicking handler panics the caller instead of answering `HANDLER_PANIC`,
+    and a streaming command's events are captured in the `Execution` instead
+    of printed.
+
+    `cli.run_argv(["app", "status"]).await` becomes
+    `cli.run(["app", "status"]).await`.
+- **Under `run_env`, a handler panic ends the process from a panic hook.**
+    `catch_unwind` is gone. The hook writes the `HANDLER_PANIC` envelope and
+    exits with code 1, so `run_env` does not return. The Fixed section lists
+    what the hook covers.
+
+    Code after `cli.run_env().await` no longer runs when a handler panics.
+- **Raw handlers take the argv tail by value and resolve to an `ExitCode`.**
+
+    `.raw_handler(|args, _ctx| { let args = args.to_vec(); Box::pin(async move { ..; 0 }) })`
+    becomes `.raw_handler(|args| async move { ..; ExitCode::SUCCESS })`.
+- **A command has one handler slot.** `handler`, `stream_handler` and
+    `raw_handler` each fill it, and the last call wins. A raw handler used to
+    win over a normal one whatever the order, and `audit()` reported
+    `RAW_COMMAND_HAS_HANDLER`; that finding is gone. `doctor_with` replaces
+    whatever handler its command had.
+
+    `.raw_handler(raw).handler(normal)` runs `normal`.
+- **Streaming moves into the framework.** `Command::stream_handler` hands the
+    handler a `StreamWriter` for its events, and the framework writes the one
+    terminal line from the handler's return value. `NdjsonEmitter`,
+    `FlushPolicy`, `StreamEmitError`, the terminal `StreamEvent::Result` and
+    `StreamEvent::Error` variants, `StreamEvent::result_from_envelope` and
+    `StreamEvent::error_from_envelope` are gone. `StreamEvent` variants lose
+    their `ts`: the writer stamps each event from the run's clock and flushes
+    every line.
+
+    `emitter.emit(StreamEvent::Step { .., ts }).await?; emitter.emit_result(envelope).await?`
+    becomes `out.emit(&StreamEvent::Step { .. })?; Ok(CommandOutput::new(..))`.
+- **tokio is no longer a dependency.** Dispatch stays async, and any executor
+    can drive `run_env` and `run`. `truncate_lines_with_file` and
+    `TruncatedEntries::cleanup` are synchronous, and `read_stdin` is gone.
+
+    `truncate_lines_with_file(lines, 20, "logs").await?` becomes
+    `truncate_lines_with_file(lines, 20, "logs")?`, and
+    `agcli::read_stdin().await?` becomes
+    `std::io::read_to_string(std::io::stdin())?`.
+- **`truncate_lines_with_file` refuses a `max_lines` of 0 and an invalid
+    `file_prefix`** with `io::ErrorKind::InvalidInput`, before writing
+    anything. It used to treat 0 as 1 and replace an invalid prefix with
+    `agcli-output`. A valid prefix is non-empty ASCII letters, digits, `-` and
+    `_`.
+
+    `truncate_lines_with_file(lines, 0, "logs")` returns an error.
+- **Doctor checks have one constructor, and it takes the request.**
+    `Check::with_request` is gone.
+
+    `Check::new("ping", || Box::pin(async { CheckResult::pass() }))` becomes
+    `Check::new("ping", |_req| async { CheckResult::pass() })`.
+- **`ExitCode` is a `u8` newtype**, not a namespace of `i32` constants.
+    `CommandError::exit_code`, `CommandOutput::exit_code`, `Check::exit_code`,
+    raw handlers, `Execution::exit_code`, `Execution::print` and
+    `Envelope::exit_code` take or return it. `ExitCode::new` builds any status
+    and `get` reads it. `TryFrom<i32>` fails outside `0..=255`, so nothing is
+    masked any more. `From<ExitCode> for std::process::ExitCode` lets `main`
+    return one.
+
+    `assert_eq!(run.exit_code(), 0)` becomes
+    `assert_eq!(run.exit_code(), ExitCode::SUCCESS)`.
+- **Error codes are `ErrorCode` values, and `CommandError::new` takes the code
+    first**, so the code, the message and the fix cannot trade places. The
+    framework's codes are constants such as `ErrorCode::INVALID_ARG`; a
+    command names its own with `ErrorCode::new`. `CommandError::code` and
+    `ErrorBody::code` are `ErrorCode`.
+
+    `CommandError::new("no such issue", "NOT_FOUND", "Check the id")` becomes
+    `CommandError::new(ErrorCode::new("NOT_FOUND"), "no such issue", "Check the id")`.
+- **The framework builds every envelope.** `SuccessEnvelope::new`,
+    `ErrorEnvelope::new`, `ErrorBody::new`, and the envelopes'
+    `schema_version`, `exit_code`, `retryable` and `data` builders are
+    private. `SuccessEnvelope`, `ErrorEnvelope`, `ErrorBody` and
+    `CommandError` are `#[non_exhaustive]`, so `CommandError::new`, which
+    requires a fix, is the only way to build an error. Read envelopes from
+    `Execution::envelope`, or decode them with the `deserialize` feature.
+
+    `ErrorEnvelope::new(command, message, code, fix, actions)` becomes
+    `Err(CommandError::new(code, message, fix))` from a handler.
+- **Envelope timestamps are `Timestamp` values.** `SuccessEnvelope::timestamp`
+    and `ErrorEnvelope::timestamp` are an `agcli::Timestamp`: a second from
+    1970-01-01T00:00:00Z to 9999-12-31T23:59:59Z that displays and serializes
+    as the RFC 3339 string and parses back strictly. `StreamLine::Event`
+    carries `timestamp: Timestamp`; its wire key stays `ts`.
+    `SuccessEnvelope` gains `select_warning`.
+
+    `envelope.timestamp` (a `u64`) becomes `envelope.timestamp.epoch_secs()`.
+- **`Invocation::parse(args, is_bool)` replaces `parse_invocation` and
+    `parse_invocation_with_bool_flags`.** `Invocation::into_command_line` is
+    gone, `positional_indices` is private, and `ParseInvocationError` gains
+    `RepeatedFlag`.
+
+    `parse_invocation_with_bool_flags(args, |flag| flag == "force")` becomes
+    `Invocation::parse(args, |flag| flag == "force")`.
+- **`AgentCli::reserved_flags(false)` is `without_reserved_flags()`.** `true`
+    was the default and meant nothing.
+
+    `.reserved_flags(false)` becomes `.without_reserved_flags()`.
+- **`CommandRequest::prompt` is gone, and `CommandRequest::select` returns an
+    iterator** over the requested fields, empty when `--select` is absent.
+
+    `req.select().unwrap_or_default()` becomes
+    `req.select().collect::<Vec<_>>()`.
+- **`CommandOutput::from_serializable` is `try_from_serializable`**, so the
+    name says it can fail.
+
+    `CommandOutput::from_serializable(&value)` becomes
+    `CommandOutput::try_from_serializable(&value)`.
+- **`CheckResult::failed` and `CheckResult::skipped` are `is_failed` and
+    `is_skipped`**, named like `is_ok`.
+
+    `result.failed()` becomes `result.is_failed()`.
+- **`reserved_flag_names()` no longer lists `version`**, and lists the flags
+    in the order the root tree documents them. `--help`, `-h`, `--version`
+    and `-V` are reserved always, apart from the agent flags.
+
+    `reserved_flag_names().contains(&"version")` is now `false`.
+- **More public types are `#[non_exhaustive]`**: the structs `NextAction`,
+    `ActionParam`, `TruncatedEntries`, `CheckResult`, `AuditFinding` and
+    `AuditReport`, and the enums `ParseInvocationError` and
+    `StreamWriteError`. Get the structs from `NextAction::new`,
+    `ActionParam::new` and the other functions that return them, and give a
+    `match` on the enums a wildcard arm.
+
+    `CheckResult { status: CheckStatus::Pass, detail: None, fix: None }`
+    becomes `CheckResult::pass()`.
+- **Builder mistakes panic in every build.** A duplicate name in
+    `AgentCli::command` or `Command::subcommand`, and
+    `CommandError::exit_code(ExitCode::SUCCESS)`, were `debug_assert!`s: a
+    release build silently replaced the first command, or printed an error
+    envelope with exit code 0. Under `run_env`, the assert inside a handler
+    becomes a `HANDLER_PANIC` envelope.
+
+    `.command(status).command(status_again)` panics in release builds too.
+- **The `deserialize` feature is strict about the keys it knows.** A missing
+    or malformed known key is an error: no epoch-integer `timestamp`, no
+    unparseable timestamp read as 0, no timestamp naming an impossible date
+    such as 2026-02-29, and no default for a missing `exit_code`, `dropped`
+    or event field. Unknown keys are still ignored, so a reader keeps working
+    on output from a later agcli that only added a field. `StreamEvent`
+    decodes event lines only; `StreamLine` decodes any line of a stream.
+
+    `serde_json::from_str::<StreamEvent>(terminal_line)` becomes
+    `serde_json::from_str::<StreamLine>(terminal_line)`.
+
+On the wire, for agents and the programs that read agcli output:
+
+- **`select_warning` is an envelope key**, between `result` and
+    `next_actions`. It used to be inserted into the handler's `result`
+    object, where it could replace the handler's own `select_warning`, and an
+    array result had nowhere to put it.
+
+    `result.select_warning` becomes the top-level `select_warning`.
+- **The `command` field reruns as printed**: the program's file name, then
+    every argument, single-quoted (POSIX style) unless it is made only of
+    shell-safe characters. Every envelope renders it this way, including a
+    `PARSE_ERROR` raised before argv parses, which used to carry the full
+    argv[0] path, and the raw command, `--select` advertisement and panic
+    envelopes.
+
+    `"command": "app note two words"` becomes
+    `"command": "app note 'two words'"`.
+- **Doctor check entries drop `ok`.** `status` (`pass`, `fail` or `skip`) is
+    the one outcome field.
+
+    `checks[i].ok` becomes `checks[i].status != "fail"`.
+- **`--version` with no version set omits the `version` key** instead of
+    reporting `"unknown"`.
+
+    `{"name":"app","version":"unknown"}` becomes `{"name":"app"}`.
+- **A malformed `SOURCE_DATE_EPOCH` is an `INVALID_ENV` error**, exit code 2,
+    checked before anything runs. The reproducible-builds spec requires an
+    error; agcli used to clamp a malformed, negative or too-large value.
+
+    `SOURCE_DATE_EPOCH=-5 app status` answered at `1970-01-01T00:00:00Z`; it
+    now answers `INVALID_ENV`.
+- **Boolean flag values are strict.** Only `true`/`false`, `1`/`0`,
+    `yes`/`no` and `on`/`off` count, in any ASCII case and untrimmed, and a
+    bare flag is `true`. Any other value of a reserved or framework boolean is
+    `INVALID_FLAG`, exit code 2, with the named command's templates as
+    `next_actions`, and as a terminal line for a streaming command. Any value
+    but an off spelling used to turn the flag on.
+
+    `--quiet=maybe` turned quiet on; it now fails with `INVALID_FLAG`.
+- **A flag given twice is a `PARSE_ERROR`** naming it (`--select given
+    twice`), in any spelling: `--n=1 -n 2`, `-vv`. The last value used to win
+    silently.
+
+    `--select=a --select=b` projected `b`; it now fails.
+- **Bundled short flags with a value are a `PARSE_ERROR`.**
+
+    `-abc=5` set the flags `a`, `b`, `c`, `=` and `5`; it now fails, naming the
+    token.
+- **`--help`, `-h`, `--version` and `-V` always belong to the framework**,
+    parsed as booleans even under `without_reserved_flags()`. `-V foo` keeps
+    `foo` as a positional, and `--version=false` is off. A raw command still
+    owns them.
+
+    `app -V foo` answered the version; it now reports `UNKNOWN_COMMAND` for
+    `foo`.
+- **`--version` and `-V` answer wherever they appear**, as `--help` does,
+    and help wins when both are given. Flags are checked against the named
+    command's usage.
+
+    `calc add 1 2 --version` ran `add`; it now answers the version.
+- **The root, help and version answers reject unknown flags** with
+    `UNKNOWN_FLAG`, exit code 2. Help for a command checks flags against that
+    command's usage.
+
+    `calc --bogus` printed the tree; it now fails.
+
+### Added
+
+- **`Command::stream_handler` and `StreamWriter`.** The handler writes
+    `start`, `step`, `progress`, `log` and `event` lines with
+    `StreamWriter::emit`. When it returns, the framework writes exactly one
+    terminal line: the envelope with `"type":"result"` or `"type":"error"` in
+    front, to which `--select`, `--quiet` and `next_actions` apply. A usage
+    error on a streaming command is a terminal line too. Under `run_env` the
+    events reach stdout as they are written; under `run` they are captured,
+    and `Execution::stream_events` returns them. A failed write is a
+    `StreamWriteError` that poisons the writer, and `?` turns it into a
+    `STREAM_WRITE_FAILED` error. `Command::is_stream` and
+    `Execution::is_stream` tell a streaming command apart; the root tree and
+    help mark it `"stream": true`, and the generated skill says it streams.
+    `examples/ops.rs` gains a streaming `deploy`.
+- **`StreamLine`**, with the `deserialize` feature, decodes any line of a
+    stream: an event, or the terminal `result` or `error` envelope.
+- **`AgentCli::clock`** sets the clock in Unix seconds. The run reads it
+    whenever it writes a timestamp: an event's `ts` as the event is written,
+    the envelope's `timestamp` when it is built at the end of the run, and a
+    `HANDLER_PANIC` envelope's at the panic. Tests pin it instead of setting
+    `SOURCE_DATE_EPOCH`. A reading past `Timestamp::MAX`
+    (9999-12-31T23:59:59Z) panics rather than write a wrong timestamp.
+- **`Timestamp` and `ParseTimestampError`.** `Timestamp::UNIX_EPOCH`,
+    `Timestamp::MAX`, `from_epoch_secs` (`None` past `MAX`), `epoch_secs`,
+    `Display` as RFC 3339 UTC, and a strict `FromStr` that accepts exactly
+    `YYYY-MM-DDTHH:MM:SSZ` on a real calendar date.
+- **`CommandOutput::next_actions` and `CommandError::next_actions` take any
+    `IntoIterator<Item = NextAction>`**, not only a `Vec`.
+- **`CommandRequest::flag_on`** reads a command's own boolean flag strictly:
+    `false` when absent, the boolean a valid spelling names, else
+    `INVALID_FLAG`. `req.flag("force").is_some()` read `--force=false` as on.
+- **The `INVALID_ENV` and `STREAM_WRITE_FAILED` error codes**, published in
+    `error_codes` and the generated skill.
+- **The root tree and the generated skill describe the whole contract.**
+    `agent_flags` says that `--quiet` keeps an error's `next_actions`, that a
+    `--select` miss is reported in a top-level `select_warning`, and why
+    `--json` is reserved. `exit_codes` and `error_codes` name malformed and
+    repeated flags, the boolean spellings, and when `MISSING_HANDLER` happens.
+    The skill's contract adds `select_warning`, that `--help` and `--version`
+    are answered anywhere on the line, and that only a stream's terminal line
+    carries `ok`.
+- **`audit()` reports `INTERCEPTED_FLAG_DECLARED`** (error) for a usage
+    string that declares `-h`, `--help`, `-V` or `--version`, which the
+    framework always answers itself. Raw commands are exempt.
+- **More standard traits.** `Debug` for `Check` and `StreamWriter`; `Clone`
+    and `Debug` for `CommandRequest`; `Display` for `ExitCode` (the number);
+    `Copy`, `Hash` and `Ord` for `LogLevel` (`Info` < `Warn` < `Error`);
+    `Copy` and `Hash` for `StepStatus`; `Hash` and `Ord` for `AuditSeverity`
+    (`Warning` < `Error`); `Hash` for `CheckStatus`, which is now exhaustive
+    like the other wire enums, so a `match` notices a new outcome.
+
+### Fixed
+
+- **A panicking handler always ends with one `HANDLER_PANIC` envelope under
+    `run_env`.** The panic hook covers the synchronous code a handler runs
+    before its future, which `catch_unwind` around the poll missed. It works
+    under `panic = "abort"`, writes the envelope as the terminal line of a
+    streaming command and to stderr for a raw one, stamps it with the clock
+    at the panic, and calls the previously installed hook first. Panics
+    outside handlers, and panics in tasks a handler spawned that the runtime
+    catches, behave as they would without agcli.
+- **A non-UTF-8 argument is a `PARSE_ERROR` envelope** naming its position
+    (`argument 2 is not valid UTF-8`). `run_env` read argv with
+    `std::env::args`, which panics on one.
+- **Printing never panics.** `Execution::print` and `finish` write through
+    locked handles: a closed stdout (`EPIPE`, a broken pipe) is ignored, and
+    any other write failure is reported on stderr. `println!` panicked on a
+    closed pipe.
+- **A streaming command prints exactly one terminal line.** A handler that
+    streamed through `NdjsonEmitter` still returned an envelope, so stdout got
+    two terminal lines.
+- **Deep command trees are documented and audited in full.** A depth limit of
+    32 levels silently cut the root tree, help, the skill and `audit()` short.
+- **`flag_parse` names a one-letter flag with one dash** (`flag -n is not
+    valid`), like every other message, instead of `--n`.
+- **The `UNKNOWN_FLAG` fix lists the reserved flags from the list the parser
+    reads**, and says that `--help` and `--version` are accepted too.
+- **The root tree's `commands` is built as JSON directly**, so it can no
+    longer fall back to a string.
+- **`examples/ops.rs` teaches typed errors.** `ops logs` refuses a missing
+    `<source>` with `MISSING_ARG` and a `--lines` that is not a positive count
+    with `INVALID_FLAG`, instead of defaulting to `worker` and 20.
+- **A `PARSE_ERROR` says how to fix its cause.** A repeated `--select` says to
+    pass every field in one comma-separated list, another repeated flag says
+    to pass it once, and a malformed flag says how to spell one. Every
+    `PARSE_ERROR` used to say "Use valid CLI syntax. Run the root command to
+    inspect command templates."
+- **A literal `next_action` runs as printed.** A usage string without a
+    placeholder became a literal action that kept its optional parts, so
+    `wokhei gateway stream [--follow]` passed `[--follow]` as an argument and
+    failed with `EXTRA_ARG`. The literal now drops them:
+    `wokhei gateway stream`.
+- **`--select` on an array result warns, as on an object.** A select that
+    matched no field in any row returned rows of `{}` without a warning. It
+    now returns the full result and a `select_warning` naming the keys found
+    across the rows.
+- **The `help` alias yields to a CLI's own `help` command**, as the
+    `version` alias already did. The CLI's `help` command was unreachable.
+- **The pre-commit hooks and `just publish-check` build through `mbx`**, like
+    the gate.
+
+### Internal
+
+- `src/cli.rs`, about 5,300 lines, is split into one module per primary item,
+    with unit tests beside their code. Free functions are called through their
+    module (`usage::flag_display`). Unreachable branches, among them a
+    `MISSING_HANDLER` path in raw dispatch, and a second copy of the reserved
+    flag names are gone. Test names and crate-private helpers follow the
+    current API.
+- The crate-wide `#![allow(clippy::pedantic)]` is gone. The crate is clean
+    under clippy pedantic and the repo's ast-grep rules with no lint
+    suppressions anywhere. Builders, constructors, getters, `CommandError` and
+    `Execution` are `#[must_use]`, so dropping a builder's result or an
+    `Execution` that was never printed warns. Functions that fail or panic
+    document `# Errors` and `# Panics`.
+- `ci.yml` runs the gate on every push to `master` and every pull request:
+    rustfmt, clippy pedantic with and without `--all-features`, nextest,
+    doctests, ast-grep, a check for lint suppressions, and rustdoc with
+    `-D warnings`. A second job checks the MSRV (minimum supported Rust
+    version) named by `rust-version`.
+- `release.yml` runs that gate before it publishes, fails when CHANGELOG.md
+    has no `## [X.Y.Z]` heading for the tag, and takes the GitHub Release
+    notes from that section. The skip-if-already-published branch and
+    git-cliff are gone, with `cliff.toml`. Every action is on its latest
+    release, pinned by commit SHA.
+- `rust-version = "1.88"`: 1.87 fails to build the crate.
+- Packaging: an `include` list (`src`, `examples`, `tests`, `benches`,
+    `Cargo.toml`, `README.md`, `CHANGELOG.md`, `LICENSE`) replaces `exclude`,
+    and docs.rs builds with every feature, so the `deserialize` items are
+    documented.
+- `just gate` runs the CI gate through `mbx`. The `release` and `changelog`
+    recipes are gone: they bypassed the tag-driven flow and used the BSD-only
+    `sed -i ''`. The pre-commit hooks run clippy with `--all-features` and
+    call `ast-grep scan`.
+- criterion 0.8, and a refreshed `Cargo.lock`.
+- Tests: the `tests/kill_*.rs` mutation-triage files are folded into
+    `argv_parsing.rs`, `suggestions.rs`, `usage_templates.rs` and
+    `golden_envelopes.rs`. Tests that need a process re-execute the test
+    binary instead of calling `cargo run`, which takes the raw end-to-end
+    test from about 11 s to 0.04 s. No test sets an environment variable;
+    they pin the clock. New suites: `panic_hook.rs`, `streaming.rs`,
+    `clock.rs`, `ops_example.rs` and `calc_example.rs`, plus a
+    serialize-then-deserialize test for every public wire type. The example
+    tests crawl every literal `next_action` an example prints and run it.
+- `examples/calc.rs` builds its CLI in `fn cli()`, which the README's
+    calculator copies and `tests/calc_example.rs` drives in-process.
+- Docs: README.md is the user guide and the crate documentation, and every
+    Rust block in it is a doctest. Every public item has rustdoc, and
+    `#![warn(missing_docs)]` keeps it that way. AGENTS.md
+    is the one guide to working on the repo, and CLAUDE.md imports it.
+    `design.md`, a copy of an upstream skill, is gone; its agcli-specific
+    content is in the README. `agent_ergonomics_audit/` is gone; nothing read
+    it.
+
+## [0.17.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.17.0) - 2026-08-21
+
+Help becomes a skill, the built-in `doctor` becomes a command the consumer
+owns, and a failure can carry structured facts instead of prose about them.
+Three public types gain a field, hence a **minor** bump pre-1.0. 0.16.0 was
+never published; its changes ship in this release.
+
+### Breaking changes
+
+- **`StreamEvent::Error` gains a `data: Option<Value>` field.** The NDJSON
+    terminal error carries the same payload as the direct envelope: the same
+    failure must not read differently because the caller chose the streaming
+    channel. Code matching the variant exhaustively must add `data` or a `..`
+    arm.
+- **`CommandError` and `ErrorEnvelope` gain a `data` field**
+    (`Option<Box<Value>>` and `Option<Value>` respectively — boxed on the error
+    type so the `Err` arm of every handler `Result` stays small). Code that
+    builds either with a struct literal, or destructures one exhaustively, must
+    add `data`. Builder calls (`CommandError::new(...)`,
+    `ErrorEnvelope::new(...)`) are unaffected, and an error that never sets a
+    payload serializes exactly as before.
 
 ### Added
 
@@ -26,37 +440,6 @@ All notable changes to this project will be documented in this file.
 - **`audit()` reports `SKILL_NAME_INVALID`** when a CLI that registered
     `.skill()` has a name that is not a slug. The name is both the frontmatter
     `name` a harness matches on and the directory `--install` writes into.
-
-### Changed
-
-- The root tree's `exit_codes` and `error_codes` dictionaries now come from
-    shared tables (`EXIT_CODE_DOCS`, `ERROR_CODE_DOCS`) that the skill renderer
-    reads too, so JSON and markdown cannot disagree. `error_codes` gains
-    `WRITE_FAILED`.
-
-## [0.16.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.16.0) - 2026-08-19
-
-The built-in `doctor` stops being a command the framework owns and becomes one
-the consumer owns, and a failure can carry structured facts instead of prose
-about them. Three public types gain a field, hence a **minor** bump pre-1.0.
-
-### Breaking changes
-
-- **`StreamEvent::Error` gains a `data: Option<Value>` field.** The NDJSON
-    terminal error carries the same payload as the direct envelope: the same
-    failure must not read differently because the caller chose the streaming
-    channel. Code matching the variant exhaustively must add `data` or a `..`
-    arm.
-- **`CommandError` and `ErrorEnvelope` gain a `data` field**
-    (`Option<Box<Value>>` and `Option<Value>` respectively — boxed on the error
-    type so the `Err` arm of every handler `Result` stays small). Code that
-    builds either with a struct literal, or destructures one exhaustively, must
-    add `data`. Builder calls (`CommandError::new(...)`,
-    `ErrorEnvelope::new(...)`) are unaffected, and an error that never sets a
-    payload serializes exactly as before.
-
-### Added
-
 - **`AgentCli::doctor_with(command, checks)`.** `doctor(checks)` hardcodes the
     command — name, description, usage, and therefore *no flags* — so a CLI
     whose `doctor` takes `--profile <name>` had nowhere to declare it:
@@ -79,6 +462,13 @@ about them. Three public types gain a field, hence a **minor** bump pre-1.0.
     encoded into the message text and parsed back out. The key is absent when
     the payload is never set, on both the envelope and the NDJSON `error`
     event.
+
+### Changed
+
+- The root tree's `exit_codes` and `error_codes` dictionaries now come from
+    shared tables (`EXIT_CODE_DOCS`, `ERROR_CODE_DOCS`) that the skill renderer
+    reads too, so JSON and markdown cannot disagree. `error_codes` gains
+    `WRITE_FAILED`.
 
 ## [0.15.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.15.0) - 2026-08-19
 

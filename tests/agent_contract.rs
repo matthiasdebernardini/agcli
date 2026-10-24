@@ -1,4 +1,4 @@
-//! Contract guarantees a migrating CLI leans on.
+//! Contract guarantees a CLI built on agcli leans on.
 //!
 //! Each test here pins a promise the crate makes but that no single API
 //! signature states: what happens to a flag nobody declared, what the exit
@@ -19,11 +19,11 @@ fn cli() -> AgentCli {
     AgentCli::new("app", "Test CLI").command(
         Command::new("brain", "Report state")
             .usage("app brain [<repo>]")
-            .handler(|req, _ctx| {
+            .handler(|req| {
                 let positionals = req.positionals().to_vec();
                 let json_flag = req.flag("json").map(str::to_string);
                 let quiet = req.quiet();
-                Box::pin(async move {
+                async move {
                     // A handler may narrate on stderr; stdout belongs to the
                     // envelope alone. `--quiet` is the caller's signal to stop.
                     if !quiet {
@@ -34,29 +34,28 @@ fn cli() -> AgentCli {
                         "json_flag": json_flag,
                         "quiet": quiet,
                     })))
-                })
+                }
             }),
     )
 }
 
 #[tokio::test]
 async fn an_undeclared_json_flag_is_parsed_and_ignored() {
-    // `--json` is reserved framework-wide, so a CLI that dropped its own
-    // `--json` flag still accepts the calls agents already have memorized.
-    let execution = cli().run_argv(["app", "brain", "--json"]).await;
+    // `--json` is reserved framework-wide: it is the flag an agent most often
+    // guesses on an unfamiliar tool, and output is always JSON anyway.
+    let execution = cli().run(["app", "brain", "--json"]).await;
     let json = parse(&execution);
 
-    assert_eq!(execution.exit_code(), 0);
+    assert_eq!(execution.exit_code(), ExitCode::SUCCESS);
     assert_eq!(json["ok"], json!(true));
     assert_eq!(json["result"]["json_flag"], json!("true"));
 }
 
 #[tokio::test]
 async fn an_undeclared_json_flag_does_not_swallow_the_next_positional() {
-    // The edge case that would silently break back-compat: `--json` is a
-    // reserved *boolean*, so `myrepo` stays a positional instead of becoming
-    // the flag's value.
-    let execution = cli().run_argv(["app", "brain", "--json", "myrepo"]).await;
+    // `--json` is a reserved *boolean*, so `myrepo` stays a positional
+    // instead of becoming the flag's value.
+    let execution = cli().run(["app", "brain", "--json", "myrepo"]).await;
     let json = parse(&execution);
 
     assert_eq!(json["ok"], json!(true));
@@ -65,7 +64,7 @@ async fn an_undeclared_json_flag_does_not_swallow_the_next_positional() {
 
 #[tokio::test]
 async fn a_json_flag_before_the_command_name_still_resolves_the_command() {
-    let execution = cli().run_argv(["app", "--json", "brain", "myrepo"]).await;
+    let execution = cli().run(["app", "--json", "brain", "myrepo"]).await;
     let json = parse(&execution);
 
     assert_eq!(json["ok"], json!(true));
@@ -74,7 +73,7 @@ async fn a_json_flag_before_the_command_name_still_resolves_the_command() {
 
 #[tokio::test]
 async fn the_root_tree_documents_the_json_flag() {
-    let execution = cli().run_argv(["app"]).await;
+    let execution = cli().run(["app"]).await;
     let json = parse(&execution);
     let flags = json["result"]["agent_flags"].as_array().expect("flags");
 
@@ -90,21 +89,21 @@ async fn without_reserved_flags_an_undeclared_json_swallows_the_positional() {
     // safe *because* it is reserved. Turn the reserved vocabulary off and it
     // becomes an ordinary undeclared flag, which consumes the next token.
     let cli = AgentCli::new("app", "Test CLI")
-        .reserved_flags(false)
+        .without_reserved_flags()
         .command(
             Command::new("brain", "Report state")
                 .usage("app brain [<repo>]")
-                .handler(|req, _ctx| {
+                .handler(|req| {
                     let positionals = req.positionals().to_vec();
                     let json_flag = req.flag("json").map(str::to_string);
-                    Box::pin(async move {
+                    async move {
                         Ok(CommandOutput::new(
                             json!({ "positionals": positionals, "json_flag": json_flag }),
                         ))
-                    })
+                    }
                 }),
         );
-    let execution = cli.run_argv(["app", "brain", "--json", "myrepo"]).await;
+    let execution = cli.run(["app", "brain", "--json", "myrepo"]).await;
     let json = parse(&execution);
 
     assert_eq!(json["result"]["json_flag"], json!("myrepo"));
@@ -119,19 +118,17 @@ async fn a_successful_command_exits_zero_whatever_it_reports() {
     let cli = AgentCli::new("app", "Test CLI").command(
         Command::new("brain", "Report state")
             .usage("app brain")
-            .handler(|_req, _ctx| {
-                Box::pin(async move {
-                    Ok(CommandOutput::new(json!({
-                        "viewer": "unreachable",
-                        "error": "connection refused",
-                        "healthy": false,
-                    })))
-                })
+            .handler(|_req| async move {
+                Ok(CommandOutput::new(json!({
+                    "viewer": "unreachable",
+                    "error": "connection refused",
+                    "healthy": false,
+                })))
             }),
     );
-    let execution = cli.run_argv(["app", "brain"]).await;
+    let execution = cli.run(["app", "brain"]).await;
 
-    assert_eq!(execution.exit_code(), 0);
+    assert_eq!(execution.exit_code(), ExitCode::SUCCESS);
     assert_eq!(parse(&execution)["ok"], json!(true));
 }
 
@@ -140,30 +137,28 @@ async fn a_command_may_report_success_with_a_chosen_exit_code() {
     let cli = AgentCli::new("app", "Test CLI").command(
         Command::new("check", "Check")
             .usage("app check")
-            .handler(|_req, _ctx| {
-                Box::pin(async move {
-                    Ok(CommandOutput::new(json!({ "stale": true })).exit_code(ExitCode::NOT_FOUND))
-                })
+            .handler(|_req| async move {
+                Ok(CommandOutput::new(json!({ "stale": true })).exit_code(ExitCode::NOT_FOUND))
             }),
     );
-    let execution = cli.run_argv(["app", "check"]).await;
+    let execution = cli.run(["app", "check"]).await;
 
-    assert_eq!(execution.exit_code(), 3);
+    assert_eq!(execution.exit_code(), ExitCode::NOT_FOUND);
     assert_eq!(parse(&execution)["ok"], json!(true));
 }
 
 #[tokio::test]
 async fn a_failing_doctor_check_carries_its_own_exit_code() {
     let cli = AgentCli::new("app", "Test CLI").doctor(vec![
-        Check::new("auth", || {
-            Box::pin(async { CheckResult::fail("no token", "Run `app login`") })
+        Check::new("auth", |_req| async {
+            CheckResult::fail("no token", "Run `app login`")
         })
         .exit_code(ExitCode::AUTH),
     ]);
-    let execution = cli.run_argv(["app", "doctor"]).await;
+    let execution = cli.run(["app", "doctor"]).await;
     let json = parse(&execution);
 
-    assert_eq!(execution.exit_code(), 4);
+    assert_eq!(execution.exit_code(), ExitCode::AUTH);
     // The report itself succeeded, so the envelope is still ok.
     assert_eq!(json["ok"], json!(true));
     assert_eq!(json["result"]["healthy"], json!(false));
@@ -174,20 +169,18 @@ async fn a_failing_doctor_check_carries_its_own_exit_code() {
 #[tokio::test]
 async fn a_skipped_doctor_check_is_neither_pass_nor_fail() {
     let cli = AgentCli::new("app", "Test CLI").doctor(vec![
-        Check::new("git", || {
-            Box::pin(async { CheckResult::pass_with("2.44.0") })
-        }),
-        Check::new("s3", || {
-            Box::pin(async { CheckResult::skip("no bucket configured") })
+        Check::new("git", |_req| async { CheckResult::pass_with("2.44.0") }),
+        Check::new("s3", |_req| async {
+            CheckResult::skip("no bucket configured")
         })
         .exit_code(ExitCode::API),
     ]);
-    let execution = cli.run_argv(["app", "doctor"]).await;
+    let execution = cli.run(["app", "doctor"]).await;
     let json = parse(&execution);
     let checks = &json["result"]["checks"];
 
     // A skipped check cannot fail the run, and its exit code never applies.
-    assert_eq!(execution.exit_code(), 0);
+    assert_eq!(execution.exit_code(), ExitCode::SUCCESS);
     assert_eq!(json["result"]["healthy"], json!(true));
     assert_eq!(json["result"]["skipped"], json!(1));
     assert_eq!(checks[0]["status"], json!("pass"));
@@ -195,20 +188,19 @@ async fn a_skipped_doctor_check_is_neither_pass_nor_fail() {
     assert_eq!(checks[1]["detail"], json!("no bucket configured"));
     // …but it is not reported as a pass either.
     assert_ne!(checks[1]["status"], checks[0]["status"]);
-    // The back-compat the changelog promises: an agent still reading `ok`
-    // sees a skip as "not a failure", which is the honest coarse answer.
-    assert_eq!(checks[0]["ok"], json!(true));
-    assert_eq!(checks[1]["ok"], json!(true));
+    // `status` is the one outcome field; there is no coarse `ok` beside it.
+    assert!(checks[0].get("ok").is_none(), "{checks:?}");
+    assert!(checks[1].get("ok").is_none(), "{checks:?}");
     // A skip carries no `fix` — there is nothing to repair.
     assert!(checks[1].get("fix").is_none(), "{checks:?}");
 }
 
 #[tokio::test]
 async fn quiet_reaches_the_handler_and_still_yields_a_valid_envelope() {
-    let execution = cli().run_argv(["app", "brain", "--quiet"]).await;
+    let execution = cli().run(["app", "brain", "--quiet"]).await;
     let json = parse(&execution);
 
     assert_eq!(json["result"]["quiet"], json!(true));
     assert_eq!(json["next_actions"], json!([]));
-    assert_eq!(execution.exit_code(), 0);
+    assert_eq!(execution.exit_code(), ExitCode::SUCCESS);
 }

@@ -2,14 +2,27 @@
 name = "agcli"
 version = "0.17.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A tiny, no-bloat foundation crate for building agentic CLIs in Rust."
 license = "MIT"
 repository = "https://github.com/matthiasdebernardini/agcli"
 homepage = "https://github.com/matthiasdebernardini/agcli"
 readme = "README.md"
-exclude = ["agent_ergonomics_audit/", "*.html"]
+include = [
+    "/src/**",
+    "/examples/**",
+    "/tests/**",
+    "/benches/**",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
 keywords = ["cli", "agent", "json", "framework"]
 categories = ["command-line-interface"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 deserialize = []
@@ -17,10 +30,9 @@ deserialize = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["fs", "io-util", "io-std"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
