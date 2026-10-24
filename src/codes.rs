@@ -90,7 +90,7 @@ impl From<ExitCode> for std::process::ExitCode {
 /// places with the message or the fix in
 /// [`CommandError::new`](crate::CommandError::new). Serialized as the plain
 /// string, and never empty.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct ErrorCode(Cow<'static, str>);
 
@@ -148,8 +148,7 @@ impl ErrorCode {
     ///
     /// When `code` is empty: an empty code names no failure class.
     #[must_use]
-    pub fn owned(code: impl Into<String>) -> Self {
-        let code = code.into();
+    pub fn owned(code: String) -> Self {
         assert!(!code.is_empty(), "an error code cannot be empty");
         Self(Cow::Owned(code))
     }

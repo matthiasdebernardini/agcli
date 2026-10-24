@@ -63,7 +63,7 @@ fn build_nested_cli(breadth: usize, depth: usize) -> AgentCli {
 // ---------------------------------------------------------------------------
 
 fn bench_root_invocation(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("a tokio runtime");
     let mut group = c.benchmark_group("root_invocation");
     for n in [5, 20, 50] {
         let cli = build_flat_cli(n);
@@ -96,7 +96,7 @@ fn bench_root_invocation(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_command_execution(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("a tokio runtime");
     let mut group = c.benchmark_group("command_execution");
     for n in [5, 20, 50] {
         let cli = build_flat_cli(n);
@@ -195,7 +195,7 @@ fn build_stream_cli(events: u8) -> AgentCli {
 }
 
 fn bench_stream(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("a tokio runtime");
     let mut group = c.benchmark_group("stream");
     for events in [0u8, 5, 50] {
         let cli = build_stream_cli(events);

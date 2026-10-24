@@ -26,10 +26,7 @@ In Rust:
 
     `ctx.set("seen", value)` becomes a write through a captured
     `Arc<Mutex<_>>`.
-- **`run_argv` is `run`.** It runs in-process and installs nothing: a
-    panicking handler panics the caller instead of answering `HANDLER_PANIC`,
-    and a streaming command's events are captured in the `Execution` instead
-    of printed.
+- **`run_argv` is `run`.**
 
     `cli.run_argv(["app", "status"]).await` becomes
     `cli.run(["app", "status"]).await`.
@@ -57,10 +54,18 @@ In Rust:
     `StreamEvent::Error` variants, `StreamEvent::result_from_envelope` and
     `StreamEvent::error_from_envelope` are gone. `StreamEvent` variants lose
     their `ts`: the writer stamps each event from the run's clock and flushes
-    every line.
+    every line. `StreamWriter::emit` takes `&self`, and the writer is `Clone`,
+    so a task the handler spawns can emit through a clone; a clone kept past
+    the handler's return is refused with `StreamWriteError::Closed`.
 
     `emitter.emit(StreamEvent::Step { .., ts }).await?; emitter.emit_result(envelope).await?`
     becomes `out.emit(&StreamEvent::Step { .. })?; Ok(CommandOutput::new(..))`.
+- **`ActionParam::default` is `default_value`.** The builder shadowed the
+    derived `Default`, so `ActionParam::default()` did not compile. The wire
+    key stays `default`.
+
+    `ActionParam::new().default("worker")` becomes
+    `ActionParam::new().default_value("worker")`.
 - **tokio is no longer a dependency.** Dispatch stays async, and any executor
     can drive `run_env` and `run`. `truncate_lines_with_file` and
     `TruncatedEntries::cleanup` are synchronous, and `read_stdin` is gone.
@@ -94,7 +99,9 @@ In Rust:
 - **Error codes are `ErrorCode` values, and `CommandError::new` takes the code
     first**, so the code, the message and the fix cannot trade places. The
     framework's codes are constants such as `ErrorCode::INVALID_ARG`; a
-    command names its own with `ErrorCode::new`. `CommandError::code` and
+    command names its own with `ErrorCode::new`, or `ErrorCode::owned` for a
+    `String` built at run time (`format!("HTTP_{status}")`). A code is never
+    empty: both constructors panic on one. `CommandError::code` and
     `ErrorBody::code` are `ErrorCode`.
 
     `CommandError::new("no such issue", "NOT_FOUND", "Check the id")` becomes
@@ -160,17 +167,30 @@ In Rust:
     `AgentCli::command` or `Command::subcommand`, and
     `CommandError::exit_code(ExitCode::SUCCESS)`, were `debug_assert!`s: a
     release build silently replaced the first command, or printed an error
-    envelope with exit code 0. Under `run_env`, the assert inside a handler
-    becomes a `HANDLER_PANIC` envelope.
+    envelope with exit code 0. Two more mistakes panic the same way:
+    `CommandOutput::list_truncated(items, total)` with a `total` below the
+    item count, which reported `count: 3, total: 1, truncated: false`, and
+    `AgentCli::skill()` on a CLI name that is not a slug, whose frontmatter
+    `name` and `--install` directory no harness accepts. The
+    `SKILL_NAME_INVALID` audit finding is gone with it: such a CLI cannot be
+    built. Under `run_env`, an assert inside a handler becomes a
+    `HANDLER_PANIC` envelope.
 
     `.command(status).command(status_again)` panics in release builds too.
 - **The `deserialize` feature is strict about the keys it knows.** A missing
     or malformed known key is an error: no epoch-integer `timestamp`, no
     unparseable timestamp read as 0, no timestamp naming an impossible date
     such as 2026-02-29, and no default for a missing `exit_code`, `dropped`
-    or event field. Unknown keys are still ignored, so a reader keeps working
-    on output from a later agcli that only added a field. `StreamEvent`
-    decodes event lines only; `StreamLine` decodes any line of a stream.
+    or event field. Shapes the framework never writes are refused too: a
+    `null` for `schema_version`, `select_warning` or `data` (the key is left
+    out instead), an empty `error.code`, an error envelope with `exit_code`
+    0, and a `TruncatedEntries` whose counts disagree (`lines` must count
+    `entries`, `dropped` must be `total - lines`, `truncated` must be true
+    exactly when lines were dropped, and `full_output` must be present
+    exactly when truncated). Unknown keys are still ignored, so a reader
+    keeps working on output from a later agcli that only added a field.
+    `StreamEvent` decodes event lines only; `StreamLine` decodes any line of
+    a stream.
 
     `serde_json::from_str::<StreamEvent>(terminal_line)` becomes
     `serde_json::from_str::<StreamLine>(terminal_line)`.
@@ -224,22 +244,51 @@ On the wire, for agents and the programs that read agcli output:
     `-abc=5` set the flags `a`, `b`, `c`, `=` and `5`; it now fails, naming the
     token.
 - **`--help`, `-h`, `--version` and `-V` always belong to the framework**,
-    parsed as booleans even under `without_reserved_flags()`. `-V foo` keeps
-    `foo` as a positional, and `--version=false` is off. A raw command still
-    owns them.
+    parsed as booleans even under `without_reserved_flags()`. `-V status`
+    keeps `status` as a positional, which then has to name a command, and
+    `--version=false` is off, so the root tree answers. A raw command still
+    owns them after its name.
 
-    `app -V foo` answered the version; it now reports `UNKNOWN_COMMAND` for
-    `foo`.
+    `app -V foo` answered the version; it now keeps `foo` as a positional
+    and reports `UNKNOWN_COMMAND` for it.
 - **`--version` and `-V` answer wherever they appear**, as `--help` does,
-    and help wins when both are given. Flags are checked against the named
-    command's usage.
+    once the positionals name a command or nothing, and help wins when both
+    are given. Flags are checked against the named command's usage. The
+    `version` alias takes no argument.
 
     `calc add 1 2 --version` ran `add`; it now answers the version.
+    `calc version extra` was `UNKNOWN_COMMAND` for `version`; it is now
+    `EXTRA_ARG` for `extra`.
 - **The root, help and version answers reject unknown flags** with
     `UNKNOWN_FLAG`, exit code 2. Help for a command checks flags against that
-    command's usage.
+    command's usage, and a group without a usage string declares no flags.
 
-    `calc --bogus` printed the tree; it now fails.
+    `calc --bogus` printed the tree; it now fails. `app db --bogus` printed
+    the group's tree with the flag dropped; it now fails.
+- **The tokens before a raw command's name are the framework's.** A help or
+    version flag there is answered, a reserved or framework boolean given a
+    value that is not a boolean is `INVALID_FLAG`, and a malformed token there
+    is `PARSE_ERROR`. Everything after the name stays the command's, as before.
+
+    `app --help grep` ran grep with no arguments, and `app -h grep pat` ran it
+    with `pat`; both now answer help for `grep`. `app --quiet=maybe grep pat`
+    ran grep; it is now `INVALID_FLAG`.
+- **A `-` followed by a digit is a positional.** `-0x10` and `-1,000` were
+    read as bundles of short flags.
+
+    `app add 1 -0x10` failed with `PARSE_ERROR: -0 given twice`; it now reaches
+    the handler, whose `arg_parse` reports `INVALID_ARG` for `-0x10`.
+- **An explicit `--select` wins over `compact_fields`.** Beside `--select`,
+    `--compact` only drops nulls and empty containers from the selection.
+
+    `app get --select=body --compact` on a command declaring
+    `compact_fields(["id", "name"])` answered `"result": {}`; it now answers
+    the selected `body`.
+- **A list's `fields` leaves out keys `--select` cannot spell**: one holding
+    `.` or `,`, or padded with whitespace.
+
+    `["items.a.b"]` was advertised for a row key `a.b` and projected to a
+    miss; the key is now left out of `fields`.
 
 ### Added
 
@@ -264,6 +313,9 @@ On the wire, for agents and the programs that read agcli output:
     `HANDLER_PANIC` envelope's at the panic. Tests pin it instead of setting
     `SOURCE_DATE_EPOCH`. A reading past `Timestamp::MAX`
     (9999-12-31T23:59:59Z) panics rather than write a wrong timestamp.
+- **`CommandRequest::now`** reads the run's clock, so a handler that stamps
+    its own fields (`created_at`) is byte-stable under a pinned clock too.
+- **`Envelope::timestamp`** is public, like `command`, `ok` and `exit_code`.
 - **`Timestamp` and `ParseTimestampError`.** `Timestamp::UNIX_EPOCH`,
     `Timestamp::MAX`, `from_epoch_secs` (`None` past `MAX`), `epoch_secs`,
     `Display` as RFC 3339 UTC, and a strict `FromStr` that accepts exactly
@@ -286,12 +338,22 @@ On the wire, for agents and the programs that read agcli output:
 - **`audit()` reports `INTERCEPTED_FLAG_DECLARED`** (error) for a usage
     string that declares `-h`, `--help`, `-V` or `--version`, which the
     framework always answers itself. Raw commands are exempt.
+- **`audit()` reports `USAGE_PATH_MISMATCH`** (error) for a usage string
+    whose command tokens, after the program name, do not name the command it
+    documents: the tree and every gate error advertise `app fetch <id>` for
+    `get`, a template that runs as `UNKNOWN_COMMAND`.
+- **The generated skill says what a raw command prints**: its own output and
+    exit code, with no envelope, when any command is raw.
 - **More standard traits.** `Debug` for `Check` and `StreamWriter`; `Clone`
-    and `Debug` for `CommandRequest`; `Display` for `ExitCode` (the number);
-    `Copy`, `Hash` and `Ord` for `LogLevel` (`Info` < `Warn` < `Error`);
-    `Copy` and `Hash` for `StepStatus`; `Hash` and `Ord` for `AuditSeverity`
+    for `StreamWriter`; `Clone` and `Debug` for `CommandRequest`; `Display`
+    for `ExitCode` (the number); `Eq` for `NextAction`, `ActionParam`,
+    `CommandOutput`, `CommandError`, `SuccessEnvelope`, `ErrorEnvelope`,
+    `Envelope`, `Execution` and `StreamEvent`; `Ord` for `ErrorCode`; `Copy`,
+    `Hash` and `Ord` for `LogLevel` (`Info` < `Warn` < `Error`); `Copy` and
+    `Hash` for `StepStatus`; `Hash` and `Ord` for `AuditSeverity`
     (`Warning` < `Error`); `Hash` for `CheckStatus`, which is now exhaustive
-    like the other wire enums, so a `match` notices a new outcome.
+    like the other wire enums, so a `match` notices a new outcome. Every
+    public type is `Send + Sync`, and a test pins it.
 
 ### Fixed
 
@@ -333,13 +395,41 @@ On the wire, for agents and the programs that read agcli output:
     placeholder became a literal action that kept its optional parts, so
     `wokhei gateway stream [--follow]` passed `[--follow]` as an argument and
     failed with `EXTRA_ARG`. The literal now drops them:
-    `wokhei gateway stream`.
-- **`--select` on an array result warns, as on an object.** A select that
-    matched no field in any row returned rows of `{}` without a warning. It
-    now returns the full result and a `select_warning` naming the keys found
-    across the rows.
+    `wokhei gateway stream`. A variadic placeholder is a param like any
+    other: `t run <cmd...>` created none, so the action was literal and
+    printed `<cmd...>`; it is now a template with the required param
+    `cmd...`.
+- **`--select` never wipes a result, on any shape.** A dot path that reached
+    nothing left an empty container behind (`--select=a.zzz` gave
+    `{"a":{}}`, `--select=items.zzz` on a list gave `{"items":[{},{}]}`),
+    so the result was gone with `ok: true` and no warning; it is a miss like
+    any other, and the full result comes back with a `select_warning`. A
+    select that matched no field in any row of an array returned rows of
+    `{}` without a warning; it warns, naming the keys found across the rows.
+    A partial miss on an array (`--select=id,naem`) was dropped in silence,
+    as a dot-path miss beside a hit was; both warn as an object does. A bare
+    `--select` reached the projection as the parser's `"true"`, so the
+    warning blamed a `--select=true` nobody typed; it now says the flag was
+    given no field names. A result that is not an object or an array of
+    objects was projected to itself in silence; it now carries a warning.
+- **The `--select` advertisement runs as printed.** It appended
+    `--select=<fields>` after a `--`, where the filled template parsed it as
+    a positional and grew on every hop; the flag now sits before the first
+    `--`.
+- **`skill --install` honors `--dry-run` with the agent flags off.** It read
+    the flag only through the reserved set, so under `without_reserved_flags()`
+    it wrote the file. The skill reads it itself, and refuses a value that is
+    not a boolean with `INVALID_FLAG`.
 - **The `help` alias yields to a CLI's own `help` command**, as the
     `version` alias already did. The CLI's `help` command was unreachable.
+- **Wire prose is plain ASCII English.** The `--select` advertisement, the
+    non-finite `INVALID_ARG` and `INVALID_FLAG` fixes, the `EXTRA_ARG` range
+    (`1 to 2`, not `1–2`), the unbalanced-brackets audit message and the
+    generated skill's list items (`` `item`: description ``) carry no dashes
+    or multiplication signs. The list `guidance` no longer names a `--limit`
+    the command may not have; it points at the command's own flags and
+    `--select`. The lone root action of a CLI with no commands reads "Inspect
+    the full command tree", like every other root action.
 - **The pre-commit hooks and `just publish-check` build through `mbx`**, like
     the gate.
 
@@ -358,10 +448,10 @@ On the wire, for agents and the programs that read agcli output:
     `Execution` that was never printed warns. Functions that fail or panic
     document `# Errors` and `# Panics`.
 - `ci.yml` runs the gate on every push to `master` and every pull request:
-    rustfmt, clippy pedantic with and without `--all-features`, nextest,
-    doctests, ast-grep, a check for lint suppressions, and rustdoc with
-    `-D warnings`. A second job checks the MSRV (minimum supported Rust
-    version) named by `rust-version`.
+    rustfmt, cargo-machete, clippy pedantic with and without
+    `--all-features`, nextest, doctests, ast-grep, a check for lint
+    suppressions, and rustdoc with `-D warnings`. A second job checks the MSRV
+    (minimum supported Rust version) named by `rust-version`.
 - `release.yml` runs that gate before it publishes, fails when CHANGELOG.md
     has no `## [X.Y.Z]` heading for the tag, and takes the GitHub Release
     notes from that section. The skip-if-already-published branch and
@@ -370,8 +460,8 @@ On the wire, for agents and the programs that read agcli output:
 - `rust-version = "1.88"`: 1.87 fails to build the crate.
 - Packaging: an `include` list (`src`, `examples`, `tests`, `benches`,
     `Cargo.toml`, `README.md`, `CHANGELOG.md`, `LICENSE`) replaces `exclude`,
-    and docs.rs builds with every feature, so the `deserialize` items are
-    documented.
+    docs.rs builds with every feature, so the `deserialize` items are
+    documented, and the `homepage` that repeated `repository` is gone.
 - `just gate` runs the CI gate through `mbx`. The `release` and `changelog`
     recipes are gone: they bypassed the tag-driven flow and used the BSD-only
     `sed -i ''`. The pre-commit hooks run clippy with `--all-features` and
@@ -381,20 +471,23 @@ On the wire, for agents and the programs that read agcli output:
     `argv_parsing.rs`, `suggestions.rs`, `usage_templates.rs` and
     `golden_envelopes.rs`. Tests that need a process re-execute the test
     binary instead of calling `cargo run`, which takes the raw end-to-end
-    test from about 11 s to 0.04 s. No test sets an environment variable;
-    they pin the clock. New suites: `panic_hook.rs`, `streaming.rs`,
-    `clock.rs`, `ops_example.rs` and `calc_example.rs`, plus a
-    serialize-then-deserialize test for every public wire type. The example
+    test from about 11 s to 0.04 s; every re-executed child writes a
+    sentinel line to stderr, and the parent asserts it once, with the
+    harness's `running 1 test` line, so a child the filter never reached, or
+    a filter that matched a second test, fails loudly. No test sets an
+    environment variable; they pin the clock. New suites: `panic_hook.rs`,
+    `streaming.rs`, `clock.rs`, `ops_example.rs` and `calc_example.rs`, plus
+    a serialize-then-deserialize test for every public wire type. The example
     tests crawl every literal `next_action` an example prints and run it.
 - `examples/calc.rs` builds its CLI in `fn cli()`, which the README's
     calculator copies and `tests/calc_example.rs` drives in-process.
 - Docs: README.md is the user guide and the crate documentation, and every
     Rust block in it is a doctest. Every public item has rustdoc, and
-    `#![warn(missing_docs)]` keeps it that way. AGENTS.md
-    is the one guide to working on the repo, and CLAUDE.md imports it.
-    `design.md`, a copy of an upstream skill, is gone; its agcli-specific
-    content is in the README. `agent_ergonomics_audit/` is gone; nothing read
-    it.
+    `#![warn(missing_docs)]` keeps it that way. No prose in the crate, the
+    tests or the examples carries an em-dash. AGENTS.md is the one guide to
+    working on the repo, and CLAUDE.md imports it. `design.md`, a copy of an
+    upstream skill, is gone; its agcli-specific content is in the README.
+    `agent_ergonomics_audit/` is gone; nothing read it.
 
 ## [0.17.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.17.0) - 2026-08-21
 

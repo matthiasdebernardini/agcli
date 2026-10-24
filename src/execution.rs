@@ -13,7 +13,7 @@ use crate::envelope::Envelope;
 /// [`Execution::finish`] and [`Execution::print`] are how it leaves the
 /// process. A test reads it instead: [`Execution::envelope`],
 /// [`Execution::to_json`] and [`Execution::stream_events`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use = "an Execution carries the exit code; call finish() or print()"]
 pub struct Execution {
     pub(crate) envelope: Envelope,
@@ -21,7 +21,7 @@ pub struct Execution {
 }
 
 /// How an [`Execution`] reaches stdout.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Output {
     /// One JSON envelope on stdout.
     Envelope,

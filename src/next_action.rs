@@ -12,7 +12,7 @@ use serde_json::Value;
 /// With `params` the `command` is a template: the agent fills every
 /// `<placeholder>` before running it. Without `params` it is literal and runs
 /// as printed.
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[non_exhaustive]
 pub struct NextAction {
@@ -54,7 +54,7 @@ impl NextAction {
 ///
 /// Every field is optional and left out of the JSON when unset; the keys
 /// serialize in this order.
-#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[non_exhaustive]
 pub struct ActionParam {

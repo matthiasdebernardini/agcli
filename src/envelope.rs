@@ -33,7 +33,7 @@ pub struct ErrorBody {
 /// The framework builds every envelope; read one from
 /// [`Execution::envelope`](crate::Execution::envelope), or decode one with
 /// the `deserialize` feature.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SuccessEnvelope {
     /// The invocation as one shell line that reruns as printed: the program's
@@ -191,7 +191,7 @@ impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
 /// Built by the framework from a [`CommandError`]; read one from
 /// [`Execution::envelope`](crate::Execution::envelope), or decode one with
 /// the `deserialize` feature.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ErrorEnvelope {
     /// The invocation as one shell line that reruns as printed, as in
@@ -339,7 +339,7 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
 /// Read it from [`Execution::envelope`](crate::Execution::envelope);
 /// [`Envelope::ok`] tells which it is. It serializes as the envelope itself,
 /// and decodes (with the `deserialize` feature) by its `ok` key.
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum Envelope {
     /// `"ok": true`: the command ran and answered.

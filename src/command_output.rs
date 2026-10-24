@@ -42,7 +42,7 @@ fn row_schema(items: &[Value]) -> Vec<String> {
 /// The framework turns it into the success envelope, applying `--select`,
 /// `--compact` and `--quiet` on the way. Build one with
 /// [`CommandOutput::new`], or [`CommandOutput::list`] for a bounded list.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandOutput {
     pub(crate) result: Value,
     pub(crate) next_actions: Vec<NextAction>,

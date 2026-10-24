@@ -56,7 +56,7 @@ pub enum LogLevel {
 /// the run's clock as it writes it, in RFC 3339 UTC, so an event carries no
 /// timestamp of its own. There is no terminal variant. The framework writes
 /// the one terminal line from the handler's return value.
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum StreamEvent {

@@ -29,7 +29,7 @@ use crate::stream::StreamWriteError;
 ///     data: None,
 /// };
 /// ```
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use]
 pub struct CommandError {

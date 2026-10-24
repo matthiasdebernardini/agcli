@@ -297,8 +297,42 @@ assert_eq!(failure.fix, "Pass a valid value for --lines.");
 
 The request also gives `req.positionals()` (the command's own arguments),
 `req.command_path()` (`["db", "migrate"]`), `req.invocation()` (the whole
-parsed line), and typed reads of the agent flags, listed under Agent flags
-below.
+parsed line), `req.now()` (the run's clock), and typed reads of the agent
+flags, listed under Agent flags below.
+
+A handler is `Fn`, so it may run more than once. State it owns reaches the
+future by a clone per call, not by a move out of the closure:
+
+```rust
+use std::sync::{Arc, Mutex};
+
+use agcli::{AgentCli, Command, CommandOutput, Envelope};
+use serde_json::json;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let notes: Arc<Mutex<Vec<String>>> = Arc::default();
+let store = Arc::clone(&notes);
+let cli = AgentCli::new("notes", "Agent-native notes").command(
+    Command::new("add", "Add a note")
+        .usage("notes add <text>")
+        .handler(move |req| {
+            let store = Arc::clone(&store);
+            async move {
+                let text = req.require_arg(0, "text")?.to_string();
+                let mut store = store.lock().expect("not poisoned");
+                store.push(text);
+                Ok(CommandOutput::new(json!({ "count": store.len() })))
+            }
+        }),
+);
+
+let run = cli.run(["notes", "add", "milk"]).await;
+let Envelope::Success(answer) = run.envelope() else { panic!("{}", run.to_json()) };
+assert_eq!(answer.result, json!({ "count": 1 }));
+assert_eq!(*notes.lock().expect("not poisoned"), ["milk"]);
+# }
+```
 
 `CommandOutput::try_from_serializable(value)` builds a result from any
 `Serialize` type, and returns the `serde_json::Error` when the value cannot
@@ -326,10 +360,14 @@ enforces before the handler runs:
   writes from the usage: required for `<name>`, optional inside brackets.
 
 A command without a usage string gets no flag or arity checks, and the tree
-shows a generic template for it. Start every usage string with the program
-name, since agents copy templates as printed. Keep the brackets balanced. Do
-not declare `--help`, `-h`, `--version` or `-V`: the framework answers those
-itself. `audit()` reports each of these mistakes.
+shows a generic template for it. A group without one declares no flags, so a
+flag the framework does not reserve is `UNKNOWN_FLAG` there, as on the root.
+Start every usage string with the program name, since agents copy templates as
+printed, and make its command tokens name the command itself: a usage for `get`
+that reads `app fetch <id>` is a template agents copy into `UNKNOWN_COMMAND`.
+Keep the brackets balanced, and do not declare `--help`, `-h`, `--version` or
+`-V`, which are the framework's own. `audit()` reports each of these mistakes,
+the path mismatch as `USAGE_PATH_MISMATCH`.
 
 ### How argv is parsed
 
@@ -342,7 +380,8 @@ itself. `audit()` reports each of these mistakes.
 - `-x`, `-x=value` and `-x value` are short flags. `-abc` sets three booleans.
   `-abc=5` cannot say which flag the value belongs to, so it is a
   `PARSE_ERROR`.
-- `-3` and `-2.5` are positionals, not flags.
+- `-3`, `-2.5`, and any `-` followed by a digit (`-0x10`, `-1,000`) are
+  positionals, not flags.
 - `--` ends flag parsing: every later token is a positional.
 - A flag given twice, in any spelling (`--n=1 -n 2`, `-vv`), is a
   `PARSE_ERROR` such as `-n given twice`. The parser never picks a winner.
@@ -397,10 +436,11 @@ the command's `default_next_action`s, or else the command's own template and
 the root command. Errors get the same treatment. A list result gets one more
 action, described under Lists.
 
-The framework writes its own actions from usage strings. A usage with a
-placeholder becomes a template with `params`. A usage without one becomes a
-literal, and its optional `[...]` parts are dropped so it runs as printed:
-`ops echo [args...]` is offered as `ops echo`.
+The framework writes its own actions from usage strings: every `<placeholder>`
+becomes a param (required when bare, optional inside brackets, a variadic
+`<args...>` included), and a usage with no placeholder becomes a literal whose
+optional `[...]` parts are dropped so it runs as printed: `ops echo [args...]`
+is offered as `ops echo`.
 
 ### Errors
 
@@ -408,8 +448,10 @@ literal, and its optional `[...]` parts are dropped so it runs as printed:
 so the three cannot trade places. The fix is required: every error tells the
 agent how to recover.
 
-- `ErrorCode::new("NOT_FOUND")` names a code of your own. The framework's codes
-  are constants, such as `ErrorCode::INVALID_ARG`.
+- `ErrorCode::new("NOT_FOUND")` names a code of your own, and
+  `ErrorCode::owned(format!("HTTP_{status}"))` one built at run time. The
+  framework's codes are constants, such as `ErrorCode::INVALID_ARG`. A code is
+  never empty.
 - `.exit_code(ExitCode::NOT_FOUND)` picks the process status. The default is 1.
   `ExitCode::SUCCESS` panics, because an error that exits 0 reads as success.
 - `.retryable(true)` marks a transient failure that the same call may survive.
@@ -516,7 +558,9 @@ its own subtree, and an unknown name under it is `UNKNOWN_SUBCOMMAND` with the
 valid names in `fix`. An unknown command is `UNKNOWN_COMMAND` the same way, with
 "Did you mean `status`?" in front when the token looks like a typo (an edit
 distance of at most 2, and less than the name's length). Registering two
-commands with the same name panics.
+commands with the same name panics, as does a mistake in any other builder
+call: an error with exit code 0, a list whose `total` is below its rows, a
+`skill()` on a name that is not a slug.
 
 The framework answers these itself:
 
@@ -529,15 +573,18 @@ The framework answers these itself:
 - **`--help` or `-h` anywhere, and `help <command...>`**: the named command's
   `name`, `description`, `usage` and `subcommands`.
 - **`--version` or `-V` anywhere, and `version` alone**: `name` and `version`.
-  Help wins when both are asked for.
+  The positionals must name a command or nothing: `app nope --version` is
+  `UNKNOWN_COMMAND` for `nope`, as it is with `--help`, and `app version extra`
+  is `EXTRA_ARG`. Help wins when both are asked for.
 
 The `help` and `version` words yield to commands of those names that the CLI
 defines. The flags never do.
 
 These answers check flags the way the named command would, and they honor
 `--select`, `--compact` and `--quiet`: `app --select=commands` returns only the
-command list. A line that names a raw command goes to that command instead,
-whatever flags it carries.
+command list. A line that names a raw command goes to that command with every
+token after its name; the tokens before the name are the framework's (see
+[Raw commands](#raw-commands)).
 
 ### Agent flags
 
@@ -545,8 +592,8 @@ Every command accepts these flags without declaring them:
 
 | Flag | What happens |
 |------|--------------|
-| `--select=<a,b,c>` | The result is projected to these top-level keys or `a.b` dot paths, mapped over arrays. |
-| `--compact` | `null` values and empty containers are dropped from the result, or only the command's `CommandOutput::compact_fields` are kept. |
+| `--select=<a,b,c>` | The result is projected to these top-level keys or `a.b` dot paths, mapped over arrays. A miss is reported in `select_warning`, below. |
+| `--compact` | `null` values and empty containers are dropped from the result, or only the command's `CommandOutput::compact_fields` are kept. Beside `--select` it only drops nulls and empty containers from the selection. |
 | `--quiet` | A successful answer has no `next_actions`. Errors keep theirs: they are how the agent recovers. |
 | `--dry-run` | Refused with `DRY_RUN_UNSUPPORTED` unless the command declares `handles_dry_run()`. The handler reads `req.dry_run()`. |
 | `--yes`, `--no-input` | Read by the handler with `req.assume_yes()`. |
@@ -609,12 +656,14 @@ assert_eq!(refused.error.code, ErrorCode::DRY_RUN_UNSUPPORTED);
 # }
 ```
 
-- **`--select` never wipes a result.** A `--select` with no field names, or
-  one that matches nothing, returns the full result plus a `select_warning`.
-  For a miss, the warning lists the fields that exist: the keys of an object,
-  or every key found across the rows of an array. On an object, a partial miss
-  keeps the projection and names the misses. The warning is a key of the
-  envelope, beside `result`, so it never collides with the handler's data:
+- **`--select` never wipes a result.** A `--select` with no field names, one
+  that matches nothing, or one on a result that is not an object or an array
+  of objects, returns the full result plus a `select_warning`. For a miss, the
+  warning lists the fields that exist: the keys of an object, or every key
+  found across the rows of an array. A partial miss keeps the projection and
+  names the dropped fields, and a dot path that reaches nothing (`a.zzz`,
+  `items.zzz`) is a miss like any other. The warning is a key of the envelope,
+  beside `result`, so it never collides with the handler's data:
 
   ```json
   {
@@ -707,7 +756,7 @@ assert_eq!(
     { "command": "notes", "description": "Inspect the full command tree" },
     {
       "command": "notes ls --select=<fields>",
-      "description": "Re-run projected to only the fields you need — smaller result, same data",
+      "description": "Re-run projected to only the fields you need: a smaller result, the same data",
       "params": {
         "fields": {
           "description": "Comma-separated subset of: items.done, items.id, items.title (dot paths project each row)",
@@ -721,17 +770,17 @@ assert_eq!(
 
 `CommandOutput::list(items)` and `CommandOutput::list_truncated(items, total)`
 return `items`, `count`, `total` and `truncated`. When `total` is more than the
-rows returned, a `guidance` string says how to narrow the query.
+rows returned, a `guidance` string says how to narrow the query; a `total`
+below the rows returned is a mistake, and `list_truncated` panics on it.
 
 For object rows, `fields` lists the `--select` paths that cover a row: one
-sorted `items.<key>` for each key found across the rows. The framework then
-appends a `next_action` that reruns this exact invocation under `--select`. The
-paths are dot paths because `--select` projects top-level keys, and a bare `id`
-would miss the rows nested under `items`. Pasted back as they are, they project
-every row, and `count`, `total`, `truncated` and `fields` drop out with
-everything else nobody asked for. The advertisement is left out when `--select`
-is already on the line, under `--quiet`, and when the agent flags are off.
-`fields` stays either way.
+sorted `items.<key>` for each key found across the rows that `--select` can
+spell (a key holding `.` or `,` cannot be named, so it is left out). The paths
+are dot paths because `--select` projects top-level keys, and a bare `id`
+would miss the rows nested under `items`. The framework then appends a
+`next_action` that reruns this exact invocation under `--select`, with the flag
+before any `--`; it is left out when `--select` is already on the line, under
+`--quiet`, and when the agent flags are off.
 
 ### Long output
 
@@ -808,9 +857,10 @@ assert!(run.to_json().starts_with(r#"{"type":"result","ok":true,"command":"ops d
 
 `Command::stream_handler` hands the handler a `StreamWriter`. Each
 `out.emit(&event)` writes one NDJSON line, stamped with `ts` from the run's
-clock, and flushes it. The
-handler returns the same `Result` a normal handler does. From it the framework
-writes exactly one terminal line: the envelope, with `"type":"result"` or
+clock, and flushes it. The writer is `Clone`, so a task the handler spawns can
+emit through a clone: lines are written whole, one at a time. The handler
+returns the same `Result` a normal handler does. From it the framework writes
+exactly one terminal line: the envelope, with `"type":"result"` or
 `"type":"error"` in front. `--select`, `--quiet` and `next_actions` apply to that
 line as to any envelope.
 
@@ -843,14 +893,17 @@ JSON, so `jq --unbuffered 'select(.type == "step")'` filters a live stream.
 - A write that fails, because the reader went away, is a `StreamWriteError`.
   `?` turns it into a `STREAM_WRITE_FAILED` error. After a failed write the
   writer refuses every later one, so nothing lands after a partial line. It also
-  closes when the handler returns, so nothing can follow the terminal line.
+  closes when the handler returns, so nothing can follow the terminal line, not
+  even through a clone a spawned task kept.
 - Under `run_env` the events reach stdout as they are written. Under `run` they
   are captured: `Execution::stream_events()` returns them and `to_json()`
   returns the terminal line.
 - A usage error on a streaming command, such as an unknown flag, a surplus
   argument, an unsupported `--dry-run` or a non-boolean value, is also a
-  terminal `"type":"error"` line. Once the command is known, a consumer never
-  meets a line without `type`.
+  terminal `"type":"error"` line, so once the command runs, every line carries
+  `type`. The help and version answers for a streaming command
+  (`ops deploy --help`) are plain envelopes, like the framework's other
+  answers.
 - Streaming commands are marked `"stream": true` in the tree and in help, and
   the generated skill says they stream.
 
@@ -909,7 +962,10 @@ The command still appears in the tree (marked `"raw": true`), in help, and in
 - The handover holds wherever the name sits. `app grep -h pat`,
   `app --json grep -h pat`, and even `app --json grep --=x` (a line the parser
   rejects) all reach the handler. `--help`, `-h`, `--version` and `-V` after the
-  name belong to the command. Ask the framework with `app help grep`.
+  name belong to the command. Before the name, the tokens are the framework's:
+  `app --help grep` answers help for `grep` (as `app help grep` does),
+  `app -V grep` the version, `app --quiet=maybe grep pat` is `INVALID_FLAG`,
+  and `app --=x grep pat` is `PARSE_ERROR`.
 - One shape cannot work. A flag before the name that the framework does not
   know as a boolean takes the next token as its value, so
   `app --profile grep pat` reads `grep` as the value of `--profile` and names no
@@ -1001,11 +1057,14 @@ calc skill                            # the markdown, in result.markdown
 calc skill --install=.claude/skills   # writes .claude/skills/calc/SKILL.md
 ```
 
+Without `--install` the result holds `markdown` and `skill_name`.
 `--install=<dir>` writes `<dir>/<name>/SKILL.md` and answers with the absolute
-`path` and its `bytes`. Under `--dry-run` it writes nothing and reports the
-path. A shell does not expand `~` after `=`, so `--install=~/skills` is refused
-with `INVALID_FLAG`, and a failed write is `WRITE_FAILED`.
-`cli.skill_markdown()` returns the same document, for a test to pin:
+`path`, its `bytes` and `skill_name`; under `--dry-run` it writes nothing,
+reports the path and adds `"dry_run": true`. `skill` reads `--dry-run` itself,
+so the preview works with the agent flags off too. A shell does not expand `~`
+after `=`, so `--install=~/skills` is refused with `INVALID_FLAG`, and a failed
+write is `WRITE_FAILED`. `cli.skill_markdown()` returns the same document, for
+a test to pin:
 
 ```rust
 use agcli::AgentCli;
@@ -1036,9 +1095,11 @@ anything runs: falling back to the wall clock would defeat the pin. A system
 clock set before 1970 reads as 1970-01-01T00:00:00Z.
 
 `AgentCli::clock(|| seconds)` replaces the default clock. A test pins it to get
-byte-stable output. A clock that reads past `Timestamp::MAX`
-(9999-12-31T23:59:59Z) panics: no RFC 3339 timestamp can name that second, and
-writing a wrong one would be a silent fallback.
+byte-stable output, and a handler that stamps its own fields reads the same
+clock with `req.now()`, so a `created_at` is pinned with the rest. A clock that
+reads past `Timestamp::MAX` (9999-12-31T23:59:59Z) panics: no RFC 3339
+timestamp can name that second, and writing a wrong one would be a silent
+fallback.
 
 ### Panics
 
@@ -1148,10 +1209,10 @@ and it parses back from exactly the shape it prints.
 
 ### `next_actions`
 
-Each action has `command`, `description` and, for a template, `params`. Each
-param holds any of `description`, `value`, `default`, `enum` and `required`, in
-that order. With `params`, `command` is a template: fill every placeholder
-before running it. Without `params`, run `command` as printed.
+Each action has `command`, `description` and, for a template, `params`, whose
+entries hold any of `description`, `value`, `default`, `enum` and `required`,
+in that order. How to read a template is under
+[`next_actions`](#next_actions) above.
 
 ### NDJSON streams
 
@@ -1171,9 +1232,8 @@ line.
 
 ### Raw commands
 
-A raw command prints whatever its handler prints, and the handler's exit code
-is the process status. No envelope reaches stdout. If the handler panics, the
-`HANDLER_PANIC` envelope goes to stderr and the command's stdout is incomplete.
+A raw command prints whatever its handler prints and exits with the handler's
+code; nothing else reaches its stdout (see [Raw commands](#raw-commands)).
 
 ### Exit codes
 
@@ -1223,8 +1283,10 @@ With the `deserialize` feature, the wire types implement `Deserialize`:
 `NextAction`, `ActionParam`, `Timestamp`, `ExitCode`, `ErrorCode`,
 `TruncatedEntries` and `AuditReport`, among others. Decoding is strict about
 what it knows: a missing or malformed known key is an error, and so is a
-timestamp that names no real date. A key it does not know is ignored, so a
-reader keeps working on output from a later agcli that only added a field.
+timestamp that names no real date, a `null` where the framework would leave the
+key out, an empty `error.code`, an error envelope with `exit_code` 0, or a
+`TruncatedEntries` whose counts disagree. A key it does not know is ignored, so
+a reader keeps working on output from a later agcli that only added a field.
 
 ```rust
 # #[cfg(feature = "deserialize")]

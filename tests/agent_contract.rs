@@ -195,6 +195,45 @@ async fn a_skipped_doctor_check_is_neither_pass_nor_fail() {
     assert!(checks[1].get("fix").is_none(), "{checks:?}");
 }
 
+#[test]
+fn every_public_type_is_send_and_sync() {
+    // A CLI is built once and driven from any thread or executor, and a
+    // request, a writer and an execution cross worker threads, so every
+    // public type is `Send + Sync`. Pinned here so a refactor cannot regress
+    // it in silence.
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<agcli::AgentCli>();
+    assert_send_sync::<agcli::Command>();
+    assert_send_sync::<agcli::CommandRequest>();
+    assert_send_sync::<agcli::CommandOutput>();
+    assert_send_sync::<agcli::CommandError>();
+    assert_send_sync::<agcli::Execution>();
+    assert_send_sync::<agcli::Envelope>();
+    assert_send_sync::<agcli::SuccessEnvelope>();
+    assert_send_sync::<agcli::ErrorEnvelope>();
+    assert_send_sync::<agcli::ErrorBody>();
+    assert_send_sync::<agcli::NextAction>();
+    assert_send_sync::<agcli::ActionParam>();
+    assert_send_sync::<agcli::Invocation>();
+    assert_send_sync::<agcli::ParseInvocationError>();
+    assert_send_sync::<agcli::StreamWriter>();
+    assert_send_sync::<agcli::StreamEvent>();
+    assert_send_sync::<agcli::StreamWriteError>();
+    assert_send_sync::<agcli::StepStatus>();
+    assert_send_sync::<agcli::LogLevel>();
+    assert_send_sync::<agcli::Timestamp>();
+    assert_send_sync::<agcli::ParseTimestampError>();
+    assert_send_sync::<agcli::ExitCode>();
+    assert_send_sync::<agcli::ErrorCode>();
+    assert_send_sync::<agcli::TruncatedEntries>();
+    assert_send_sync::<agcli::Check>();
+    assert_send_sync::<agcli::CheckResult>();
+    assert_send_sync::<agcli::CheckStatus>();
+    assert_send_sync::<agcli::AuditReport>();
+    assert_send_sync::<agcli::AuditFinding>();
+    assert_send_sync::<agcli::AuditSeverity>();
+}
+
 #[tokio::test]
 async fn quiet_reaches_the_handler_and_still_yields_a_valid_envelope() {
     let execution = cli().run(["app", "brain", "--quiet"]).await;
