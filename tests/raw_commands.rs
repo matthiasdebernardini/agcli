@@ -366,6 +366,42 @@ async fn a_reserved_flag_before_the_name_is_refused_as_undeliverable() {
 }
 
 #[tokio::test]
+async fn the_commands_own_flag_before_the_name_says_where_it_goes() {
+    // `--count` is grep's own flag, not an unknown one: it used to be
+    // UNKNOWN_FLAG with "`app` takes no flags of its own".
+    let seen = Seen::default();
+    let cli = AgentCli::new("app", "Test CLI").command(
+        Command::new("grep", "Search the index")
+            .usage("app grep [--count] <pattern> [path...]")
+            .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+    );
+    let fixture = Fixture { cli, seen };
+    let (execution, seen) = run(&fixture, &["app", "--count", "grep", "pat"]).await;
+
+    assert!(!execution.is_raw());
+    assert!(seen.is_empty(), "the handler ran");
+    assert_eq!(execution.exit_code(), ExitCode::USAGE);
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(json["error"]["code"], json!("INVALID_FLAG"), "{json}");
+    assert_eq!(
+        json["error"]["message"],
+        json!(
+            "flag --count does not reach raw command `grep`: it receives only the tokens after \
+             its name"
+        )
+    );
+    assert_eq!(
+        json["fix"],
+        json!("Drop it, or pass it after `grep` if that command takes it.")
+    );
+
+    // A flag the usage does not declare is still unknown.
+    let (execution, _) = run(&fixture, &["app", "--bogus=1", "grep", "pat"]).await;
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(json["error"]["code"], json!("UNKNOWN_FLAG"), "{json}");
+}
+
+#[tokio::test]
 async fn a_nested_raw_command_is_named_by_its_path() {
     let seen = Seen::default();
     let cli = AgentCli::new("app", "Test CLI").command(

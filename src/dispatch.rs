@@ -232,9 +232,10 @@ impl AgentCli {
     /// framework has answered for its own tokens: `prefix`, the parsed line up
     /// to the command's name, when the name was not the leading token. A help
     /// or version flag there is answered, a value that is not a boolean is
-    /// refused, a flag the framework does not reserve is unknown, as on the
-    /// root line, and a reserved flag that cannot reach the handler is
-    /// refused. The command's own tokens, after its name, are never read.
+    /// refused, a flag the command's usage declares is refused as one that
+    /// cannot reach it, any other flag the framework does not reserve is
+    /// unknown, as on the root line, and a reserved flag that cannot reach
+    /// the handler is refused. The command's own tokens, after its name, are never read.
     async fn raw_execution(
         &self,
         handler: &RawCommandHandler,
@@ -251,6 +252,9 @@ impl AgentCli {
                 return self.invalid_bool_execution(prefix, &**clock, name, value);
             }
             if let Some(execution) = self.framework_route(prefix, &**clock) {
+                return execution;
+            }
+            if let Some(execution) = self.declared_prefix_flag(prefix, &**clock) {
                 return execution;
             }
             if let Some(execution) = self.framework_flag_error(prefix, &**clock) {
@@ -294,17 +298,36 @@ impl AgentCli {
                 .filter(|&flag| reserved_flags::is_reserved(flag) && flag != "json")
                 .collect();
             reserved.sort_unstable();
-            let flag = usage::flag_display(reserved.first()?);
-            CommandError::new(
-                ErrorCode::INVALID_FLAG,
-                format!(
-                    "flag {flag} does not reach raw command `{name}`: it receives only the \
-                     tokens after its name"
-                ),
-                format!("Drop it, or pass it after `{name}` if that command takes it."),
-            )
-            .exit_code(ExitCode::USAGE)
+            not_delivered_error(&name, reserved.first()?)
         };
+        Some(self.error_execution(
+            prefix.command_line().to_string(),
+            clock,
+            error.next_actions(self.default_command_actions(&path, resolved.command)),
+        ))
+    }
+
+    /// The refusal of a flag before a raw command's name that the command's
+    /// own usage declares: it is not unknown, it is the command's, but it
+    /// cannot reach the command from there. Reserved flags are left to
+    /// [`Self::undeliverable_prefix_flag`], and nothing is refused when the
+    /// reserved flags are off, as no other flag there is.
+    fn declared_prefix_flag(&self, prefix: &Invocation, clock: &ClockFn) -> Option<Execution> {
+        if !self.reserved_flags {
+            return None;
+        }
+        let resolved = self.resolve_command(prefix.positionals())?;
+        let mut declared = HashSet::new();
+        usage::extract_all_flag_names(resolved.command.usage.as_deref()?, &mut declared);
+        let mut own: Vec<&str> = prefix
+            .flags()
+            .keys()
+            .map(String::as_str)
+            .filter(|&flag| declared.contains(flag) && !reserved_flags::is_reserved(flag))
+            .collect();
+        own.sort_unstable();
+        let path = path_refs(resolved.path);
+        let error = not_delivered_error(&path.join(" "), own.first()?);
         Some(self.error_execution(
             prefix.command_line().to_string(),
             clock,
@@ -787,10 +810,11 @@ impl AgentCli {
                     _ => {
                         let compacted = project::compact(&result);
                         // A selection --compact empties is kept as selected,
-                        // with a word, the way a --select miss is.
+                        // with a word, the way a --select miss is. Emptied
+                        // counts at any depth: a list's rows survive as `{}`.
                         if selected.is_some()
-                            && project::is_droppable(&compacted)
-                            && !project::is_droppable(&result)
+                            && project::is_hollow(&compacted)
+                            && compacted != result
                         {
                             let warning = "--compact removed every selected field because they \
                                            were null or empty. Returning the selection \
@@ -1030,6 +1054,21 @@ enum ParsedArgv<'cli> {
     /// argv failed to parse and names no raw command, or the framework's own
     /// tokens before a raw command's name failed to parse.
     Failed(ParseInvocationError),
+}
+
+/// The `INVALID_FLAG` refusal of `flag`, found before the name of the raw
+/// command `name`, which receives only the tokens after its name.
+fn not_delivered_error(name: &str, flag: &str) -> CommandError {
+    let flag = usage::flag_display(flag);
+    CommandError::new(
+        ErrorCode::INVALID_FLAG,
+        format!(
+            "flag {flag} does not reach raw command `{name}`: it receives only the tokens \
+             after its name"
+        ),
+        format!("Drop it, or pass it after `{name}` if that command takes it."),
+    )
+    .exit_code(ExitCode::USAGE)
 }
 
 /// Positionals walked down the command tree: the deepest command they name.

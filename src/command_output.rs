@@ -435,6 +435,33 @@ mod tests {
             warning.ends_with("Returning the selection uncompacted."),
             "{warning}"
         );
+
+        // A nested selection --compact empties row by row is kept too: the
+        // rows survive as `{}`, so the top level alone is not empty.
+        let cli = AgentCli::new("app", "x").command(Command::new("get", "get").handler(
+            |_req| async move {
+                Ok(CommandOutput::new(json!({
+                    "items": [{ "id": 1, "note": null }, { "id": 2, "note": null }]
+                })))
+            },
+        ));
+        let run = cli
+            .run(["app", "get", "--select=items.note", "--compact"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(
+            envelope.result,
+            json!({ "items": [{ "note": null }, { "note": null }] })
+        );
+        assert_eq!(
+            envelope.select_warning.as_deref(),
+            Some(
+                "--compact removed every selected field because they were null or empty. \
+                 Returning the selection uncompacted."
+            )
+        );
     }
 
     #[tokio::test]

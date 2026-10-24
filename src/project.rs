@@ -130,6 +130,17 @@ pub(crate) fn is_droppable(value: &Value) -> bool {
     }
 }
 
+/// True for values with nothing but droppable leaves: a droppable value, or
+/// an object or array whose every member is hollow. `--compact` keeps the
+/// rows of an array, so a selection it empties can still be `[{}, {}]`.
+pub(crate) fn is_hollow(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.values().all(is_hollow),
+        Value::Array(items) => items.iter().all(is_hollow),
+        other => is_droppable(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
