@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.18.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.18.0) - 2026-10-24
 
 This release redesigns the Rust API. Handlers are plain async closures, agcli
 no longer depends on tokio, the framework writes a streaming command's terminal
