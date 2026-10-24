@@ -16,14 +16,22 @@ pub(crate) fn parse_select_fields(raw: &str) -> impl Iterator<Item = &str> {
     raw.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// True when `key` can be named in a `--select` value: `--select` splits
+/// its value on `,`, trims each field and reads `.` as a path step, so a key
+/// holding any of those is one no `--select` can reach.
+pub(crate) fn is_selectable_key(key: &str) -> bool {
+    !key.contains([',', '.']) && key.trim() == key && !key.is_empty()
+}
+
 /// The pre-filled `--select` template offered for a list result: the same
 /// invocation re-run projected to a subset of `fields`.
 pub(crate) fn advertisement_action(invocation: &Invocation, fields: &[String]) -> NextAction {
-    // `command_line()` is shell-quoted, so the template re-runs exactly this
-    // invocation even when an argument contains a space.
+    // The tokens are shell-quoted, so the template re-runs exactly this
+    // invocation even when an argument contains a space, and the flag sits
+    // before any `--`, so the re-run reads it as a flag.
     NextAction::new(
-        format!("{} --select=<fields>", invocation.command_line()),
-        "Re-run projected to only the fields you need — smaller result, same data",
+        invocation.command_line_with_flag("--select=<fields>"),
+        "Re-run projected to only the fields you need: a smaller result, the same data",
     )
     .with_param(
         "fields",
@@ -34,15 +42,16 @@ pub(crate) fn advertisement_action(invocation: &Invocation, fields: &[String]) -
     )
 }
 
-/// Apply a reserved `--select` value to a handler result, guarding against the
-/// silent-erasure footgun. A bare `--select` (parsed as the sentinel `"true"`),
-/// an empty value, or a typo'd/array-only field name all project a non-empty
-/// object down to `{}`. Rather than discard the handler's real output and
-/// report a misleading `ok: true` with `result: {}`, this keeps the original
-/// result and returns a warning naming the available fields, so the agent
-/// keeps its data and learns how to correct the select. (An error envelope is
-/// deliberately avoided: the handler already ran — possibly with side effects
-/// — so signalling failure could trigger an unwanted retry.)
+/// Apply a `--select` value to a result, without ever wiping it.
+///
+/// `raw` is the flag's value, or the empty string when it was given bare.
+/// Three things can go wrong, and each keeps the agent's data and tells it
+/// how to correct the select instead of answering `ok: true` with an empty
+/// `result`: the value names no field, no field matches anything, or the
+/// result has nothing a `--select` can project. A field that matches nothing
+/// beside fields that do is dropped from the projection and named. An error
+/// envelope is deliberately avoided: the handler already ran, possibly with
+/// side effects, so signalling failure could trigger an unwanted retry.
 ///
 /// The warning is the envelope's own `select_warning` field, never a key
 /// inside `result`: the result belongs to the handler, which may well have a
@@ -59,69 +68,85 @@ pub(crate) fn apply_select_flag(result: Value, raw: &str) -> (Value, Option<Stri
             ),
         );
     }
-    let projected = project::select(&result, &fields);
-    if let Some((kind, available)) = collapsed(&result, &projected) {
+    let Some((kind, available)) = selectable_fields(&result) else {
         return (
             result,
             Some(format!(
-                "--select={} matched no fields. Available {kind} fields: {}. \
-                 Returning the full result; re-run --select with a valid field name.",
-                fields.join(","),
-                available.join(", ")
+                "--select={} cannot project this result: it is not an object or an array \
+                 of objects. Returning the full result.",
+                fields.join(",")
+            )),
+        );
+    };
+    let available = describe_available(kind, &available);
+    let missed: Vec<&str> = fields
+        .iter()
+        .copied()
+        .filter(|field| !matches_anything(&result, field))
+        .collect();
+    if missed.len() == fields.len() {
+        return (
+            result,
+            Some(format!(
+                "--select={} matched no fields. {available} Returning the full result; \
+                 re-run --select with a valid field name.",
+                fields.join(",")
             )),
         );
     }
-    // Partial miss: some fields matched, others didn't. Without this, a typo'd
-    // field in a multi-field select is silently dropped and the agent never
-    // learns the spelling. Keep the (useful) projection, but name the misses.
-    if let Value::Object(map) = &result {
-        let missed: Vec<&&str> = fields
-            .iter()
-            .filter(|field| {
-                matches!(project::select(&result, slice::from_ref(*field)),
-                         Value::Object(m) if m.is_empty())
-            })
-            .collect();
-        if !missed.is_empty() {
-            let available = map.keys().cloned().collect::<Vec<_>>().join(", ");
-            let missed_list = missed
-                .iter()
-                .map(|s| (**s).to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return (
-                projected,
-                Some(format!(
-                    "--select field(s) matched nothing and were dropped: {missed_list}. \
-                     Available top-level fields: {available}."
-                )),
-            );
-        }
+    let projected = project::select(&result, &fields);
+    if missed.is_empty() {
+        return (projected, None);
     }
-    (projected, None)
+    // A partial miss: without this, a typo'd field in a multi-field select
+    // is silently dropped and the agent never learns the spelling.
+    (
+        projected,
+        Some(format!(
+            "--select field(s) matched nothing and were dropped: {}. {available}",
+            missed.join(", ")
+        )),
+    )
 }
 
-/// When `projected` wiped a non-empty `result` — an object down to `{}`, or
-/// an array whose object rows all project to `{}` — the kind of field and the
-/// sorted fields the select could have named: an object's keys, or the union
-/// of the rows' keys.
-fn collapsed(result: &Value, projected: &Value) -> Option<(&'static str, Vec<String>)> {
-    match (result, projected) {
-        (Value::Object(map), Value::Object(out)) if !map.is_empty() && out.is_empty() => {
-            Some(("top-level", map.keys().cloned().collect()))
-        }
-        (Value::Array(rows), Value::Array(out)) => {
-            let keys: BTreeSet<&String> = rows
-                .iter()
-                .filter_map(Value::as_object)
-                .flat_map(Map::keys)
-                .collect();
-            let matched = out
-                .iter()
-                .any(|row| row.as_object().is_some_and(|row| !row.is_empty()));
-            (!keys.is_empty() && !matched).then(|| ("row", keys.into_iter().cloned().collect()))
+/// What a `--select` on `result` can name: the kind of field (`top-level`
+/// for an object, `row` for an array) and the sorted fields, an object's keys
+/// or the union of the rows' keys. `None` when the result is neither an object
+/// nor an array with an object row, so no select can project it.
+fn selectable_fields(result: &Value) -> Option<(&'static str, Vec<String>)> {
+    match result {
+        Value::Object(map) => Some(("top-level", map.keys().cloned().collect())),
+        Value::Array(rows) => {
+            let objects: Vec<&Map<String, Value>> =
+                rows.iter().filter_map(Value::as_object).collect();
+            if objects.is_empty() {
+                return None;
+            }
+            let keys: BTreeSet<&String> = objects.iter().flat_map(|row| row.keys()).collect();
+            Some(("row", keys.into_iter().cloned().collect()))
         }
         _ => None,
+    }
+}
+
+/// The sentence of a warning that lists the fields a select could have named.
+fn describe_available(kind: &str, available: &[String]) -> String {
+    if available.is_empty() {
+        format!("The result has no {kind} fields.")
+    } else {
+        format!("Available {kind} fields: {}.", available.join(", "))
+    }
+}
+
+/// True when `field`, selected on its own, keeps anything of `result`: a
+/// non-empty object, or an array with a non-empty object row.
+fn matches_anything(result: &Value, field: &str) -> bool {
+    match project::select(result, slice::from_ref(&field)) {
+        Value::Object(projected) => !projected.is_empty(),
+        Value::Array(rows) => rows
+            .iter()
+            .any(|row| row.as_object().is_some_and(|row| !row.is_empty())),
+        _ => false,
     }
 }
 
@@ -160,30 +185,56 @@ mod tests {
         let Envelope::Success(envelope) = run.envelope() else {
             panic!("expected success envelope");
         };
-        assert_eq!(envelope.result["id"], json!(1));
-        let warning = envelope
-            .select_warning
-            .as_deref()
-            .expect("select_warning present");
-        assert!(
-            warning.contains("nonexistnt"),
-            "warning names the miss: {warning}"
+        assert_eq!(envelope.result, json!({ "id": 1 }));
+        assert_eq!(
+            envelope.select_warning.as_deref(),
+            Some(
+                "--select field(s) matched nothing and were dropped: nonexistnt. Available \
+                 top-level fields: body, id, name, note, tags."
+            )
         );
     }
 
     // --- --select projection cluster: never silently wipe a result ---
 
     #[tokio::test]
-    async fn bare_select_keeps_result_and_warns() {
-        // `get 1 --select` (bare, flushed to the "true" sentinel) must not wipe
-        // the result to {}; it returns the full result plus a select_warning.
+    async fn bare_select_keeps_result_and_warns_that_no_field_was_named() {
+        // `get 1 --select`: the parser reads a bare flag as `"true"`, but the
+        // caller typed no field, so the warning must not blame a `--select=true`
+        // nobody wrote.
         let cli = rich_cli();
-        let run = cli.run(["app", "get", "1", "--select"]).await;
+        for argv in [
+            &["app", "get", "1", "--select"][..],
+            &["app", "get", "1", "--select", "--quiet"],
+            &["app", "get", "1", "--select="],
+        ] {
+            let run = cli.run(argv.iter().copied()).await;
+            let Envelope::Success(envelope) = run.envelope() else {
+                panic!("expected success envelope");
+            };
+            assert_eq!(envelope.result["id"], json!(1), "{argv:?}");
+            assert_eq!(
+                envelope.select_warning.as_deref(),
+                Some(
+                    "--select was given no field names. Returning the full result. Re-run \
+                     with --select=<field>[,<field>...]."
+                ),
+                "{argv:?}"
+            );
+        }
+        // A field literally spelled `true` is a field, and it is missing.
+        let run = cli.run(["app", "get", "1", "--select=true"]).await;
         let Envelope::Success(envelope) = run.envelope() else {
             panic!("expected success envelope");
         };
-        assert_eq!(envelope.result["id"], json!(1));
-        assert!(envelope.select_warning.is_some());
+        assert!(
+            envelope
+                .select_warning
+                .as_deref()
+                .is_some_and(|warning| warning.starts_with("--select=true matched no fields.")),
+            "{:?}",
+            envelope.select_warning
+        );
     }
 
     #[tokio::test]
@@ -223,6 +274,129 @@ mod tests {
         let (result, warning) = apply_select_flag(rows, "tag");
         assert_eq!(result, json!([{ "tag": "a" }, {}]));
         assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn select_partial_miss_on_an_array_warns_like_an_object() {
+        // `naem` matches no row: the projection keeps `id`, and the warning
+        // names the miss. It used to be dropped without a word.
+        let rows = json!([{ "id": 1, "name": "a" }, { "id": 2, "name": "b" }]);
+        let (result, warning) = apply_select_flag(rows, "id,naem");
+        assert_eq!(result, json!([{ "id": 1 }, { "id": 2 }]));
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "--select field(s) matched nothing and were dropped: naem. Available row \
+                 fields: id, name."
+            )
+        );
+    }
+
+    #[test]
+    fn a_dot_path_that_matches_nothing_warns_like_a_top_level_miss() {
+        // `a.zzz` used to project to `{ a: {} }`, an empty container that
+        // passed for a hit: `ok: true`, no warning, and the data gone.
+        let result = json!({ "a": { "b": 1 }, "d": 3 });
+        let (kept, warning) = apply_select_flag(result.clone(), "a.zzz");
+        assert_eq!(kept, result);
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "--select=a.zzz matched no fields. Available top-level fields: a, d. \
+                 Returning the full result; re-run --select with a valid field name."
+            )
+        );
+        let (kept, warning) = apply_select_flag(result, "a.zzz,d");
+        assert_eq!(kept, json!({ "d": 3 }));
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "--select field(s) matched nothing and were dropped: a.zzz. Available \
+                 top-level fields: a, d."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dot_path_no_row_of_a_list_has_warns() {
+        // The advertised `items.<key>` shape, with a key no row has.
+        let cli =
+            AgentCli::new("app", "x").command(Command::new("ls", "ls").usage("app ls").handler(
+                |_req| async move {
+                    Ok(CommandOutput::list(vec![
+                        json!({ "id": 1, "name": "a" }),
+                        json!({ "id": 2, "name": "b" }),
+                    ]))
+                },
+            ));
+        let run = cli.run(["app", "ls", "--select=items.zzz"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(
+            envelope.result["count"],
+            json!(2),
+            "the full result is kept"
+        );
+        assert!(
+            envelope
+                .select_warning
+                .as_deref()
+                .is_some_and(|warning| warning.starts_with("--select=items.zzz matched no fields.")),
+            "{:?}",
+            envelope.select_warning
+        );
+
+        let run = cli.run(["app", "ls", "--select=items.id,items.zzz"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(
+            envelope.result,
+            json!({ "items": [{ "id": 1 }, { "id": 2 }] })
+        );
+        assert_eq!(
+            envelope.select_warning.as_deref(),
+            Some(
+                "--select field(s) matched nothing and were dropped: items.zzz. Available \
+                 top-level fields: count, fields, items, total, truncated."
+            )
+        );
+    }
+
+    #[test]
+    fn a_result_nothing_can_project_is_kept_with_a_warning() {
+        for result in [json!(42), json!("text"), json!([1, 2, 3]), json!(null)] {
+            let (kept, warning) = apply_select_flag(result.clone(), "id");
+            assert_eq!(kept, result);
+            assert_eq!(
+                warning.as_deref(),
+                Some(
+                    "--select=id cannot project this result: it is not an object or an array \
+                     of objects. Returning the full result."
+                ),
+                "{result}"
+            );
+        }
+        let (kept, warning) = apply_select_flag(json!({}), "id");
+        assert_eq!(kept, json!({}));
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "--select=id matched no fields. The result has no top-level fields. Returning \
+                 the full result; re-run --select with a valid field name."
+            )
+        );
+    }
+
+    #[test]
+    fn selectable_keys_are_the_ones_a_select_value_can_spell() {
+        for key in ["id", "user_name", "a-b", "with space", "ünï"] {
+            assert!(is_selectable_key(key), "{key:?}");
+        }
+        for key in ["a.b", "a,b", " a", "a ", ""] {
+            assert!(!is_selectable_key(key), "{key:?}");
+        }
     }
 
     #[tokio::test]
@@ -267,5 +441,42 @@ mod tests {
         );
         let wire: Value = serde_json::from_str(&run.to_json()).expect("JSON");
         assert!(wire["select_warning"].is_string(), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn the_advertisement_puts_the_flag_before_the_separator() {
+        // Appended after `--`, the filled template would parse the flag as a
+        // positional, and the advertisement would grow on every hop.
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("ls", "ls")
+                .usage("app ls [args...]")
+                .handler(|_req| async move { Ok(CommandOutput::list(vec![json!({ "id": 1 })])) }),
+        );
+        let run = cli.run(["app", "ls", "--", "-x"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        let advertised = envelope
+            .next_actions
+            .iter()
+            .find(|action| action.command.contains("--select=<fields>"))
+            .expect("the advertisement");
+        assert_eq!(advertised.command, "app ls --select=<fields> -- -x");
+
+        // Filled in, it projects, and advertises nothing further.
+        let run = cli
+            .run(["app", "ls", "--select=items.id", "--", "-x"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result, json!({ "items": [{ "id": 1 }] }));
+        assert!(envelope.select_warning.is_none());
+        assert!(
+            envelope
+                .next_actions
+                .iter()
+                .all(|action| !action.command.contains("--select=<fields>"))
+        );
     }
 }

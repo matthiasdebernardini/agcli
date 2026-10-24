@@ -11,10 +11,11 @@ use serde_json::{Map, Value};
 /// Project `value` to only the named fields.
 ///
 /// - **Object**: keep only `fields`. Each field may be a dot path
-///   (`"a.b"`), which preserves nesting in the output. Missing paths are
-///   silently skipped (selection never errors).
-/// - **Array**: apply [`select`] to each element — the natural behavior for
-///   list results like `[{id, name, body}, …]` projected to `id,name`.
+///   (`"a.b"`), which preserves nesting in the output. A path that matches
+///   nothing adds nothing, not even an empty container: `a.zzz` over
+///   `{ a: { b: 1 } }` is `{}`, so a caller can tell a miss from a hit.
+/// - **Array**: apply [`select`] to each element, the natural behavior for
+///   list results like `[{id, name, body}, ...]` projected to `id,name`.
 /// - **Anything else**: returned unchanged.
 pub(crate) fn select(value: &Value, fields: &[&str]) -> Value {
     match value {
@@ -25,8 +26,8 @@ pub(crate) fn select(value: &Value, fields: &[&str]) -> Value {
             let mut out = Map::new();
             for field in fields {
                 let path: Vec<&str> = field.split('.').filter(|s| !s.is_empty()).collect();
-                if !path.is_empty() {
-                    insert_path(map, &path, &mut out);
+                if let Some(projected) = project_path(map, &path) {
+                    merge(&mut out, projected);
                 }
             }
             Value::Object(out)
@@ -35,50 +36,62 @@ pub(crate) fn select(value: &Value, fields: &[&str]) -> Value {
     }
 }
 
-/// Descend `source` along `path`, inserting the found leaf into `out` while
-/// reconstructing intermediate objects so nesting is preserved. An array
-/// encountered mid-path is descended element-wise — `checks.fix` over
-/// `{ checks: [ {fix}, … ] }` yields `{ checks: [ {fix}, … ] }` — matching the
-/// element-wise convention [`select`] already uses for top-level arrays.
-fn insert_path(source: &Map<String, Value>, path: &[&str], out: &mut Map<String, Value>) {
-    let (head, rest) = path.split_first().expect("path is non-empty");
-    let Some(found) = source.get(*head) else {
-        return;
-    };
-    if rest.is_empty() {
-        out.insert((*head).to_string(), found.clone());
-        return;
-    }
-    match found {
-        Value::Object(inner) => {
-            let entry = out
-                .entry((*head).to_string())
-                .or_insert_with(|| Value::Object(Map::new()));
-            if let Value::Object(target) = entry {
-                insert_path(inner, rest, target);
-            }
-        }
-        Value::Array(items) => {
-            // Descend the remaining path into each object element. Merge into an
-            // existing array target so multiple paths into the same array
-            // (`checks.name,checks.fix`) accumulate rather than overwrite.
-            let entry = out
-                .entry((*head).to_string())
-                .or_insert_with(|| Value::Array(Vec::new()));
-            if let Value::Array(target) = entry {
-                if target.len() < items.len() {
-                    target.resize(items.len(), Value::Object(Map::new()));
+/// `source` reduced to the leaf `path` names, with the objects on the way
+/// rebuilt around it, or `None` when nothing on the path exists. An array met
+/// mid-path is descended element-wise: `checks.fix` over
+/// `{ checks: [ {fix}, ... ] }` yields `{ checks: [ {fix}, ... ] }`, the
+/// convention [`select`] uses for top-level arrays. Rows without the leaf stay
+/// as `{}` so positions hold, and when no row has it the path is a miss.
+fn project_path(source: &Map<String, Value>, path: &[&str]) -> Option<Map<String, Value>> {
+    let (head, rest) = path.split_first()?;
+    let found = source.get(*head)?;
+    let projected = if rest.is_empty() {
+        found.clone()
+    } else {
+        match found {
+            Value::Object(inner) => Value::Object(project_path(inner, rest)?),
+            Value::Array(items) => {
+                let rows: Vec<Option<Map<String, Value>>> = items
+                    .iter()
+                    .map(|item| item.as_object().and_then(|row| project_path(row, rest)))
+                    .collect();
+                if rows.iter().all(Option::is_none) {
+                    return None;
                 }
-                for (slot, item) in target.iter_mut().zip(items.iter()) {
-                    if let (Value::Object(target_obj), Value::Object(item_obj)) = (slot, item) {
-                        insert_path(item_obj, rest, target_obj);
+                // A row without the leaf stays `{}`, so positions hold.
+                Value::Array(
+                    rows.into_iter()
+                        .map(|row| row.map_or_else(|| Value::Object(Map::new()), Value::Object))
+                        .collect(),
+                )
+            }
+            // A scalar mid-path cannot be descended: the path names nothing.
+            _ => return None,
+        }
+    };
+    let mut out = Map::new();
+    out.insert((*head).to_string(), projected);
+    Some(out)
+}
+
+/// Merge `incoming` into `target`, so several paths into one object or array
+/// (`checks.name,checks.fix`) accumulate instead of the last one winning.
+/// Objects merge key by key and arrays row by row; anything else is replaced.
+fn merge(target: &mut Map<String, Value>, incoming: Map<String, Value>) {
+    for (key, value) in incoming {
+        match (target.get_mut(&key), value) {
+            (Some(Value::Object(existing)), Value::Object(incoming)) => merge(existing, incoming),
+            (Some(Value::Array(existing)), Value::Array(incoming)) => {
+                for (slot, row) in existing.iter_mut().zip(incoming) {
+                    if let (Value::Object(slot), Value::Object(row)) = (slot, row) {
+                        merge(slot, row);
                     }
                 }
             }
+            (_, value) => {
+                target.insert(key, value);
+            }
         }
-        // Scalar mid-path: cannot descend. Leave unselected (consistent with a
-        // missing path) rather than emitting a partial/empty entry.
-        _ => {}
     }
 }
 
@@ -185,6 +198,40 @@ mod tests {
         assert_eq!(
             out,
             json!({ "checks": [ { "name": "auth", "fix": "Set API_TOKEN" } ] })
+        );
+    }
+
+    #[test]
+    fn select_multiple_dot_paths_into_same_object_merge() {
+        let value = json!({ "a": { "b": { "c": 1, "d": 2, "e": 3 } } });
+        let out = select(&value, &["a.b.c", "a.b.d"]);
+        assert_eq!(out, json!({ "a": { "b": { "c": 1, "d": 2 } } }));
+        // A whole key and a path into it agree on the whole key.
+        let out = select(&value, &["a.b.c", "a"]);
+        assert_eq!(out, value);
+    }
+
+    #[test]
+    fn a_dot_path_that_matches_nothing_adds_no_container() {
+        // Before, `a.zzz` left `{ a: {} }` behind: an empty object that read
+        // as a hit, so no `select_warning` was raised.
+        let value = json!({ "a": { "b": 1 }, "d": 3 });
+        assert_eq!(select(&value, &["a.zzz"]), json!({}));
+        assert_eq!(select(&value, &["a.b.c"]), json!({}), "a scalar mid-path");
+        assert_eq!(select(&value, &["zzz.b"]), json!({}));
+        // One miss beside a hit leaves only the hit.
+        assert_eq!(select(&value, &["a.zzz", "d"]), json!({ "d": 3 }));
+    }
+
+    #[test]
+    fn a_dot_path_no_row_has_adds_no_array() {
+        let value = json!({ "items": [{ "id": 1 }, { "id": 2 }], "count": 2 });
+        assert_eq!(select(&value, &["items.zzz"]), json!({}));
+        // One row with the leaf keeps every row, so positions hold.
+        let value = json!({ "items": [{ "id": 1 }, { "tag": "t" }] });
+        assert_eq!(
+            select(&value, &["items.tag"]),
+            json!({ "items": [{}, { "tag": "t" }] })
         );
     }
 

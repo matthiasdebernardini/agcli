@@ -1,7 +1,7 @@
 //! [`Invocation`]: argv parsed into program, flags, and positionals.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::iter;
@@ -22,6 +22,10 @@ pub struct Invocation {
     command_line: String,
     raw_args: Vec<String>,
     flags: HashMap<String, String>,
+    /// The flags given with no value, which `flags` holds as `"true"`. A
+    /// value flag among them (`--select` alone) was given nothing, which is
+    /// not the same as being given the value `true`.
+    bare_flags: HashSet<String>,
     positionals: Vec<String>,
     /// For each entry of `positionals`, its index in `raw_args`. Recovering
     /// this after the fact by searching `raw_args` for the token does not
@@ -66,6 +70,18 @@ impl Invocation {
         self.flags.get(name).map(String::as_str)
     }
 
+    /// The value of a flag that takes one, or the empty string when the flag
+    /// was given with no value (`--select` alone, which [`Invocation::flag`]
+    /// reads as `"true"`). `None` when it is absent.
+    pub(crate) fn value_flag(&self, name: &str) -> Option<&str> {
+        let value = self.flag(name)?;
+        Some(if self.bare_flags.contains(name) {
+            ""
+        } else {
+            value
+        })
+    }
+
     /// The positional arguments in order, the command path first.
     #[must_use]
     pub fn positionals(&self) -> &[String] {
@@ -74,10 +90,29 @@ impl Invocation {
 
     /// Where each positional sat in [`Invocation::raw_args`], same order and
     /// length as [`Invocation::positionals`]. Maps a positional back to the
-    /// original argv position — which is how a raw command finds the exact
+    /// original argv position, which is how a raw command finds the exact
     /// token its own argv starts after.
     pub(crate) fn positional_indices(&self) -> &[usize] {
         &self.positional_indices
+    }
+
+    /// The command line with `flag` added as a flag token: before the first
+    /// `--`, so a re-run parses it as a flag, else at the end. `flag` is
+    /// rendered as given, not quoted, so a template placeholder such as
+    /// `--select=<fields>` stays one.
+    pub(crate) fn command_line_with_flag(&self, flag: &str) -> String {
+        let separator = self
+            .raw_args
+            .iter()
+            .position(|token| token == "--")
+            .unwrap_or(self.raw_args.len());
+        let (before, after) = self.raw_args.split_at(separator);
+        iter::once(shell_quote(&self.program))
+            .chain(before.iter().map(|token| shell_quote(token)))
+            .chain(iter::once(Cow::Borrowed(flag)))
+            .chain(after.iter().map(|token| shell_quote(token)))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// True when a bare `--help` or `-h` is on the line. A `--help=<value>`
@@ -168,9 +203,14 @@ pub(crate) fn render_command_line<S: AsRef<str>>(program: &str, args: &[S]) -> S
         .join(" ")
 }
 
-/// Returns true if `s` looks like a negative number (integer, float, or scientific notation).
+/// True when `s` is a `-` followed by an ASCII digit (`-3`, `-0x10`,
+/// `-1,000`) or parses as a negative number (`-.5`, `-1e3`): a positional,
+/// never a bundle of short flags. No usage string declares a digit as a flag.
 fn looks_like_negative_number(s: &str) -> bool {
-    s.starts_with('-') && s.len() >= 2 && s.parse::<f64>().is_ok()
+    s.strip_prefix('-').is_some_and(|rest| {
+        rest.starts_with(|c: char| c.is_ascii_digit())
+            || (!rest.is_empty() && rest.parse::<f64>().is_ok())
+    })
 }
 
 impl Invocation {
@@ -218,6 +258,7 @@ impl Invocation {
             command_line,
             raw_args: tokens,
             flags: parser.flags,
+            bare_flags: parser.bare_flags,
             positionals: parser.positionals,
             positional_indices: parser.positional_indices,
             help_requested: parser.help_requested,
@@ -229,6 +270,8 @@ impl Invocation {
 #[derive(Default)]
 struct TokenParser {
     flags: HashMap<String, String>,
+    /// The flags set to `"true"` because they were given no value.
+    bare_flags: HashSet<String>,
     positionals: Vec<String>,
     positional_indices: Vec<usize>,
     help_requested: bool,
@@ -336,7 +379,7 @@ impl TokenParser {
 
         // Bundled short flags: -abc (all bool)
         for ch in short.chars() {
-            self.set_flag(ch.to_string(), "true".to_string())?;
+            self.set_bare_flag(ch.to_string())?;
         }
         Ok(())
     }
@@ -349,7 +392,7 @@ impl TokenParser {
         is_bool: impl Fn(&str) -> bool,
     ) -> Result<(), ParseInvocationError> {
         if is_bool(name) {
-            return self.set_flag(name.to_string(), "true".to_string());
+            return self.set_bare_flag(name.to_string());
         }
         if self.flags.contains_key(name) {
             return Err(ParseInvocationError::RepeatedFlag(name.to_string()));
@@ -365,6 +408,13 @@ impl TokenParser {
         }
         self.flags.insert(key, value);
         Ok(())
+    }
+
+    /// Record flag `key` as given with no value: `"true"`, and remembered as
+    /// bare.
+    fn set_bare_flag(&mut self, key: String) -> Result<(), ParseInvocationError> {
+        self.bare_flags.insert(key.clone());
+        self.set_flag(key, "true".to_string())
     }
 
     /// A non-flag token: the pending flag's value if one is waiting, else a
@@ -390,7 +440,7 @@ impl TokenParser {
     fn flush_pending(&mut self) -> Result<(), ParseInvocationError> {
         self.pending_flag
             .take()
-            .map_or(Ok(()), |key| self.set_flag(key, "true".to_string()))
+            .map_or(Ok(()), |key| self.set_bare_flag(key))
     }
 }
 
@@ -659,6 +709,59 @@ mod tests {
         let invocation = parse_no_bools(["app", "-.5"]).expect("should parse");
         assert_eq!(invocation.positionals(), &[String::from("-.5")]);
         assert!(invocation.flags().is_empty());
+    }
+
+    #[test]
+    fn a_dash_and_a_digit_start_a_positional_not_a_flag_bundle() {
+        // `-0x10` and `-1,000` are not f64 literals, so they used to be read
+        // as bundled short flags and fail with `-0 given twice`.
+        for token in ["-0x10", "-1,000", "-7th", "-2024-01-01"] {
+            let invocation = parse_no_bools(["app", "add", "1", token]).expect("should parse");
+            assert_eq!(
+                invocation.positionals(),
+                &[String::from("add"), String::from("1"), String::from(token)],
+                "{token}"
+            );
+            assert!(invocation.flags().is_empty(), "{token}");
+        }
+        // A letter after the dash is still a flag bundle, and `-` alone a
+        // positional.
+        let invocation = parse_no_bools(["app", "-ab", "-"]).expect("should parse");
+        assert_eq!(invocation.flag("a"), Some("true"));
+        assert_eq!(invocation.positionals(), &[String::from("-")]);
+    }
+
+    #[test]
+    fn a_value_flag_given_bare_reads_as_empty() {
+        // `flag` keeps the parser's `"true"`; `value_flag` tells a flag given
+        // nothing from one given the value `true`.
+        let bare = parse_no_bools(["app", "--select"]).expect("should parse");
+        assert_eq!(bare.flag("select"), Some("true"));
+        assert_eq!(bare.value_flag("select"), Some(""));
+        let before_a_flag = parse_no_bools(["app", "--select", "--quiet"]).expect("should parse");
+        assert_eq!(before_a_flag.value_flag("select"), Some(""));
+        let given = parse_no_bools(["app", "--select", "true"]).expect("should parse");
+        assert_eq!(given.value_flag("select"), Some("true"));
+        let equals = parse_no_bools(["app", "--select=true"]).expect("should parse");
+        assert_eq!(equals.value_flag("select"), Some("true"));
+        assert_eq!(equals.value_flag("other"), None);
+        let bundled = parse_no_bools(["app", "-sv"]).expect("should parse");
+        assert_eq!(bundled.value_flag("s"), Some(""));
+    }
+
+    #[test]
+    fn command_line_with_flag_keeps_the_flag_before_the_separator() {
+        let invocation =
+            parse_no_bools(["/bin/app", "ls", "two words", "--", "-x"]).expect("should parse");
+        assert_eq!(
+            invocation.command_line_with_flag("--select=<fields>"),
+            "app ls 'two words' --select=<fields> -- -x"
+        );
+        let invocation = parse_no_bools(["app", "ls"]).expect("should parse");
+        assert_eq!(
+            invocation.command_line_with_flag("--select=<fields>"),
+            "app ls --select=<fields>"
+        );
     }
 
     #[test]

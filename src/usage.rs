@@ -5,26 +5,25 @@ use std::collections::HashSet;
 
 use crate::next_action::{ActionParam, NextAction};
 
-/// Extract a `<name>` placeholder from `text`, returning the inner name when it
-/// is a usable param — non-empty and free of `.` (which marks a variadic like
-/// `args...`). Returns `None` when there is no placeholder or it is not usable.
+/// Extract a `<name>` placeholder from `text`, returning the inner name when
+/// it is non-empty. `None` when there is no placeholder.
 fn placeholder_param_name(text: &str) -> Option<&str> {
     let angle_start = text.find('<')?;
     let angle_end = text[angle_start..].find('>')?;
     let param_name = &text[angle_start + 1..angle_start + angle_end];
-    (!param_name.is_empty() && !param_name.contains('.')).then_some(param_name)
+    (!param_name.is_empty()).then_some(param_name)
 }
 
 /// Build a `NextAction` from a usage string and description.
 ///
-/// A bare `<name>` placeholder becomes a **required** positional param. Any
-/// placeholder inside brackets is **optional**: `[--flag=<name>]`,
-/// `[--flag <name>]`, short value flags `[-v <level>]`, and bare optional
-/// positionals `[<optional>]`. Brackets without a `<...>` placeholder
-/// (`[--follow]`, `[args...]`) contribute no param. If no placeholders are
-/// found, the action is literal (no `params`) and its command drops the
-/// optional `[...]` segments, so it runs as printed: `app tail [--follow]`
-/// becomes `app tail`.
+/// A bare `<name>` placeholder becomes a **required** positional param, a
+/// variadic `<args...>` included. Any placeholder inside brackets is
+/// **optional**: `[--flag=<name>]`, `[--flag <name>]`, short value flags
+/// `[-v <level>]`, and bare optional positionals `[<optional>]`. Brackets
+/// without a `<...>` placeholder (`[--follow]`, `[args...]`) contribute no
+/// param. If no placeholders are found, the action is literal (no `params`)
+/// and its command drops the optional `[...]` segments, so it runs as printed:
+/// `app tail [--follow]` becomes `app tail`.
 pub(crate) fn next_action_from_usage(usage: &str, description: &str) -> NextAction {
     let mut action = NextAction::new(usage, description);
     let bytes = usage.as_bytes();
@@ -53,7 +52,7 @@ pub(crate) fn next_action_from_usage(usage: &str, description: &str) -> NextActi
             && let Some(close) = usage[i..].find('>')
         {
             let param_name = &usage[i + 1..i + close];
-            if !param_name.is_empty() && !param_name.contains('.') {
+            if !param_name.is_empty() {
                 action = action.with_param(param_name, ActionParam::new().required(true));
             }
             i += close + 1;
@@ -319,6 +318,23 @@ mod tests {
         // <value> from [--flag=<value>] should be parsed
         assert!(params.contains_key("value"));
         // [args...] has no angle brackets, no param
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn a_variadic_placeholder_is_a_param_like_any_other() {
+        // `<cmd...>` used to create no param, so the action was literal and
+        // printed `t run <cmd...>`, a line that runs as nothing.
+        let action = next_action_from_usage("t run <cmd...>", "Run");
+        assert_eq!(action.command, "t run <cmd...>");
+        let params = action.params.as_ref().expect("a template");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params["cmd..."].required, Some(true));
+        // Bracketed, it is optional, like every other bracketed placeholder.
+        let action = next_action_from_usage("t run <cmd> [<args...>]", "Run");
+        let params = action.params.as_ref().expect("a template");
+        assert_eq!(params["cmd"].required, Some(true));
+        assert_eq!(params["args..."].required, Some(false));
     }
 
     // --- next_action_from_usage: short value flags & bare optional positionals ---

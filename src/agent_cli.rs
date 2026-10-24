@@ -228,7 +228,7 @@ impl AgentCli {
     ) -> Execution {
         let mut select_warning = None;
         if self.reserved_flags {
-            if let Some(raw) = invocation.flag("select") {
+            if let Some(raw) = invocation.value_flag("select") {
                 (result, select_warning) = select::apply_select_flag(result, raw);
             }
             if reserved_flags::bool_flag_on(invocation.flag("compact")) {
@@ -256,7 +256,7 @@ impl AgentCli {
         if self.commands.is_empty() {
             return vec![NextAction::new(
                 self.name.clone(),
-                "Inspect root command tree",
+                "Inspect the full command tree",
             )];
         }
 

@@ -254,8 +254,10 @@ impl AgentCli {
     pub(crate) fn skill_execution(&self, invocation: &Invocation, clock: &ClockFn) -> Execution {
         let root_action = || NextAction::new(self.name.clone(), "Inspect the full command tree");
 
-        // No `--install`: the document itself is the answer.
-        let Some(raw_dir) = invocation.flag("install") else {
+        // No `--install`: the document itself is the answer. A bare
+        // `--install` reads as the empty directory, so it is refused below
+        // instead of writing `./true/<name>/SKILL.md` and reporting success.
+        let Some(raw_dir) = invocation.value_flag("install") else {
             let result = json!({
                 "markdown": self.skill_markdown(),
                 "skill_name": self.name,
@@ -264,18 +266,14 @@ impl AgentCli {
         };
 
         let dir = raw_dir.trim();
-        // A bare `--install` parses as the boolean sentinel `"true"`, which
-        // would write `./true/<name>/SKILL.md` — a wrong answer reported as a
-        // success. Refuse it, and tell the caller the spelling that works.
-        let bare = invocation.raw_args().iter().any(|arg| arg == "--install");
         // `--install=~/skills` never reaches tilde expansion: a shell expands
         // `~` only at the start of a word, not after `=`. A literal `~`
         // directory is never what the caller meant.
         let tilde = dir.split('/').next().is_some_and(|c| c.starts_with('~'));
-        if dir.is_empty() || (bare && dir == "true") || tilde {
+        if dir.is_empty() || tilde {
             let fix = if tilde {
                 format!(
-                    "Nothing was written. `~` is not expanded after `=` — pass an absolute \
+                    "Nothing was written. `~` is not expanded after `=`. Pass an absolute \
                      path: `{} skill --install=/absolute/path`.",
                     self.name
                 )

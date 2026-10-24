@@ -586,7 +586,7 @@ impl AgentCli {
                 .join(", ");
             let expected = match optional {
                 0 => format!("{required}"),
-                _ => format!("{required}–{}", required + optional),
+                _ => format!("{required} to {}", required + optional),
             };
             return Some(self.gate_error(
                 gate,
@@ -677,16 +677,21 @@ impl AgentCli {
         // command supports --select / --compact / --quiet for free.
         let mut select_warning = None;
         if self.reserved_flags && command.applies_reserved_projection() {
-            if let Some(raw) = invocation.flag("select") {
+            let selected = invocation.value_flag("select");
+            if let Some(raw) = selected {
                 (result, select_warning) = select::apply_select_flag(result, raw);
             }
             if reserved_flags::bool_flag_on(invocation.flag("compact")) {
+                // An explicit --select names what the agent wants, so beside
+                // it --compact only drops nulls and empty containers: keeping
+                // the command's `compact_fields` instead could empty the
+                // selection without a word.
                 result = match &compact_fields {
-                    Some(fields) => {
+                    Some(fields) if selected.is_none() => {
                         let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
                         project::select(&result, &refs)
                     }
-                    None => project::compact(&result),
+                    _ => project::compact(&result),
                 };
             }
         }

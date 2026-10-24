@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use crate::codes::ExitCode;
 use crate::next_action::NextAction;
+use crate::select;
 
 /// Derive a list's row schema as sorted `--select` paths, ready to paste into
 /// `--select` verbatim.
@@ -16,16 +17,21 @@ use crate::next_action::NextAction;
 /// `id` would miss the rows nested under `items` and dead-end in a
 /// `select_warning`. Rows are commonly heterogeneous (optional fields, mixed
 /// variants), so the union across items beats sampling the first row. Keys go
-/// through a [`BTreeSet`], so the paths are deduplicated and sorted — order
+/// through a [`BTreeSet`], so the paths are deduplicated and sorted: the order
 /// does not depend on `serde_json`'s map backing, which a `preserve_order`
 /// feature unification elsewhere in the dependency graph could otherwise flip.
 /// Non-object items contribute nothing, so a list of scalars yields an empty
-/// schema.
+/// schema, and a key no `--select` value can spell (one holding `.` or `,`)
+/// is left out rather than advertised as a path that cannot work.
 fn row_schema(items: &[Value]) -> Vec<String> {
     let mut keys: BTreeSet<&str> = BTreeSet::new();
     for item in items {
         let Value::Object(map) = item else { continue };
-        keys.extend(map.keys().map(String::as_str));
+        keys.extend(
+            map.keys()
+                .map(String::as_str)
+                .filter(|key| select::is_selectable_key(key)),
+        );
     }
     keys.into_iter().map(|key| format!("items.{key}")).collect()
 }
@@ -106,9 +112,19 @@ impl CommandOutput {
     /// because the output cannot see that configuration. When they are on, the
     /// framework also appends a `next_action` that reruns this invocation under
     /// `--select`.
+    ///
+    /// # Panics
+    ///
+    /// When `total` is less than the number of items: a list cannot hold more
+    /// rows than exist, and reporting one as `truncated: false` with a `total`
+    /// below its `count` would be a wrong answer.
     #[must_use]
     pub fn list_truncated(items: Vec<Value>, total: usize) -> Self {
         let count = items.len();
+        assert!(
+            total >= count,
+            "a list of {count} items cannot have a total of {total}"
+        );
         let truncated = count < total;
         let fields = row_schema(&items);
         let mut result = serde_json::Map::new();
@@ -123,7 +139,8 @@ impl CommandOutput {
             result.insert(
                 "guidance".to_string(),
                 json!(format!(
-                    "Showing {count} of {total} results. Narrow with --limit, --select, or filter flags."
+                    "Showing {count} of {total} results. Narrow the query with the command's \
+                     own flags, or project the rows with --select."
                 )),
             );
         }
@@ -330,6 +347,49 @@ mod tests {
             envelope.result["items"],
             json!([{ "id": 1, "name": "a" }, { "id": 2, "name": "b" }])
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "a list of 3 items cannot have a total of 1")]
+    fn a_total_below_the_item_count_panics() {
+        // Reported as it stood, this was `count: 3, total: 1, truncated: false`.
+        let _ = CommandOutput::list_truncated(vec![json!(1), json!(2), json!(3)], 1);
+    }
+
+    #[tokio::test]
+    async fn fields_leave_out_keys_no_select_can_spell() {
+        // `--select` splits on `,` and reads `.` as a path step, so `a.b` and
+        // `x,y` cannot be named: advertising them would promise a projection
+        // that dead-ends in a `select_warning`.
+        let items = vec![json!({ "id": 1, "a.b": 2, "x,y": 3, " padded": 4 })];
+        let run = list_cli(items, false).run(["app", "ls"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result["fields"], json!(["items.id"]));
+    }
+
+    #[tokio::test]
+    async fn compact_beside_select_keeps_the_selection() {
+        // `--select=body --compact` used to re-project the selection to the
+        // command's `compact_fields` and answer `result: {}` without a word.
+        // An explicit --select wins; --compact then only drops nulls.
+        let cli = AgentCli::new("app", "x").command(Command::new("get", "get").handler(
+            |_req| async move {
+                Ok(CommandOutput::new(
+                    json!({ "id": 1, "name": "x", "body": "huge", "note": null }),
+                )
+                .compact_fields(["id", "name"]))
+            },
+        ));
+        let run = cli
+            .run(["app", "get", "--select=body,note", "--compact"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result, json!({ "body": "huge" }));
+        assert!(envelope.select_warning.is_none());
     }
 
     #[tokio::test]

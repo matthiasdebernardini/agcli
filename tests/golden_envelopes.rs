@@ -180,7 +180,7 @@ async fn list_envelope() {
     let actual = list_golden_cli().run(["notes", "ls"]).await.to_json();
     assert_eq!(
         actual,
-        r#"{"ok":true,"command":"notes ls","timestamp":"1970-01-01T00:00:00Z","exit_code":0,"result":{"count":2,"fields":["items.done","items.id","items.title"],"items":[{"done":false,"id":1,"title":"first"},{"done":true,"id":2,"title":"second"}],"total":2,"truncated":false},"next_actions":[{"command":"notes ls","description":"Run this command template"},{"command":"notes","description":"Inspect the full command tree"},{"command":"notes ls --select=<fields>","description":"Re-run projected to only the fields you need — smaller result, same data","params":{"fields":{"description":"Comma-separated subset of: items.done, items.id, items.title (dot paths project each row)","required":true}}}]}"#,
+        r#"{"ok":true,"command":"notes ls","timestamp":"1970-01-01T00:00:00Z","exit_code":0,"result":{"count":2,"fields":["items.done","items.id","items.title"],"items":[{"done":false,"id":1,"title":"first"},{"done":true,"id":2,"title":"second"}],"total":2,"truncated":false},"next_actions":[{"command":"notes ls","description":"Run this command template"},{"command":"notes","description":"Inspect the full command tree"},{"command":"notes ls --select=<fields>","description":"Re-run projected to only the fields you need: a smaller result, the same data","params":{"fields":{"description":"Comma-separated subset of: items.done, items.id, items.title (dot paths project each row)","required":true}}}]}"#,
         "envelope bytes drifted"
     );
 }

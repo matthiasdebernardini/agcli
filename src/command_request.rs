@@ -131,7 +131,7 @@ impl CommandRequest {
                 ErrorCode::INVALID_ARG,
                 format!("argument <{name}> is not finite: {raw:?}"),
                 format!(
-                    "Pass a finite number for <{name}> — JSON cannot represent \
+                    "Pass a finite number for <{name}>. JSON cannot represent \
                      infinities or NaN."
                 ),
             )
@@ -171,7 +171,7 @@ impl CommandRequest {
                         ErrorCode::INVALID_FLAG,
                         format!("flag {flag} is not finite: {raw:?}"),
                         format!(
-                            "Pass a finite number for {flag} — JSON cannot represent \
+                            "Pass a finite number for {flag}. JSON cannot represent \
                              infinities or NaN."
                         ),
                     )
@@ -268,9 +268,11 @@ impl CommandRequest {
 
     /// `--select=a,b,c`: the requested field projection, split and trimmed
     /// exactly as the framework's own projection reads it. Empty when the
-    /// flag is absent or names no field; empty entries are dropped.
+    /// flag is absent, given bare, or names no field; empty entries are
+    /// dropped.
     pub fn select(&self) -> impl Iterator<Item = &str> {
-        self.flag("select")
+        self.invocation
+            .value_flag("select")
             .into_iter()
             .flat_map(select::parse_select_fields)
     }
@@ -312,6 +314,9 @@ mod tests {
         let none: [String; 0] = [];
         assert_eq!(select(&["app"]), none);
         assert_eq!(select(&["app", "--select="]), none);
+        // Given bare, the flag names no field: not one called `true`.
+        assert_eq!(select(&["app", "--select"]), none);
+        assert_eq!(select(&["app", "--select=true"]), ["true"]);
     }
 
     // --- Strict boolean reads ---
@@ -374,10 +379,9 @@ mod tests {
             "{}",
             error.message
         );
-        assert!(
-            error.fix.starts_with("Pass a finite number for -n "),
-            "{}",
-            error.fix
+        assert_eq!(
+            error.fix,
+            "Pass a finite number for -n. JSON cannot represent infinities or NaN."
         );
 
         let error = request(&["app", "--lines=lots"])
