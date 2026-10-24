@@ -1,11 +1,8 @@
-//! Static self-audit of an [`crate::AgentCli`] definition.
-//!
-//! This is the framework analog of the "proof-of-behavior" gates used by
-//! agent-native CLI generators: instead of validating against an API spec,
-//! it validates the command tree against itself. The highest-value check is
-//! **HATEOAS integrity** — every statically declared `next_action` must
-//! point at a command that actually exists, so an agent following the trail
-//! never hits a dead link.
+//! Static self-audit of an [`crate::AgentCli`] definition: the command tree
+//! is validated against itself. The highest-value check is **HATEOAS
+//! integrity**: every statically declared `next_action` must point at a
+//! command that exists, so an agent following the trail never hits a dead
+//! link.
 //!
 //! Only *statically declared* affordances can be audited: command
 //! descriptions, usage strings, and [`crate::Command::default_next_action`]
@@ -20,7 +17,6 @@ use serde_json::{Value, json};
 use crate::agent_cli::AgentCli;
 use crate::command::{Builtin, Command};
 use crate::reserved_flags;
-use crate::skill;
 use crate::usage;
 
 /// Severity of an [`AuditFinding`], ordered from least to most severe
@@ -124,27 +120,6 @@ impl AgentCli {
         let mut report = AuditReport::default();
         let mut path_buf: Vec<&str> = Vec::new();
         self.audit_commands(&self.commands, &mut path_buf, &mut report);
-        // The CLI name becomes the generated skill's frontmatter `name` *and*
-        // the directory `--install` writes into. A harness rejects a name that
-        // is not a slug, so the skill would be dead on arrival.
-        if self
-            .commands
-            .get("skill")
-            .is_some_and(|c| c.builtin == Some(Builtin::Skill))
-            && !skill::is_slug(&self.name)
-        {
-            report.push(
-                AuditSeverity::Error,
-                "SKILL_NAME_INVALID",
-                "skill",
-                format!(
-                    "CLI name `{}` is not a slug (lowercase letters, digits, and single \
-                     hyphens between them); the generated SKILL.md frontmatter name and its \
-                     install directory would both be invalid",
-                    self.name
-                ),
-            );
-        }
         report
     }
 
@@ -229,7 +204,7 @@ impl AgentCli {
     }
 
     /// Findings about `command`'s usage string. The usage string is not just
-    /// documentation — it is the flag schema (`extract_all_flag_names`) and
+    /// documentation: it is the flag schema (`extract_all_flag_names`) and
     /// the positional-arity bound (`usage::positional_arity`). A malformed
     /// template silently changes parsing behavior, so structural problems are
     /// findings.
@@ -245,7 +220,7 @@ impl AgentCli {
                 path,
                 format!(
                     "usage `{usage}` has unbalanced brackets \
-                     ({opens}×'[' vs {closes}×']', {lt}×'<' vs {gt}×'>'); \
+                     ({opens} '[' vs {closes} ']', {lt} '<' vs {gt} '>'); \
                      flag and arity validation parse this template, so it \
                      will misbehave"
                 ),
@@ -353,8 +328,8 @@ impl AgentCli {
     /// token (`<arg>`, `[--flag]`, `-x`, `key=value`).
     ///
     /// A bare program-name reference (or an empty template) is the valid root
-    /// affordance and resolves. But a template that — after dropping an optional
-    /// leading program name — leads straight into a placeholder/flag matches
+    /// affordance and resolves. But a template that, after dropping an optional
+    /// leading program name, leads straight into a placeholder/flag matches
     /// *zero* command tokens and names no runnable command, so it is rejected
     /// (it would be a dead link for an agent following the trail).
     fn next_action_resolves(&self, template: &str) -> bool {

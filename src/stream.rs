@@ -236,6 +236,11 @@ struct StreamState {
 /// as the event is written. Under [`AgentCli::run_env`](crate::AgentCli::run_env)
 /// the line goes to stdout; under [`AgentCli::run`](crate::AgentCli::run) it
 /// is captured in the [`Execution`](crate::Execution).
+///
+/// Clones share the stream: a clone handed to a task the handler spawns
+/// writes to the same output, one whole line at a time, and is refused with
+/// [`StreamWriteError::Closed`] once the handler has returned.
+#[derive(Clone)]
 pub struct StreamWriter {
     state: Arc<Mutex<StreamState>>,
     /// The run's clock, read for every event's `ts`.
@@ -290,7 +295,7 @@ impl StreamWriter {
     /// Only if a thread panicked while it held the writer's lock, which the
     /// writer never does: it holds the lock only to check its flags and to
     /// write one line.
-    pub fn emit(&mut self, event: &StreamEvent) -> Result<(), StreamWriteError> {
+    pub fn emit(&self, event: &StreamEvent) -> Result<(), StreamWriteError> {
         let stamped = StampedEvent {
             event,
             ts: (self.clock)(),
@@ -428,7 +433,7 @@ mod tests {
 
     #[test]
     fn emit_writes_one_stamped_line_per_event() {
-        let (mut out, wire) = failing(None, 0);
+        let (out, wire) = failing(None, 0);
         out.emit(&StreamEvent::Start {
             command: "app deploy".to_string(),
         })
@@ -470,7 +475,7 @@ mod tests {
         // Cap the wire at 10 bytes: the first emit commits a newline-less
         // fragment and fails. The writer must poison itself so a retry cannot
         // concatenate onto the broken line.
-        let (mut out, wire) = failing(Some(10), 0);
+        let (out, wire) = failing(Some(10), 0);
 
         let first = out.emit(&log("this line is longer than ten bytes"));
         assert!(matches!(first, Err(StreamWriteError::Io(_))));
@@ -486,7 +491,7 @@ mod tests {
 
     #[test]
     fn flush_error_poisons_writer() {
-        let (mut out, wire) = failing(None, 1);
+        let (out, wire) = failing(None, 1);
         let res = out.emit(&log("flushed"));
         assert!(matches!(res, Err(StreamWriteError::Io(_))));
         assert!(out.is_poisoned());
@@ -496,7 +501,7 @@ mod tests {
 
     #[test]
     fn closed_stream_refuses_events() {
-        let (mut out, handle) = StreamWriter::captured(Arc::new(|| Timestamp::UNIX_EPOCH));
+        let (out, handle) = StreamWriter::captured(Arc::new(|| Timestamp::UNIX_EPOCH));
         out.emit(&log("before"))
             .expect("open stream accepts events");
         let captured = handle.close();
@@ -505,6 +510,28 @@ mod tests {
         let late = out.emit(&log("after"));
         assert!(matches!(late, Err(StreamWriteError::Closed)));
         assert!(handle.close().is_empty(), "nothing lands after close");
+    }
+
+    #[test]
+    fn a_clone_writes_to_the_same_stream_and_closes_with_it() {
+        // A handler that spawns work hands the task a clone; the task's lines
+        // land in the same stream, and nothing lands after the handler returns.
+        let (out, handle) = StreamWriter::captured(Arc::new(|| Timestamp::UNIX_EPOCH));
+        let spawned = out.clone();
+        let worker = std::thread::spawn(move || spawned.emit(&log("from the task")));
+        worker
+            .join()
+            .expect("the task finishes")
+            .expect("an open stream accepts events");
+        out.emit(&log("from the handler"))
+            .expect("an open stream accepts events");
+        assert_eq!(handle.close().len(), 2);
+
+        let kept = out.clone();
+        assert!(matches!(
+            kept.emit(&log("late")),
+            Err(StreamWriteError::Closed)
+        ));
     }
 
     #[cfg(feature = "deserialize")]
@@ -531,7 +558,7 @@ mod tests {
                 data: json!({"key": "val"}),
             },
         ];
-        let (mut out, handle) = StreamWriter::captured(Arc::new(|| at(1_740_000_000)));
+        let (out, handle) = StreamWriter::captured(Arc::new(|| at(1_740_000_000)));
         for event in &events {
             out.emit(event).expect("must emit");
         }

@@ -18,8 +18,12 @@ use serde::Serialize;
 /// logs, the common case, want the most recent output. `dropped` says how many
 /// lines were cut from the head, and `full_output` points at a file with every
 /// line, so an agent can still read what was cut.
+///
+/// With the `deserialize` feature it decodes only a consistent shape: `lines`
+/// counts `entries`, `dropped` is `total - lines`, `truncated` is true
+/// exactly when lines were dropped, and `full_output` is present exactly when
+/// truncated.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[non_exhaustive]
 pub struct TruncatedEntries {
     /// How many lines `entries` holds.
@@ -37,6 +41,60 @@ pub struct TruncatedEntries {
     pub full_output: Option<String>,
     /// The lines kept inline: all of them, or the tail.
     pub entries: Vec<String>,
+}
+
+#[cfg(feature = "deserialize")]
+impl<'de> serde::Deserialize<'de> for TruncatedEntries {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            lines: usize,
+            total: usize,
+            dropped: usize,
+            truncated: bool,
+            #[serde(default, deserialize_with = "crate::envelope::present")]
+            full_output: Option<String>,
+            entries: Vec<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.lines != raw.entries.len() {
+            return Err(D::Error::custom(format!(
+                "`lines` is {} but `entries` holds {} lines",
+                raw.lines,
+                raw.entries.len()
+            )));
+        }
+        if raw.total < raw.lines || raw.dropped != raw.total - raw.lines {
+            return Err(D::Error::custom(format!(
+                "`dropped` is {} but `total - lines` is {} - {}",
+                raw.dropped, raw.total, raw.lines
+            )));
+        }
+        if raw.truncated != (raw.dropped > 0) {
+            return Err(D::Error::custom(format!(
+                "`truncated` is {} with {} lines dropped",
+                raw.truncated, raw.dropped
+            )));
+        }
+        if raw.full_output.is_some() != raw.truncated {
+            return Err(D::Error::custom(
+                "`full_output` is present exactly when the output was truncated",
+            ));
+        }
+        Ok(Self {
+            lines: raw.lines,
+            total: raw.total,
+            dropped: raw.dropped,
+            truncated: raw.truncated,
+            full_output: raw.full_output,
+            entries: raw.entries,
+        })
+    }
 }
 
 impl TruncatedEntries {
@@ -134,7 +192,7 @@ pub fn truncate_lines_with_file(
 
 fn write_full_output(lines: &[String], prefix: &str) -> io::Result<PathBuf> {
     // The timestamp is only a filename uniquifier (the create_new loop below
-    // resolves any collision), so never panic on a pre-1970 clock — a handler
+    // resolves any collision), so never panic on a pre-1970 clock: a handler
     // panic here would escape as non-JSON, violating the framework contract.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -206,6 +264,43 @@ mod tests {
         missing.as_object_mut().expect("object").remove("dropped");
         assert!(serde_json::from_value::<TruncatedEntries>(missing).is_err());
         truncated.cleanup().expect("cleanup must succeed");
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn truncated_entries_reject_an_inconsistent_shape() {
+        // Each of these decoded before, so a reader could not trust that
+        // `truncated` meant a file exists or that `dropped` counted anything.
+        let consistent = serde_json::json!({
+            "lines": 2, "total": 5, "dropped": 3, "truncated": true,
+            "full_output": "/tmp/x.log", "entries": ["d", "e"],
+        });
+        assert!(serde_json::from_value::<TruncatedEntries>(consistent.clone()).is_ok());
+        for (key, bad) in [
+            ("full_output", serde_json::Value::Null),
+            ("dropped", serde_json::json!(1)),
+            ("truncated", serde_json::json!(false)),
+            ("lines", serde_json::json!(3)),
+            ("total", serde_json::json!(1)),
+        ] {
+            let mut shape = consistent.clone();
+            shape[key] = bad;
+            assert!(
+                serde_json::from_value::<TruncatedEntries>(shape.clone()).is_err(),
+                "must reject {shape}"
+            );
+        }
+        let mut no_file = consistent.clone();
+        no_file
+            .as_object_mut()
+            .expect("object")
+            .remove("full_output");
+        assert!(serde_json::from_value::<TruncatedEntries>(no_file).is_err());
+        let with_file_but_whole = serde_json::json!({
+            "lines": 2, "total": 2, "dropped": 0, "truncated": false,
+            "full_output": "/tmp/x.log", "entries": ["d", "e"],
+        });
+        assert!(serde_json::from_value::<TruncatedEntries>(with_file_but_whole).is_err());
     }
 
     #[test]

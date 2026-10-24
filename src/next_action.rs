@@ -80,7 +80,7 @@ impl ActionParam {
     /// A param with nothing set.
     #[must_use]
     pub fn new() -> Self {
-        <Self as Default>::default()
+        Self::default()
     }
 
     /// Say what the value means.
@@ -99,8 +99,9 @@ impl ActionParam {
     }
 
     /// Set the value that applies when the agent leaves the placeholder out.
+    /// Serialized as the `default` key.
     #[must_use]
-    pub fn default(mut self, value: impl Into<Value>) -> Self {
+    pub fn default_value(mut self, value: impl Into<Value>) -> Self {
         self.default = Some(value.into());
         self
     }

@@ -1,7 +1,7 @@
-//! `CommandError::data` — the structured half of a failure.
+//! `CommandError::data`: the structured half of a failure.
 //!
-//! `message` and `fix` are prose. Facts an agent must act on — which rows were
-//! rejected and why, what the server replied — belong in `data`, not smuggled
+//! `message` and `fix` are prose. Facts an agent must act on (which rows were
+//! rejected and why, what the server replied) belong in `data`, not smuggled
 //! into the message text for the caller to parse back out. The key is absent
 //! from the envelope when the handler never sets it, so an error that has
 //! nothing structured to add keeps the shape it always had.

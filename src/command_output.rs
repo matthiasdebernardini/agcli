@@ -177,9 +177,11 @@ impl CommandOutput {
         self
     }
 
-    /// Declare the high-gravity fields `--compact` should keep for this
-    /// output. Without this, `--compact` falls back to dropping null/empty
-    /// fields generically.
+    /// Declare the fields `--compact` keeps for this output. Without this,
+    /// `--compact` drops null values and empty containers instead. Beside an
+    /// explicit `--select`, `--compact` only drops nulls and empty containers
+    /// from the selection, whatever this declares: the agent named what it
+    /// wants.
     #[must_use]
     pub fn compact_fields<I, S>(mut self, fields: I) -> Self
     where

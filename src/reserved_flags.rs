@@ -79,8 +79,8 @@ pub(crate) fn not_a_boolean(name: &str, value: &str) -> CommandError {
     .exit_code(ExitCode::USAGE)
 }
 
-/// The first boolean flag on `flags` — a framework flag, or a reserved agent
-/// flag when `reserved` is on — whose value is not a boolean spelling, with
+/// The first boolean flag on `flags` (a framework flag, or a reserved agent
+/// flag when `reserved` is on) whose value is not a boolean spelling, with
 /// that value. Names are checked in sorted order, so the answer does not
 /// depend on map iteration order.
 pub(crate) fn invalid_bool_flag<'a>(
@@ -109,7 +109,7 @@ pub(crate) const RESERVED_FLAG_DOCS: &[(&str, &str)] = &[
     ),
     (
         "--compact",
-        "Drop null values and empty containers from the result, or keep only the command's declared high-gravity fields.",
+        "Drop null values and empty containers from the result, or keep only the fields the command declares with `compact_fields`. Beside `--select` it only drops nulls and empty containers from the selection.",
     ),
     (
         "--quiet",

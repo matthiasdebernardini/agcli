@@ -5,7 +5,10 @@
 //! set. The harness reads `deploy` and `web` as test-name filters, which
 //! select only `ops::deploy`; that test then runs the example's own `main`,
 //! whose `run_env` reads the same argv: `ops deploy web`. So the events reach
-//! the real stdout live, followed by the one terminal line.
+//! the real stdout live, followed by the one terminal line. The child writes
+//! [`CHILD_RAN`] to stderr first, and the parent checks for it once and for
+//! the harness's `running 1 test` line, so a child the filter never reached,
+//! or a filter that reached a second test too, fails loudly.
 //!
 //! The example's other commands are checked in-process through its `cli()`.
 
@@ -20,6 +23,9 @@ mod literal_actions;
 /// Set in the re-executed child.
 const CHILD: &str = "AGCLI_TEST_CHILD";
 
+/// The line the child writes to stderr before it runs the example.
+const CHILD_RAN: &str = "AGCLI_TEST_CHILD_RAN ops_example::deploy";
+
 mod ops {
     include!("../examples/ops.rs");
 
@@ -27,7 +33,12 @@ mod ops {
     /// test run.
     #[test]
     fn deploy() {
+        use std::io::Write;
+
         if std::env::var_os(super::CHILD).is_some() {
+            // Through the handle, not `eprintln!`: the harness captures the
+            // macros.
+            writeln!(std::io::stderr(), "{}", super::CHILD_RAN).expect("write the sentinel");
             main();
         }
     }
@@ -87,8 +98,18 @@ fn streams_steps_and_progress_then_one_terminal_line() {
         .output()
         .expect("spawn the example");
     assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches(CHILD_RAN).count(),
+        1,
+        "the example did not run exactly once: {stderr}"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("running 1 test\n"),
+        "the filter selected other tests too: {stdout}"
+    );
     let lines: Vec<Value> = stdout
         .lines()
         .filter(|line| line.starts_with('{'))

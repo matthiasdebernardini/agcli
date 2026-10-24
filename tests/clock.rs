@@ -6,13 +6,17 @@
 //! re-executes itself with `child` as its only argument (which makes the
 //! harness run just the `child` test below) and the case's
 //! `SOURCE_DATE_EPOCH` set on the child alone. `AGCLI_TEST_CHILD` names the
-//! case. The child CLI's one command is also named `child` — the harness's
+//! case. The child CLI's one command is also named `child`: the harness's
 //! filter argument is the CLI's argv too.
 //!
 //! The harness prints its own `running 1 test` line on stdout first, so the
-//! assertions read only the JSON line.
+//! assertions read only the JSON line. The child writes [`CHILD_RAN`] to
+//! stderr as it starts, and the parent checks for it once and for the
+//! `running 1 test` line, so a child the filter never reached, or a filter
+//! that reached a second test too, fails instead of passing by accident.
 
 use std::env;
+use std::io::{self, Write};
 use std::process::{Command as Process, Output};
 
 use agcli::{AgentCli, Command, CommandOutput, Timestamp};
@@ -22,12 +26,17 @@ use tokio::runtime::Runtime;
 /// Names the case the `child` test runs.
 const CHILD_CASE: &str = "AGCLI_TEST_CHILD";
 
+/// The line the child writes to stderr as it starts its case.
+const CHILD_RAN: &str = "AGCLI_TEST_CHILD_RAN clock::child";
+
 /// The subprocess entry point. A no-op in a normal test run.
 #[test]
 fn child() {
     let Ok(case) = env::var(CHILD_CASE) else {
         return;
     };
+    // Through the handle, not `eprintln!`: the harness captures the macros.
+    writeln!(io::stderr(), "{CHILD_RAN}").expect("write the sentinel");
     let cli = AgentCli::new("app", "Clock test CLI").command(
         Command::new("child", "The command under test")
             .usage("app child")
@@ -43,14 +52,27 @@ fn child() {
 }
 
 /// Re-run this test binary as the `case` child with `SOURCE_DATE_EPOCH`
-/// set to `source_date_epoch`.
+/// set to `source_date_epoch`, and check that the `child` test alone ran
+/// and reached its case.
 fn run_case(case: &str, source_date_epoch: &str) -> Output {
-    Process::new(env::current_exe().expect("current exe"))
+    let output = Process::new(env::current_exe().expect("current exe"))
         .arg("child")
         .env(CHILD_CASE, case)
         .env("SOURCE_DATE_EPOCH", source_date_epoch)
         .output()
-        .expect("spawn the child")
+        .expect("spawn the child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("running 1 test\n"),
+        "the `child` filter selected other tests too: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches(CHILD_RAN).count(),
+        1,
+        "the child case did not run exactly once: {stderr}"
+    );
+    output
 }
 
 /// The one JSON envelope the child printed.

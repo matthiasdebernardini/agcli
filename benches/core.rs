@@ -182,7 +182,7 @@ fn build_stream_cli(events: u8) -> AgentCli {
     AgentCli::new("bench", "Streaming benchmark CLI").command(
         Command::new("stream", "Stream log events")
             .usage("bench stream")
-            .stream_handler(move |_req, mut out| async move {
+            .stream_handler(move |_req, out| async move {
                 for i in 0..events {
                     out.emit(&StreamEvent::Log {
                         level: LogLevel::Info,

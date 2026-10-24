@@ -12,9 +12,9 @@ use crate::stream::StreamWriteError;
 /// The failure a command handler returns, and the one value every error
 /// envelope is built from.
 ///
-/// Outside the crate it is built only through [`CommandError::new`], which
-/// requires a `fix`: every error tells the agent how to recover. A struct
-/// literal does not compile:
+/// Outside the crate it is built through [`CommandError::new`], which
+/// requires a `fix`, or by `?` on a [`StreamWriteError`]: every error tells
+/// the agent how to recover. A struct literal does not compile:
 ///
 /// ```compile_fail
 /// use agcli::{CommandError, ErrorCode};

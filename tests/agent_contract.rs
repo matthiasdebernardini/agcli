@@ -113,7 +113,7 @@ async fn without_reserved_flags_an_undeclared_json_swallows_the_positional() {
 #[tokio::test]
 async fn a_successful_command_exits_zero_whatever_it_reports() {
     // A degraded backing service is still a successful report. Nothing in the
-    // result — not `"healthy": false`, not an error string — can move the exit
+    // result (not `"healthy": false`, not an error string) can move the exit
     // code; only `CommandOutput::exit_code` can.
     let cli = AgentCli::new("app", "Test CLI").command(
         Command::new("brain", "Report state")
@@ -191,7 +191,7 @@ async fn a_skipped_doctor_check_is_neither_pass_nor_fail() {
     // `status` is the one outcome field; there is no coarse `ok` beside it.
     assert!(checks[0].get("ok").is_none(), "{checks:?}");
     assert!(checks[1].get("ok").is_none(), "{checks:?}");
-    // A skip carries no `fix` — there is nothing to repair.
+    // A skip carries no `fix`: there is nothing to repair.
     assert!(checks[1].get("fix").is_none(), "{checks:?}");
 }
 

@@ -15,7 +15,7 @@ const DEPLOY_STEPS: [(&str, u8); 3] = [("build", 33), ("upload", 66), ("activate
 fn deploy_command() -> Command {
     Command::new("deploy", "Deploy a service, streaming each step")
         .usage("ops deploy <service>")
-        .stream_handler(|req, mut out| async move {
+        .stream_handler(|req, out| async move {
             let service = req.require_arg(0, "service")?.to_string();
             out.emit(&StreamEvent::Start {
                 command: format!("ops deploy {service}"),
@@ -55,7 +55,7 @@ fn deploy_command() -> Command {
 /// The whole `ops` CLI.
 fn cli() -> AgentCli {
     AgentCli::new("ops", "Agent-native operations CLI")
-        .version(env!("CARGO_PKG_VERSION"))
+        .version("1.0.0")
         .root_field("health", json!({ "server": "ok", "worker": "ok" }))
         .command(
             Command::new("status", "Show system health")
@@ -72,13 +72,13 @@ fn cli() -> AgentCli {
                                 "source",
                                 ActionParam::new()
                                     .enum_values(["worker", "errors", "server"])
-                                    .default("worker"),
+                                    .default_value("worker"),
                             )
                             .with_param(
                                 "lines",
                                 ActionParam::new()
                                     .description("Number of lines to show")
-                                    .default(20),
+                                    .default_value(20),
                             ),
                     ))
                 }),
@@ -118,7 +118,7 @@ fn cli() -> AgentCli {
         .command(deploy_command())
         // A raw passthrough command: it owns its argv, its stdout, and its
         // exit code. Nothing here is parsed, projected, or wrapped in an
-        // envelope — the shape a `grep` or a `cat` needs.
+        // envelope: the shape a `grep` or a `cat` needs.
         .command(
             Command::new(
                 "echo",
@@ -138,7 +138,7 @@ fn cli() -> AgentCli {
 
 #[tokio::main]
 async fn main() {
-    // Prints the envelope on stdout — or nothing at all, when a raw command
-    // already wrote its own — then exits with the typed code.
+    // Prints the envelope on stdout (or nothing at all, when a raw command
+    // already wrote its own), then exits with the typed code.
     cli().run_env().await.finish()
 }

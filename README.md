@@ -371,9 +371,12 @@ let logs = NextAction::new("ops logs <source> [--lines=<lines>]", "Inspect logs"
         "source",
         ActionParam::new()
             .enum_values(["worker", "errors", "server"])
-            .default("worker"),
+            .default_value("worker"),
     )
-    .with_param("lines", ActionParam::new().description("Number of lines to show").default(20));
+    .with_param(
+        "lines",
+        ActionParam::new().description("Number of lines to show").default_value(20),
+    );
 
 assert_eq!(
     serde_json::to_value(&logs).expect("a next_action serializes"),
@@ -779,7 +782,7 @@ use serde_json::json;
 let cli = AgentCli::new("ops", "Agent-native operations CLI").command(
     Command::new("deploy", "Deploy a service, streaming each step")
         .usage("ops deploy <service>")
-        .stream_handler(|req, mut out| async move {
+        .stream_handler(|req, out| async move {
             let service = req.require_arg(0, "service")?.to_string();
             for step in ["build", "upload"] {
                 out.emit(&StreamEvent::Step {
@@ -1015,8 +1018,9 @@ assert!(cli.audit().is_clean());
 ```
 
 The CLI's name is both the frontmatter `name` and the directory `--install`
-writes, so `audit()` reports `SKILL_NAME_INVALID` unless it is a slug: lowercase
-letters and digits, with single hyphens between them.
+writes, so `skill()` panics unless it is a slug: lowercase letters and digits,
+with single hyphens between them. A mistake in the CLI definition fails the
+build of the CLI, not an agent's invocation.
 
 ### The clock
 
@@ -1238,7 +1242,7 @@ assert_eq!(timestamp, "2026-06-10T14:42:17Z".parse::<Timestamp>().expect("RFC 33
 
 // An answer raised before argv parsed has no `type`: decode it as an `Envelope`.
 let answer: Envelope = serde_json::from_str(
-    r#"{"ok":false,"command":"app --=x","timestamp":"2026-06-10T14:42:17Z","exit_code":2,"error":{"message":"invalid flag syntax: --=x","code":"PARSE_ERROR","retryable":false},"fix":"Spell a long flag `--name` or `--name=value`, and a short flag `-n` or `-n=value`. Bundled short flags (`-abc`) take no value, so give a valued short flag on its own (`-a -b -c=5`).","next_actions":[{"command":"app","description":"Inspect root command tree"}]}"#,
+    r#"{"ok":false,"command":"app --=x","timestamp":"2026-06-10T14:42:17Z","exit_code":2,"error":{"message":"invalid flag syntax: --=x","code":"PARSE_ERROR","retryable":false},"fix":"Spell a long flag `--name` or `--name=value`, and a short flag `-n` or `-n=value`. Bundled short flags (`-abc`) take no value, so give a valued short flag on its own (`-a -b -c=5`).","next_actions":[{"command":"app","description":"Inspect the full command tree"}]}"#,
 )
 .expect("an envelope");
 assert!(!answer.ok());

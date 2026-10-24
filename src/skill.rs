@@ -3,7 +3,8 @@
 //! Help becomes a skill: the same self-documenting tree the root command
 //! returns as JSON is rendered as the markdown-with-frontmatter file an agent
 //! harness loads to learn a tool. An agent that can run the CLI once can
-//! bootstrap itself from it — no hand-written skill file to drift out of date.
+//! bootstrap itself from it, with no hand-written skill file to drift out of
+//! date.
 //!
 //! Wired up by [`crate::AgentCli::skill`]; readable directly through
 //! [`crate::AgentCli::skill_markdown`].
@@ -75,6 +76,12 @@ pub(crate) fn render(cli: &AgentCli) -> String {
              line carries `ok`, and it is always last: read until it.\n",
         );
     }
+    if any_raw(&docs) {
+        out.push_str(
+            "- A command marked raw prints its own output and exits with its own code: no \
+             envelope and no `next_actions`. Read its stdout as that tool's output.\n",
+        );
+    }
     let _ = writeln!(
         out,
         "- Run `{name}` alone for the full command tree. Add `--help` to a command for that \
@@ -94,14 +101,14 @@ pub(crate) fn render(cli: &AgentCli) -> String {
              one of true/false, 1/0, yes/no, on/off; any other value is `INVALID_FLAG`.\n\n",
         );
         for (flag, description) in RESERVED_FLAG_DOCS {
-            let _ = writeln!(out, "- `{flag}` — {description}");
+            let _ = writeln!(out, "- `{flag}`: {description}");
         }
         out.push('\n');
     }
 
     out.push_str("## Exit codes\n\n");
     for (code, description) in EXIT_CODE_DOCS {
-        let _ = writeln!(out, "- `{code}` — {description}");
+        let _ = writeln!(out, "- `{code}`: {description}");
     }
     out.push('\n');
 
@@ -110,7 +117,7 @@ pub(crate) fn render(cli: &AgentCli) -> String {
          its own; every error also carries `retryable` and `fix`.\n\n",
     );
     for (code, description) in ERROR_CODE_DOCS {
-        let _ = writeln!(out, "- `{code}` — {description}");
+        let _ = writeln!(out, "- `{code}`: {description}");
     }
 
     out
@@ -151,7 +158,7 @@ fn commands_into(out: &mut String, docs: &[CommandDoc], depth: usize) {
         };
         let _ = writeln!(
             out,
-            "{indent}- `{}` — {}{contract}",
+            "{indent}- `{}`: {}{contract}",
             doc.usage,
             collapse(doc.description)
         );
@@ -163,6 +170,11 @@ fn commands_into(out: &mut String, docs: &[CommandDoc], depth: usize) {
 fn any_stream(docs: &[CommandDoc]) -> bool {
     docs.iter()
         .any(|doc| doc.stream || any_stream(&doc.subcommands))
+}
+
+/// True when any command in the tree is raw.
+fn any_raw(docs: &[CommandDoc]) -> bool {
+    docs.iter().any(|doc| doc.raw || any_raw(&doc.subcommands))
 }
 
 /// Fold every run of whitespace into one space. A frontmatter line and a
@@ -193,9 +205,9 @@ fn yaml_scalar(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// True when `name` matches `^[a-z0-9]+(-[a-z0-9]+)*$` — the slug shape an
+/// True when `name` matches `^[a-z0-9]+(-[a-z0-9]+)*$`, the slug shape an
 /// agent-skill harness accepts as a frontmatter `name` and a directory name.
-pub(crate) fn is_slug(name: &str) -> bool {
+fn is_slug(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
         && !name.ends_with('-')
@@ -225,8 +237,22 @@ impl AgentCli {
     /// `<dir>/<name>/SKILL.md` and answers with the absolute `path` and its
     /// `bytes` instead of the markdown; under `--dry-run` it reports the path
     /// it would write and writes nothing.
+    ///
+    /// # Panics
+    ///
+    /// When the CLI's name is not a slug (lowercase letters and digits, with
+    /// single hyphens between them): the name is the skill's frontmatter
+    /// `name` and the directory `--install` writes, and a harness accepts
+    /// neither otherwise. A mistake in the CLI definition, so it fails the
+    /// build of the CLI, not an agent's invocation.
     #[must_use]
     pub fn skill(self) -> Self {
+        assert!(
+            is_slug(&self.name),
+            "CLI name {:?} is not a slug (lowercase letters, digits, and single hyphens between \
+             them), so it cannot name a skill",
+            self.name
+        );
         let usage = format!("{} skill [--install=<dir>]", self.name);
         let mut command = Command::new("skill", "Print this CLI as an agent skill (SKILL.md)")
             .usage(usage)
@@ -296,15 +322,9 @@ impl AgentCli {
             );
         }
 
-        // The name is the directory written under `dir`, so a name that is
-        // not a slug would nest (`a/b`) or escape (`..`) instead of naming a
-        // skill. `audit()` reports the same mistake before anything runs.
-        if !is_slug(&self.name) {
-            return self.skill_name_invalid(invocation, clock);
-        }
-
         // Absolute, so the reported path means the same thing to a caller with
-        // a different working directory.
+        // a different working directory. The name is a slug (`skill()` made
+        // sure), so the path stays one directory under `dir`.
         let relative = Path::new(dir).join(&self.name).join("SKILL.md");
         let file = match path::absolute(&relative) {
             Ok(file) => file,
@@ -357,37 +377,6 @@ impl AgentCli {
             Value::Object(result),
             vec![root_action()],
         )
-    }
-
-    /// `skill --install` refused because the CLI's name is not a slug. A bug
-    /// in the CLI definition, not the invocation, so it carries
-    /// [`ExitCode::ERROR`], not a usage code.
-    fn skill_name_invalid(&self, invocation: &Invocation, clock: &ClockFn) -> Execution {
-        Execution {
-            envelope: self
-                .build_error_envelope(
-                    invocation.command_line().to_string(),
-                    clock(),
-                    CommandError::new(
-                        ErrorCode::SKILL_NAME_INVALID,
-                        format!(
-                            "CLI name {:?} is not a slug (lowercase letters, digits, and single \
-                             hyphens between them), so it cannot name the skill's directory",
-                            self.name
-                        ),
-                        "Nothing was written. This is a bug in the CLI definition, not the \
-                         invocation: rename the CLI to a slug. `audit()` reports it as \
-                         SKILL_NAME_INVALID.",
-                    )
-                    .exit_code(ExitCode::ERROR)
-                    .next_action(NextAction::new(
-                        self.name.clone(),
-                        "Inspect the full command tree",
-                    )),
-                )
-                .into(),
-            output: Output::Envelope,
-        }
     }
 
     /// The `skill --install` write failed. Filesystem trouble is the caller's

@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn bare_long_flag_followed_by_flag_is_boolean() {
-        // `--verbose --debug` resolves both as bool — `--debug` starts another flag.
+        // `--verbose --debug` resolves both as bool: `--debug` starts another flag.
         let invocation = parse_no_bools(["app", "--verbose", "--debug"]).expect("should parse");
         assert_eq!(invocation.flag("verbose"), Some("true"));
         assert_eq!(invocation.flag("debug"), Some("true"));

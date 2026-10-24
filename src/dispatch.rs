@@ -137,21 +137,9 @@ impl AgentCli {
                 args_start,
                 prefix,
             } => {
-                // The tokens before a raw command's name are the framework's:
-                // a help or version flag there is answered, and a value that
-                // is not a boolean is refused, as on any other line. The
-                // command's own tokens, after its name, are never read.
-                if let Some(prefix) = &prefix {
-                    if let Some((name, value)) =
-                        reserved_flags::invalid_bool_flag(prefix.flags(), self.reserved_flags)
-                    {
-                        return self.invalid_bool_execution(prefix, &*clock, name, value);
-                    }
-                    if let Some(execution) = self.framework_route(prefix, &*clock) {
-                        return execution;
-                    }
-                }
-                return self.run_raw(handler, &argv, args_start, &clock, mode).await;
+                return self
+                    .raw_execution(handler, &argv, args_start, prefix.as_ref(), &clock, mode)
+                    .await;
             }
             ParsedArgv::Failed(error) => {
                 return self.error_execution(
@@ -232,8 +220,40 @@ impl AgentCli {
             );
         };
 
-        let request = CommandRequest::new(Arc::clone(&invocation), resolved.path.len());
+        let request = CommandRequest::new(
+            Arc::clone(&invocation),
+            resolved.path.len(),
+            Arc::clone(&clock),
+        );
         self.run_handler(&gate, handler, request, mode).await
+    }
+
+    /// Run the raw command that claimed argv from `args_start` on, once the
+    /// framework has answered for its own tokens: `prefix`, the parsed line up
+    /// to the command's name, when the name was not the leading token. A help
+    /// or version flag there is answered, and a value that is not a boolean
+    /// is refused, as on any other line. The command's own tokens, after its
+    /// name, are never read.
+    async fn raw_execution(
+        &self,
+        handler: &RawCommandHandler,
+        argv: &[String],
+        args_start: usize,
+        prefix: Option<&Invocation>,
+        clock: &Arc<ClockFn>,
+        mode: RunMode,
+    ) -> Execution {
+        if let Some(prefix) = prefix {
+            if let Some((name, value)) =
+                reserved_flags::invalid_bool_flag(prefix.flags(), self.reserved_flags)
+            {
+                return self.invalid_bool_execution(prefix, &**clock, name, value);
+            }
+            if let Some(execution) = self.framework_route(prefix, &**clock) {
+                return execution;
+            }
+        }
+        self.run_raw(handler, argv, args_start, clock, mode).await
     }
 
     /// Run a normal or streaming handler on `request`, under the panic hook
@@ -522,7 +542,7 @@ impl AgentCli {
     /// in the fix (`calc add`, or the program for the root tree).
     ///
     /// Without this, a typo'd flag (`--lmit 3`) is silently dropped and the
-    /// command runs with defaults — exit 0, wrong behavior, nothing for the
+    /// command runs with defaults: exit 0, wrong behavior, nothing for the
     /// agent to learn from.
     pub(crate) fn unknown_flag_error(
         &self,
@@ -546,7 +566,7 @@ impl AgentCli {
         let first_unknown = unknown.first()?;
         let mut declared_sorted: Vec<&str> = declared.iter().map(String::as_str).collect();
         declared_sorted.sort_unstable();
-        // Typo candidates cover the reserved and framework flags too —
+        // Typo candidates cover the reserved and framework flags too:
         // `--selct` should nudge toward `--select` even though no command
         // declares it. Declared first, so equal-distance ties resolve
         // deterministically toward the command's own flags.
@@ -602,7 +622,7 @@ impl AgentCli {
     }
 
     /// Reject surplus positional arguments. Without this, `tool delete
-    /// <id>` invoked with two ids silently drops the second — exit 0,
+    /// <id>` invoked with two ids silently drops the second: exit 0,
     /// wrong behavior, nothing for the agent to learn from. Bounded by the
     /// `<...>` placeholders in the leaf usage string; variadic usages
     /// (`...`) and `allow_extra_args()` commands opt out.
@@ -681,7 +701,7 @@ impl AgentCli {
         // A list result knows its row schema, so teach the cheaper call:
         // the same invocation re-run under --select. Only when the
         // projection would actually apply and the caller has not already
-        // selected — re-advertising a flag in use is context noise.
+        // selected: re-advertising a flag in use is context noise.
         let advertise_select = self.reserved_flags
             && command.applies_reserved_projection()
             && invocation.flag("select").is_none();
@@ -756,7 +776,7 @@ impl AgentCli {
     /// heuristic by [`Self::preliminary_command_path`] so that bare bool flags
     /// in the input don't accidentally consume tokens that might be command
     /// names. The final flag/positional split honors the resolved command
-    /// path's schema, not this global union — see [`Self::path_bool_flag_set`].
+    /// path's schema, not this global union; see [`Self::path_bool_flag_set`].
     fn global_bool_flag_set(&self) -> HashSet<String> {
         let mut set = HashSet::new();
         for command in self.commands.values() {
@@ -771,7 +791,7 @@ impl AgentCli {
     ///
     /// The result feeds [`Self::path_bool_flag_set`] so the actual parse in
     /// `dispatch` only sees bool flags declared by commands on
-    /// the resolved path — never flags declared by unrelated siblings.
+    /// the resolved path, never flags declared by unrelated siblings.
     fn preliminary_command_path<'a>(&'a self, argv: &[String]) -> Vec<&'a Command> {
         let union_bools = self.global_bool_flag_set();
         let Ok(invocation) = Invocation::parse(argv.iter().map(String::as_str), |flag| {
@@ -1022,8 +1042,8 @@ mod tests {
     #[tokio::test]
     async fn bool_flags_are_scoped_to_the_resolved_command() {
         // Regression: when two sibling commands declare the same flag name
-        // with conflicting semantics — `cmd_a` treats `--format` as bool,
-        // `cmd_b` takes it with a value — invoking `cmd_b --format json`
+        // with conflicting semantics (`cmd_a` treats `--format` as bool,
+        // `cmd_b` takes it with a value), invoking `cmd_b --format json`
         // must parse `json` as the flag's value, not as a positional. A
         // global-union bool-flag set would incorrectly mark `--format` as
         // bool everywhere and silently corrupt `cmd_b`'s arguments.

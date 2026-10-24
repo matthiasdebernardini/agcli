@@ -20,8 +20,8 @@ impl AgentCli {
     /// prints nothing.
     ///
     /// Under `run_env` the handler runs under the panic hook. A panicking raw
-    /// handler cannot get a JSON error envelope on stdout — that would corrupt
-    /// whatever it printed before dying — so the hook writes it to stderr.
+    /// handler cannot get a JSON error envelope on stdout, which would corrupt
+    /// whatever it printed before dying, so the hook writes it to stderr.
     pub(crate) async fn run_raw(
         &self,
         handler: &RawCommandHandler,
@@ -59,7 +59,7 @@ impl AgentCli {
     /// Pass 0 of dispatch: does argv name a raw command starting at `start`?
     /// Its handler, and where its own argv begins.
     ///
-    /// Walks argv against the command tree literally — no flag parsing,
+    /// Walks argv against the command tree literally, with no flag parsing,
     /// because a raw command's tokens are not the framework's to parse. The
     /// first command on that walk carrying a raw handler wins, and everything
     /// after its name is its argv. A token that names no command ends the

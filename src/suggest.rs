@@ -4,9 +4,9 @@ use std::mem;
 
 /// Corrective `fix` text for an unknown command/subcommand error.
 ///
-/// Lists every valid name inline so a *semantic* miss — e.g. guessing `list`
-/// when the verb is `history`, which no edit-distance check would ever relate —
-/// is corrected on the first read instead of triggering another blind guess.
+/// Lists every valid name inline so a *semantic* miss (guessing `list` when
+/// the verb is `history`, which no edit-distance check would ever relate) is
+/// corrected on the first read instead of triggering another blind guess.
 /// When the bad token also looks like a typo of a real name, a nearest-match
 /// nudge is prefixed. `next_actions` already carry the full templates; this puts
 /// the names where the agent reads first.
@@ -80,7 +80,7 @@ mod tests {
     async fn unknown_subcommand_fix_inlines_valid_names() {
         let cli = sample_cli();
         // `list` is a semantic miss (no edit-distance relation to `stream`), so
-        // no nudge — but the valid subcommand must be inlined so the agent
+        // no nudge, but the valid subcommand must be inlined so the agent
         // corrects in one read instead of guessing again.
         let run = cli.run(["wokhei", "gateway", "list"]).await;
         let Envelope::Error(envelope) = run.envelope() else {

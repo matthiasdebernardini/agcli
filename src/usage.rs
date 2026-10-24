@@ -93,7 +93,7 @@ pub(crate) struct Arity {
 }
 
 /// Count the positional placeholders a usage string declares. Returns `None`
-/// when arity cannot be bounded — the usage declares a variadic tail
+/// when arity cannot be bounded: the usage declares a variadic tail
 /// (`...`). Flag-value placeholders (`--flag <v>`, `[-n <count>]`,
 /// `--flag=<v>`) are not positionals and are skipped; plain words are the
 /// program/command-path literals.
@@ -151,7 +151,7 @@ pub(crate) fn flag_display(name: &str) -> String {
     }
 }
 
-/// Pull *every* flag name out of a usage string — value flags (`--flag <v>`,
+/// Pull *every* flag name out of a usage string: value flags (`--flag <v>`,
 /// `--flag=<v>`, bracketed or not) as well as booleans (`[--flag]`, `[-x]`).
 /// This is the declared-flag schema used to reject unknown flags, so it is
 /// deliberately permissive about surrounding syntax: any `--name` token in the
@@ -173,7 +173,7 @@ pub(crate) fn extract_all_flag_names(usage: &str, set: &mut HashSet<String>) {
             // Short *value* flags (`-n <count>`, bracketed or not). The
             // bool extractor above only sees bracketed forms without a
             // `<value>`, so without this arm a usage-declared `[-n <count>]`
-            // would be rejected as unknown — the framework refusing its own
+            // would be rejected as unknown, the framework refusing its own
             // advertised affordance. Letters only: `-1`-style tokens are
             // negative-number examples, not flags.
             let mut chars = rest.chars();
@@ -189,7 +189,7 @@ pub(crate) fn extract_all_flag_names(usage: &str, set: &mut HashSet<String>) {
 
 /// Pull boolean flag names out of a usage string. Recognizes bracketed
 /// optional flags of the form `[--name]` (and short `[-x]`). Skips any
-/// bracketed flag that carries a `<value>` placeholder or `=` — those are
+/// bracketed flag that carries a `<value>` placeholder or `=`: those are
 /// value flags, not booleans.
 pub(crate) fn extract_bool_flag_names(usage: &str, set: &mut HashSet<String>) {
     let bytes = usage.as_bytes();

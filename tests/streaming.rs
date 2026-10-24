@@ -21,7 +21,7 @@ fn stream_cli() -> AgentCli {
         .command(
             Command::new("deploy", "Deploy, streaming each step")
                 .usage("app deploy <service>")
-                .stream_handler(|req, mut out| async move {
+                .stream_handler(|req, out| async move {
                     let service = req.require_arg(0, "service")?.to_string();
                     for step in ["build", "ship"] {
                         out.emit(&StreamEvent::Step {
@@ -44,7 +44,7 @@ fn stream_cli() -> AgentCli {
         .command(
             Command::new("fail", "Stream, then fail")
                 .usage("app fail")
-                .stream_handler(|_req, mut out| async move {
+                .stream_handler(|_req, out| async move {
                     out.emit(&StreamEvent::Step {
                         name: "build".to_string(),
                         status: StepStatus::Failed,
@@ -212,7 +212,7 @@ async fn a_writer_kept_past_the_handler_is_closed() {
     let run = cli.run(["app", "leak"]).await;
     assert!(run.is_stream());
 
-    let mut out = stash
+    let out = stash
         .lock()
         .unwrap()
         .take()

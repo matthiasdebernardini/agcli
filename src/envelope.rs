@@ -136,6 +136,18 @@ impl SuccessEnvelope {
     }
 }
 
+/// Deserialize an optional key as the framework writes it: absent, or
+/// present with a value. A `null` is refused, since the framework leaves the
+/// key out instead of writing one.
+#[cfg(feature = "deserialize")]
+pub(crate) fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[cfg(feature = "deserialize")]
 impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -148,8 +160,10 @@ impl<'de> serde::Deserialize<'de> for SuccessEnvelope {
             command: String,
             timestamp: Timestamp,
             exit_code: ExitCode,
+            #[serde(default, deserialize_with = "present")]
             schema_version: Option<String>,
             result: Value,
+            #[serde(default, deserialize_with = "present")]
             select_warning: Option<String>,
             next_actions: Vec<NextAction>,
         }
@@ -284,15 +298,28 @@ impl<'de> serde::Deserialize<'de> for ErrorEnvelope {
             command: String,
             timestamp: Timestamp,
             exit_code: ExitCode,
+            #[serde(default, deserialize_with = "present")]
             schema_version: Option<String>,
             error: ErrorBody,
             fix: String,
+            #[serde(default, deserialize_with = "present")]
             data: Option<Value>,
             next_actions: Vec<NextAction>,
         }
         let raw = Raw::deserialize(deserializer)?;
         if raw.ok {
             return Err(de::Error::custom("expected ok=false for ErrorEnvelope"));
+        }
+        if raw.exit_code == ExitCode::SUCCESS {
+            return Err(de::Error::custom(
+                "an error envelope cannot carry exit_code 0",
+            ));
+        }
+        // `Value` reads `null` as a value; the framework never writes one.
+        if raw.data.as_ref().is_some_and(Value::is_null) {
+            return Err(de::Error::custom(
+                "`data` is null; an error without a payload leaves the key out",
+            ));
         }
         Ok(ErrorEnvelope {
             command: raw.command,
@@ -369,9 +396,10 @@ impl Envelope {
         }
     }
 
-    /// The envelope's timestamp.
+    /// The envelope's `timestamp`: the run's clock, read when the envelope was
+    /// built.
     #[must_use]
-    pub(crate) fn timestamp(&self) -> Timestamp {
+    pub fn timestamp(&self) -> Timestamp {
         match self {
             Self::Success(value) => value.timestamp,
             Self::Error(value) => value.timestamp,
@@ -611,7 +639,7 @@ mod tests {
             ActionParam::new()
                 .description("the id")
                 .value(json!(7))
-                .default(json!(1))
+                .default_value(json!(1))
                 .enum_values(["1", "7"])
                 .required(true)
         }
@@ -686,6 +714,9 @@ mod tests {
             rejects(with(&json, "exit_code", json!(256)));
             rejects(with(&json, "exit_code", json!(-1)));
             rejects(with(&json, "select_warning", json!(1)));
+            // The framework leaves an optional key out; it never writes null.
+            rejects(with(&json, "select_warning", json!(null)));
+            rejects(with(&json, "schema_version", json!(null)));
         }
 
         #[test]
@@ -741,6 +772,16 @@ mod tests {
                 json!({ "message": "x", "code": "X", "retryable": "no" }),
             ));
             rejects(with(&json, "next_actions", json!([{ "command": "app" }])));
+            // Shapes the framework never writes: a null payload or
+            // schema_version, an empty code, and an error that exits 0.
+            rejects(with(&json, "data", json!(null)));
+            rejects(with(&json, "schema_version", json!(null)));
+            rejects(with(
+                &json,
+                "error",
+                json!({ "message": "x", "code": "", "retryable": false }),
+            ));
+            rejects(with(&json, "exit_code", json!(0)));
         }
     }
 }

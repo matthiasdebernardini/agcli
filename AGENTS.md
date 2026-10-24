@@ -90,9 +90,10 @@ Builds go through `mbx`, a cargo wrapper the owner uses: `mbx check`,
 `mbx clippy`, `mbx nextest run`, `mbx test`, `mbx doc`,
 `mbx run --example calc -- add 3 5`, and `mbx +1.88 check` for another
 toolchain. Never run bare `cargo build`, `check`, `clippy` or `test`. Cargo
-commands that compile nothing are fine bare: `cargo fmt`, `cargo update`,
-`cargo package --list`, `cargo metadata`. CI runs the same gate with plain
-cargo.
+commands that compile nothing are fine bare: `cargo fmt`, `cargo machete`,
+`cargo update`, `cargo package --list`, `cargo metadata`. CI runs the gate
+with plain cargo, without the local style scan, and checks the MSRV in a job
+of its own.
 
 ## The gate
 
@@ -100,6 +101,7 @@ A change is done when every one of these passes:
 
 ```bash
 cargo fmt --all -- --check
+cargo machete
 mbx clippy --all-targets --all-features -- -W clippy::all -W clippy::pedantic -D warnings
 mbx clippy --all-targets -- -W clippy::all -W clippy::pedantic -D warnings
 mbx nextest run --all-features
@@ -113,6 +115,7 @@ mbx +1.88 check --all-targets --all-features
 
 - nextest cannot run doctests, so `mbx test --doc` runs them. That includes
   every Rust block in README.md.
+- `cargo machete` fails on a dependency nothing uses.
 - `ast-grep scan --error` fails on a finding of any severity.
 - The Google Rust style scan comes from the google-rust-style skill and must
   report zero warnings.
@@ -179,7 +182,11 @@ To release `vX.Y.Z`:
    `## [Unreleased]`.
 2. Set `version = "X.Y.Z"` in Cargo.toml and run `cargo update --workspace`,
    which updates agcli's own entry in Cargo.lock.
-3. Rename `## [Unreleased]` in CHANGELOG.md to `## [X.Y.Z] - YYYY-MM-DD`.
+3. Rename `## [Unreleased]` in CHANGELOG.md to the linked heading every
+   release uses:
+   `## [X.Y.Z](https://github.com/matthiasdebernardini/agcli/releases/tag/vX.Y.Z) - YYYY-MM-DD`.
+   release.yml matches the `## [X.Y.Z]` prefix, so the link does not get in
+   its way.
 4. Run the gate. `cargo package --list --allow-dirty` shows what the `include`
    list in Cargo.toml ships.
 5. Commit as `chore: release vX.Y.Z` and push to `master`.

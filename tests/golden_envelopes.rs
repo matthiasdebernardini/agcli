@@ -1,7 +1,7 @@
 //! Golden-envelope tests: pin the exact bytes the framework emits for the
 //! canonical invocation classes. The envelope is hand-serialized
 //! (`src/envelope.rs`), so a field reorder or rename is a breaking change
-//! agents feel instantly — these tests turn schema drift into a red test
+//! agents feel instantly: these tests turn schema drift into a red test
 //! instead of a downstream agent outage, and double as a living spec.
 //!
 //! Timestamps are pinned with `AgentCli::clock(|| 0)`.
@@ -59,7 +59,7 @@ async fn run(args: &[&str]) -> String {
 
 /// Each case: (name, argv, expected exact JSON line).
 /// Regenerate an entry by running the invocation against `golden_cli()` and
-/// reading stdout — but treat any diff as a schema break to justify.
+/// reading stdout, but treat any diff as a schema break to justify.
 macro_rules! golden {
     ($name:ident, $args:expr, $expected:expr) => {
         #[tokio::test]

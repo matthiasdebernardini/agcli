@@ -5,14 +5,18 @@
 //! binary re-executes itself with `child` as its only argument, which makes
 //! the harness run just the `child` test below, and `AGCLI_TEST_CHILD` names
 //! the case. That test builds a tiny CLI whose one command is also named
-//! `child` — the harness's filter argument is the CLI's argv too — and runs it
+//! `child` (the harness's filter argument is the CLI's argv too) and runs it
 //! with `run_env` on a multi-thread runtime.
 //!
 //! The harness prints its own `running 1 test` line on stdout first, so the
-//! assertions read only the JSON lines.
+//! assertions read only the JSON lines. Before it does anything else the child
+//! writes [`CHILD_RAN`] to stderr, and the parent checks for it once and for
+//! the `running 1 test` line, so a child the filter never reached, or a
+//! filter that reached a second test too, fails instead of passing by
+//! accident.
 
 use std::env;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{self, Command as Process, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,6 +27,9 @@ use tokio::runtime::{self, Runtime};
 /// Names the case the `child` test runs.
 const CHILD_CASE: &str = "AGCLI_TEST_CHILD";
 
+/// The line the child writes to stderr as it starts its case.
+const CHILD_RAN: &str = "AGCLI_TEST_CHILD_RAN panic_hook::child";
+
 /// The child CLI's clock, in Unix seconds: `0` unless a case moves it.
 static CLOCK: AtomicU64 = AtomicU64::new(0);
 
@@ -32,6 +39,8 @@ fn child() {
     let Ok(case) = env::var(CHILD_CASE) else {
         return;
     };
+    // Through the handle, not `eprintln!`: the harness captures the macros.
+    writeln!(io::stderr(), "{CHILD_RAN}").expect("write the sentinel");
     let command = Command::new("child", "The command under test");
     let command = match case.as_str() {
         "body" => command.handler(|_req| async move {
@@ -52,7 +61,7 @@ fn child() {
         "raw" => command.raw_handler(|_args| async move {
             panic!("panic in the raw handler");
         }),
-        "stream" => command.stream_handler(|_req, mut out| async move {
+        "stream" => command.stream_handler(|_req, out| async move {
             out.emit(&StreamEvent::Start {
                 command: "child".to_string(),
             })?;
@@ -99,15 +108,34 @@ fn child() {
     execution.finish()
 }
 
-/// Re-run this test binary as the `case` child.
+/// Re-run this test binary as the `case` child, and check that the `child`
+/// test alone ran and reached its case.
 fn run_case(case: &str) -> Output {
-    Process::new(env::current_exe().expect("current exe"))
+    let output = Process::new(env::current_exe().expect("current exe"))
         .arg("child")
         .env(CHILD_CASE, case)
         // Uncaptured, so the previous hook's panic message reaches stderr.
         .env("RUST_TEST_NOCAPTURE", "1")
         .output()
-        .expect("spawn the child")
+        .expect("spawn the child");
+    assert_one_child_ran(&output);
+    output
+}
+
+/// Assert the harness ran one test in the child and that it was the `child`
+/// case: the sentinel appears on stderr exactly once.
+fn assert_one_child_ran(output: &Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("running 1 test\n"),
+        "the `child` filter selected other tests too: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches(CHILD_RAN).count(),
+        1,
+        "the child case did not run exactly once: {stderr}"
+    );
 }
 
 /// Every line of `bytes` that is a JSON object.
@@ -244,6 +272,10 @@ fn printing_to_a_closed_stdout_does_not_panic() {
             "child stdout ended early"
         );
     }
+    assert_eq!(
+        line, "running 1 test\n",
+        "the filter selected other tests too"
+    );
     drop(stdout);
     drop(process.stdin.take());
 
@@ -251,4 +283,6 @@ fn printing_to_a_closed_stdout_does_not_panic() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
+    // The case ran: without this the test passes when the child never prints.
+    assert_eq!(stderr.matches(CHILD_RAN).count(), 1, "{stderr}");
 }

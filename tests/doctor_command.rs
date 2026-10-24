@@ -1,8 +1,8 @@
-//! `AgentCli::doctor_with` — a `doctor` command the consumer owns.
+//! `AgentCli::doctor_with`: a `doctor` command the consumer owns.
 //!
 //! The framework supplies the check-running handler and the health envelope;
-//! the [`Command`] — its name, description, usage string and therefore its
-//! declared flags — comes from the caller. These tests pin the contract that
+//! the [`Command`] (its name, description, usage string and therefore its
+//! declared flags) comes from the caller. These tests pin the contract that
 //! made it necessary: a `doctor` that takes `--profile <name>` must accept the
 //! flag and hand it to the checks, and the sugar `doctor(checks)` must keep
 //! behaving exactly as it did.
@@ -10,7 +10,7 @@
 use agcli::{AgentCli, Check, CheckResult, Command, Envelope, ErrorCode, ExitCode};
 use serde_json::json;
 
-/// A `doctor` that declares `--profile` and reports which profile it checked —
+/// A `doctor` that declares `--profile` and reports which profile it checked,
 /// the nashcode shape: verify the named profile, or the active one.
 fn profile_cli() -> AgentCli {
     AgentCli::new("app", "Test CLI").doctor_with(
@@ -43,7 +43,7 @@ fn first_detail(execution: &agcli::Execution) -> String {
 #[tokio::test]
 async fn a_declared_flag_reaches_the_check() {
     let cli = profile_cli();
-    // Before the command name — the form that used to exit 2 UNKNOWN_FLAG,
+    // Before the command name, the form that used to exit 2 UNKNOWN_FLAG,
     // because the hardcoded usage string was the flag schema.
     let run = cli.run(["app", "--profile", "ci", "doctor"]).await;
     assert_eq!(run.exit_code(), ExitCode::SUCCESS);
@@ -108,7 +108,7 @@ async fn a_failing_request_check_drives_the_exit_code() {
         ],
     );
     let run = cli.run(["app", "doctor", "--profile=ci"]).await;
-    // Still an ok:true envelope — the report ran — carrying the typed code.
+    // Still an ok:true envelope (the report ran), carrying the typed code.
     assert_eq!(success(&run).result["healthy"], json!(false));
     assert_eq!(run.exit_code(), ExitCode::AUTH);
     assert!(first_detail(&run).contains("ci"));
@@ -164,7 +164,7 @@ async fn the_command_may_be_named_anything() {
     let run = cli.run(["app", "health"]).await;
     assert_eq!(success(&run).result["healthy"], json!(true));
 
-    // No usage string given, so the framework fills in `<cli> <name>` — which
+    // No usage string given, so the framework fills in `<cli> <name>`, which
     // keeps flag validation on rather than silently disabling it.
     let run = cli.run(["app"]).await;
     let commands = success(&run).result["commands"].clone();

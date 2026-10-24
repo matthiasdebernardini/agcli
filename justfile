@@ -3,6 +3,7 @@
 # the one target nothing checks.
 gate:
     cargo fmt --all -- --check
+    cargo machete
     mbx clippy --all-targets --all-features -- -W clippy::all -W clippy::pedantic -D warnings
     mbx clippy --all-targets -- -W clippy::all -W clippy::pedantic -D warnings
     mbx nextest run --all-features

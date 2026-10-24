@@ -85,8 +85,8 @@ pub(crate) enum Builtin {
     /// out of an unhealthy report.
     Doctor,
     /// The `skill` command registered by [`AgentCli::skill`]. It renders the
-    /// whole command tree, which no handler closure can see — the closure is
-    /// owned by the very tree it would have to read — so the framework
+    /// whole command tree, which no handler closure can see (the closure is
+    /// owned by the very tree it would have to read), so the framework
     /// dispatches it itself, the way it dispatches root and help.
     Skill,
 }
@@ -195,9 +195,12 @@ impl Command {
     /// # let _ = logs;
     /// ```
     ///
-    /// The framework boxes the future. A command has one handler slot: a
-    /// later [`Command::stream_handler`] or [`Command::raw_handler`] call
-    /// replaces this handler.
+    /// The framework boxes the future. The closure is `Fn`, so it may run
+    /// more than once: state it owns reaches the future by a clone per call,
+    /// `move |req| { let db = Arc::clone(&db); async move { .. } }`, not by a
+    /// move out of the closure. A command has one handler slot: a later
+    /// [`Command::stream_handler`] or [`Command::raw_handler`] call replaces
+    /// this handler.
     #[must_use]
     pub fn handler<F, Fut>(mut self, f: F) -> Self
     where
@@ -231,7 +234,7 @@ impl Command {
     ///
     /// let deploy = Command::new("deploy", "Deploy a service")
     ///     .usage("ops deploy <service>")
-    ///     .stream_handler(|req, mut out| async move {
+    ///     .stream_handler(|req, out| async move {
     ///         let service = req.require_arg(0, "service")?.to_string();
     ///         out.emit(&StreamEvent::Step {
     ///             name: "build".to_string(),

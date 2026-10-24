@@ -6,29 +6,42 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::clock::ClockFn;
 use crate::codes::{ErrorCode, ExitCode};
 use crate::command_error::CommandError;
 use crate::invocation::Invocation;
 use crate::reserved_flags;
 use crate::select;
+use crate::timestamp::Timestamp;
 use crate::usage;
 
-/// What a handler receives: the parsed invocation and where the command path
-/// ends in it.
+/// What a handler receives: the parsed invocation, where the command path
+/// ends in it, and the run's clock.
 ///
 /// Owned and cheap to clone (the invocation sits behind an [`Arc`]), so a
 /// handler takes it by value and moves it into its `async move` block:
 /// `.handler(|req| async move { let a: f64 = req.arg_parse(0, "a")?; .. })`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CommandRequest {
     invocation: Arc<Invocation>,
     /// How many leading positionals name the command (`["gateway", "stream"]`
     /// is 2). The rest are the command's own arguments.
     path_len: usize,
+    /// The run's clock, for [`CommandRequest::now`].
+    clock: Arc<ClockFn>,
+}
+
+impl fmt::Debug for CommandRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommandRequest")
+            .field("invocation", &self.invocation)
+            .field("path_len", &self.path_len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CommandRequest {
-    pub(crate) fn new(invocation: Arc<Invocation>, path_len: usize) -> Self {
+    pub(crate) fn new(invocation: Arc<Invocation>, path_len: usize, clock: Arc<ClockFn>) -> Self {
         debug_assert!(
             path_len <= invocation.positionals().len(),
             "command path is longer than the positionals it came from"
@@ -36,7 +49,18 @@ impl CommandRequest {
         Self {
             invocation,
             path_len,
+            clock,
         }
+    }
+
+    /// The run's clock, read now: the second to stamp a result with, such as
+    /// a `created_at`. It is the clock every `timestamp` and `ts` of the run
+    /// comes from, so a test that pins it with
+    /// [`AgentCli::clock`](crate::AgentCli::clock) gets byte-stable output
+    /// from the handler too.
+    #[must_use]
+    pub fn now(&self) -> Timestamp {
+        (self.clock)()
     }
 
     /// The whole parsed command line: the program, every flag and every
@@ -228,7 +252,10 @@ impl CommandRequest {
         reserved_flags::bool_flag_on(self.flag("dry-run"))
     }
 
-    /// `--quiet`: suppress non-essential output.
+    /// `--quiet`: the caller wants no `next_actions` on success. The framework
+    /// drops them itself; a handler reads this to skip work whose output the
+    /// flag will drop, such as building those actions, or to stop narrating
+    /// on stderr.
     #[must_use]
     pub fn quiet(&self) -> bool {
         reserved_flags::bool_flag_on(self.flag("quiet"))
@@ -253,7 +280,11 @@ impl CommandRequest {
         reserved_flags::bool_flag_on(self.flag("no-color"))
     }
 
-    /// `--compact`: caller asked for high-gravity fields only.
+    /// `--compact`: the caller wants only the fields the command declares
+    /// with [`CommandOutput::compact_fields`](crate::CommandOutput::compact_fields),
+    /// or else no nulls and empty containers. The framework projects the
+    /// result itself; a handler reads this to skip work whose output the
+    /// projection will drop.
     #[must_use]
     pub fn compact(&self) -> bool {
         reserved_flags::bool_flag_on(self.flag("compact"))
@@ -280,7 +311,7 @@ impl CommandRequest {
 
 /// True unless `value` is a non-finite `f64`/`f32`. String parsing accepts
 /// `"inf"`/`"NaN"` for the float types, but `serde_json` serializes non-finite
-/// floats as `null` — an envelope-corrupting value the typed helpers refuse
+/// floats as `null`, an envelope-corrupting value the typed helpers refuse
 /// to produce.
 fn parsed_value_is_finite<T: Any>(value: &T) -> bool {
     let any = value as &dyn Any;
@@ -303,7 +334,34 @@ mod tests {
 
     fn request(args: &[&str]) -> CommandRequest {
         let invocation = Invocation::parse(args.iter().copied(), |_| false).expect("should parse");
-        CommandRequest::new(Arc::new(invocation), 0)
+        CommandRequest::new(Arc::new(invocation), 0, Arc::new(|| Timestamp::UNIX_EPOCH))
+    }
+
+    #[tokio::test]
+    async fn now_reads_the_runs_clock() {
+        // A handler stamping its own fields reads the clock the envelope and
+        // the stream events read, so a pinned clock makes those byte-stable
+        // too.
+        let cli = AgentCli::new("app", "x").clock(|| 1_740_000_000).command(
+            Command::new("make", "make")
+                .usage("app make")
+                .handler(|req| async move {
+                    Ok(CommandOutput::new(json!({ "created_at": req.now() })))
+                }),
+        );
+        let run = cli.run(["app", "make"]).await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope, got {}", run.to_json());
+        };
+        assert_eq!(envelope.result["created_at"], json!("2025-02-19T21:20:00Z"));
+        assert_eq!(
+            envelope.timestamp,
+            envelope.result["created_at"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        );
     }
 
     #[test]

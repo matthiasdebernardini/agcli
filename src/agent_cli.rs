@@ -215,7 +215,7 @@ impl AgentCli {
     /// Build a success `Execution` for a framework-rendered (root / help /
     /// version) result, honoring the reserved output flags. The root tree
     /// advertises `--select` / `--compact` / `--quiet` on *every* command, so
-    /// these paths must honor them too — the root tree of a large CLI is
+    /// these paths must honor them too: the root tree of a large CLI is
     /// exactly where an agent wants `--select=commands`. (The handler path
     /// has its own application with per-command `compact_fields` support.)
     /// The envelope's timestamp is read from `clock` now.
@@ -323,7 +323,7 @@ impl AgentCli {
     /// error (parse failure, unknown command/subcommand, missing handler) is
     /// a usage error, so it carries [`ExitCode::USAGE`] whatever `error` says
     /// and is not retryable: the same invocation fails the same way.
-    /// Handler-raised errors do not go through here — they honor the
+    /// Handler-raised errors do not go through here: they honor the
     /// handler's own exit code and retry hint in `handler_error`. The
     /// envelope's timestamp is read from `clock` now.
     pub(crate) fn error_execution(

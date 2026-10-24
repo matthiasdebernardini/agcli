@@ -8,15 +8,15 @@
 //! agent exactly what to fix.
 //!
 //! A check has three outcomes, not two. [`CheckResult::skip`] reports that the
-//! check never ran — no credentials configured, an optional dependency absent,
+//! check never ran: no credentials configured, an optional dependency absent,
 //! a platform the check does not apply to. A skipped check is not a failure: it
 //! leaves `healthy` true and never drives the exit code. Folding "did not run"
 //! into "passed" would tell an agent something was verified when nothing was.
 //!
 //! Every check reads the invocation that triggered it: [`Check::new`] hands
 //! the check the same [`CommandRequest`] a handler gets, so a `doctor` command
-//! that declares its own flags — a `--profile <name>` selecting which
-//! credentials to verify — can act on them instead of always checking the
+//! that declares its own flags (a `--profile <name>` selecting which
+//! credentials to verify) can act on them instead of always checking the
 //! default. Declare those flags on the
 //! [`crate::Command`] you pass to [`crate::AgentCli::doctor_with`]; the usage
 //! string is the flag schema.
@@ -372,7 +372,7 @@ mod tests {
             .exit_code(ExitCode::AUTH),
         ]);
         let run = cli.run(["app", "doctor"]).await;
-        // Still an ok:true envelope — the report succeeded — but exit code 4.
+        // Still an ok:true envelope (the report succeeded), but exit code 4.
         let Envelope::Success(envelope) = run.envelope() else {
             panic!("expected success envelope");
         };

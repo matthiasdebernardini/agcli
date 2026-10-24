@@ -85,12 +85,12 @@ impl From<ExitCode> for std::process::ExitCode {
 /// A machine-readable failure class: the envelope's `error.code`.
 ///
 /// The constants are the codes the framework itself raises; a command names
-/// its own with [`ErrorCode::new`]. The code is a type of its own, not a
-/// string, so it cannot trade places with the message or the fix in
+/// its own with [`ErrorCode::new`], or [`ErrorCode::owned`] for one built at
+/// run time. The code is a type of its own, not a string, so it cannot trade
+/// places with the message or the fix in
 /// [`CommandError::new`](crate::CommandError::new). Serialized as the plain
-/// string.
+/// string, and never empty.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
-#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[serde(transparent)]
 pub struct ErrorCode(Cow<'static, str>);
 
@@ -127,14 +127,31 @@ impl ErrorCode {
     pub const SERIALIZATION_FAILED: Self = Self::new("SERIALIZATION_FAILED");
     /// The framework could not write a file the command was asked to produce.
     pub const WRITE_FAILED: Self = Self::new("WRITE_FAILED");
-    /// The CLI's name is not a slug, so `skill --install` cannot name the
-    /// skill's directory. A bug in the CLI definition.
-    pub const SKILL_NAME_INVALID: Self = Self::new("SKILL_NAME_INVALID");
 
-    /// The error code `code`, conventionally `SCREAMING_SNAKE_CASE`.
+    /// The error code `code`, conventionally `SCREAMING_SNAKE_CASE`, known
+    /// at compile time.
+    ///
+    /// # Panics
+    ///
+    /// When `code` is empty: an empty code names no failure class.
     #[must_use]
     pub const fn new(code: &'static str) -> Self {
+        assert!(!code.is_empty(), "an error code cannot be empty");
         Self(Cow::Borrowed(code))
+    }
+
+    /// The error code `code` built at run time, such as
+    /// `ErrorCode::owned(format!("HTTP_{status}"))`. [`ErrorCode::new`] is
+    /// the form for a code known at compile time.
+    ///
+    /// # Panics
+    ///
+    /// When `code` is empty: an empty code names no failure class.
+    #[must_use]
+    pub fn owned(code: impl Into<String>) -> Self {
+        let code = code.into();
+        assert!(!code.is_empty(), "an error code cannot be empty");
+        Self(Cow::Owned(code))
     }
 
     /// The code as a string.
@@ -147,6 +164,24 @@ impl ErrorCode {
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Strict: the plain string, and never empty, since no code the framework or
+/// a command writes is.
+#[cfg(feature = "deserialize")]
+impl<'de> serde::Deserialize<'de> for ErrorCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let code = String::deserialize(deserializer)?;
+        if code.is_empty() {
+            return Err(D::Error::custom("an error code cannot be empty"));
+        }
+        Ok(Self(Cow::Owned(code)))
     }
 }
 
@@ -237,10 +272,6 @@ pub(crate) const ERROR_CODE_DOCS: &[(ErrorCode, &str)] = &[
         ErrorCode::WRITE_FAILED,
         "the framework could not write a file the command was asked to produce",
     ),
-    (
-        ErrorCode::SKILL_NAME_INVALID,
-        "the CLI's name is not a slug, so `skill --install` cannot name the skill's directory; a bug in the CLI definition, not the invocation",
-    ),
 ];
 
 /// Turn `(key, description)` doc entries into a JSON object for the root
@@ -282,6 +313,41 @@ mod tests {
         );
         assert_eq!(ErrorCode::new("CUSTOM").to_string(), "CUSTOM");
         assert_eq!(ErrorCode::INVALID_ENV.as_str(), "INVALID_ENV");
+    }
+
+    #[test]
+    fn an_owned_code_is_the_same_code() {
+        // A code built at run time, such as from an HTTP status.
+        let status = 404;
+        let owned = ErrorCode::owned(format!("HTTP_{status}"));
+        assert_eq!(owned, ErrorCode::new("HTTP_404"));
+        assert_eq!(owned.as_str(), "HTTP_404");
+        assert_eq!(
+            serde_json::to_value(&owned).expect("serialize"),
+            serde_json::json!("HTTP_404")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "an error code cannot be empty")]
+    fn an_empty_owned_code_panics() {
+        let _ = ErrorCode::owned(String::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "an error code cannot be empty")]
+    fn an_empty_code_panics() {
+        let _ = ErrorCode::new("");
+    }
+
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn an_empty_code_does_not_deserialize() {
+        assert!(serde_json::from_str::<ErrorCode>(r#""""#).is_err());
+        assert_eq!(
+            serde_json::from_str::<ErrorCode>(r#""HTTP_404""#).expect("a code"),
+            ErrorCode::new("HTTP_404")
+        );
     }
 
     #[test]

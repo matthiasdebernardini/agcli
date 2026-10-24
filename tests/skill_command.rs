@@ -1,4 +1,4 @@
-//! `AgentCli::skill` — help becomes a skill.
+//! `AgentCli::skill`: help becomes a skill.
 //!
 //! The built-in `skill` command renders the live command tree as a `SKILL.md`
 //! document, so an agent that can run the binary once can bootstrap itself
@@ -105,6 +105,15 @@ fn a_raw_command_is_marked_as_raw() {
         markdown.contains("(raw: prints the tool's own output, not an envelope)"),
         "{markdown}"
     );
+    // The contract says what a raw command prints instead of an envelope.
+    assert!(
+        markdown.contains("- A command marked raw prints its own output"),
+        "{markdown}"
+    );
+    assert!(
+        !app().skill_markdown().contains("marked raw"),
+        "no raw command, no raw bullet"
+    );
 }
 
 #[tokio::test]
@@ -197,33 +206,6 @@ async fn dry_run_is_honored_without_the_reserved_flags() {
 }
 
 #[tokio::test]
-async fn install_refuses_a_name_that_is_not_a_slug() {
-    // The name is the directory under `--install`: `a/b` would nest, and
-    // `..` would escape. The audit reports the name; the command refuses it.
-    let dir = scratch_dir("slug");
-    let flag = format!("--install={}", dir.display());
-    let cli = AgentCli::new("a/b", "Test CLI").skill();
-    let run = cli.run(["a/b", "skill", &flag]).await;
-    let Envelope::Error(envelope) = run.envelope() else {
-        panic!("expected an error envelope, got {}", run.to_json());
-    };
-    assert_eq!(envelope.error.code, ErrorCode::SKILL_NAME_INVALID);
-    assert_eq!(run.exit_code(), ExitCode::ERROR);
-    assert!(
-        envelope.fix.contains("Nothing was written"),
-        "{}",
-        envelope.fix
-    );
-    assert!(!dir.join("a").exists(), "a nested directory was written");
-
-    // The document itself is still readable.
-    let run = cli.run(["a/b", "skill"]).await;
-    assert!(success(&run).result["markdown"].is_string());
-
-    fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test]
 async fn a_bare_install_flag_is_rejected() {
     // `--install` with no value parses as the boolean sentinel "true"; writing
     // ./true/app/SKILL.md and reporting success would be a wrong answer.
@@ -261,26 +243,14 @@ async fn an_unknown_flag_beats_a_missing_handler() {
 }
 
 #[test]
-fn audit_rejects_a_cli_name_that_is_not_a_slug() {
-    let report = AgentCli::new("My App", "Test CLI").skill().audit();
-    assert!(
-        report
-            .findings
-            .iter()
-            .any(|f| f.code == "SKILL_NAME_INVALID"),
-        "{:?}",
-        report.findings
-    );
+fn a_slug_name_passes_the_audit_and_the_builder() {
     // Without the skill command the name is nobody's business.
-    assert!(
-        !AgentCli::new("My App", "Test CLI")
-            .audit()
-            .findings
-            .iter()
-            .any(|f| f.code == "SKILL_NAME_INVALID")
-    );
-    // A slug name is clean.
-    assert!(app().audit().is_clean(), "{:?}", app().audit().findings);
+    assert!(AgentCli::new("My App", "Test CLI").audit().is_clean());
+    // A slug name registers the skill and audits clean.
+    for name in ["app", "my-app", "app2", "a-b-c"] {
+        let cli = AgentCli::new(name, "Test CLI").skill();
+        assert!(cli.audit().is_clean(), "{name}: {:?}", cli.audit().findings);
+    }
 }
 
 #[tokio::test]

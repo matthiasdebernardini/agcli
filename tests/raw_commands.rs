@@ -3,7 +3,7 @@
 //! A raw command owns its argv, its stdout, and its exit code. These tests
 //! pin the three halves of that contract: argv arrives verbatim, none of the
 //! framework's parse-time gates fire, and the exit code the handler returns
-//! survives — including `1` meaning "no matches", not "failure".
+//! survives, including `1` meaning "no matches", not "failure".
 //!
 //! The handler records what it received in a shared capture, which is the
 //! observable side channel a test has: the real stdout goes to the process,
@@ -13,6 +13,7 @@
 
 use std::env;
 use std::future::{self, Ready};
+use std::io::{self, Write};
 use std::iter;
 use std::process::{self, Output};
 use std::sync::{Arc, Mutex};
@@ -285,7 +286,7 @@ async fn a_line_the_parser_rejects_still_reaches_the_handler() {
 async fn a_value_flag_may_repeat_the_command_name() {
     // `--select` eats the first `grep` as its value; the second is the
     // command. Splitting argv by searching for the command name would hand the
-    // handler ["grep", "pat"] — the parser's positional indices get it right.
+    // handler ["grep", "pat"]; the parser's positional indices get it right.
     let (execution, seen) = run(
         &raw_cli(ExitCode::SUCCESS),
         &["app", "--select", "grep", "grep", "pat"],
@@ -460,6 +461,10 @@ const CHILD_ARGV: &str = "AGCLI_TEST_CHILD_ARGV";
 /// argument contains it).
 const ARGV_SEPARATOR: char = '\u{1f}';
 
+/// The line the child writes to stderr as it starts, so the parent knows the
+/// child ran exactly once rather than passing on an empty stdout.
+const CHILD_RAN: &str = "AGCLI_TEST_CHILD_RAN raw_commands::raw_echo_child";
+
 /// The libtest harness's own first output on the child's stdout, before the
 /// child test runs and ends the process.
 const HARNESS_PREAMBLE: &str = "\nrunning 1 test\n";
@@ -473,6 +478,9 @@ fn raw_echo_child() {
     let Ok(argv) = env::var(CHILD_ARGV) else {
         return;
     };
+    // The child's stdout is the command's own, so the sentinel goes to
+    // stderr, through the handle rather than `eprintln!`.
+    writeln!(io::stderr(), "{CHILD_RAN}").expect("write the sentinel");
     let cli = AgentCli::new("app", "Raw end-to-end test CLI").command(
         Command::new("echo", "Print each argument on its own line")
             .usage("app echo [args...]")
@@ -512,7 +520,7 @@ fn run_app(args: &[&str]) -> Output {
         }
         joined.push_str(arg);
     }
-    process::Command::new(env::current_exe().expect("current exe"))
+    let output = process::Command::new(env::current_exe().expect("current exe"))
         .args([
             "--exact",
             "raw_echo_child",
@@ -521,7 +529,14 @@ fn run_app(args: &[&str]) -> Output {
         ])
         .env(CHILD_ARGV, joined)
         .output()
-        .expect("spawn the child")
+        .expect("spawn the child");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches(CHILD_RAN).count(),
+        1,
+        "the child did not run exactly once: {stderr}"
+    );
+    output
 }
 
 /// The bytes the command itself wrote on the child's stdout.
