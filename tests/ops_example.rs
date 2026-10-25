@@ -88,6 +88,30 @@ mod ops {
             .expect("the full log was written");
         std::fs::remove_file(path).expect("remove the full log");
     }
+
+    #[tokio::test]
+    async fn a_value_flag_before_the_command_is_given_no_value() {
+        // `logs` is the command, never the value of `--lines`, so `--lines`
+        // was given nothing, as it is at the end of the line.
+        for argv in [
+            ["ops", "--lines", "logs", "worker"],
+            ["ops", "logs", "worker", "--lines"],
+        ] {
+            let run = cli().run(argv).await;
+            let envelope: serde_json::Value = serde_json::from_str(&run.to_json()).expect("JSON");
+            assert_eq!(
+                envelope["error"]["code"],
+                json!("INVALID_FLAG"),
+                "{argv:?}: {envelope}"
+            );
+            assert_eq!(
+                envelope["error"]["message"],
+                json!("flag --lines was given no value"),
+                "{argv:?}: {envelope}"
+            );
+            assert_eq!(envelope["exit_code"], json!(2), "{argv:?}: {envelope}");
+        }
+    }
 }
 
 #[test]

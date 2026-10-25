@@ -29,8 +29,8 @@ pub struct Invocation {
     positionals: Vec<String>,
     /// For each entry of `positionals`, its index in `raw_args`. Recovering
     /// this after the fact by searching `raw_args` for the token does not
-    /// work: a value flag can consume a token spelled exactly like a later
-    /// positional, so the first textual match is not always the right one.
+    /// work: a flag's value can be spelled exactly like a later positional,
+    /// so the first textual match is not always the right one.
     positional_indices: Vec<usize>,
     help_requested: bool,
 }
@@ -226,6 +226,12 @@ impl Invocation {
     /// from each command's usage string, and a caller parsing argv outside
     /// the `AgentCli` runtime should pass the same knowledge.
     ///
+    /// This parse knows no commands, so `--key grep` gives `--key` the value
+    /// `grep` even when `grep` is a command. [`AgentCli::run`](crate::AgentCli::run)
+    /// knows the command tree, so there a command's name, where one can go,
+    /// is never a flag's value: `--key` is given no value and `grep` is the
+    /// command.
+    ///
     /// # Errors
     ///
     /// - [`ParseInvocationError::EmptyArgv`] if `args` yields no program name.
@@ -240,6 +246,28 @@ impl Invocation {
         S: Into<String>,
         F: Fn(&str) -> bool,
     {
+        Self::parse_in_tree(args, is_bool, |_, _| false)
+    }
+
+    /// [`Invocation::parse`], where `names_command(positionals, token)` says
+    /// whether `token`, read after `positionals`, names a command. Such a
+    /// token is a positional even right after a bare flag that would take it
+    /// as its value: the flag is given no value instead.
+    ///
+    /// # Errors
+    ///
+    /// As [`Invocation::parse`].
+    pub(crate) fn parse_in_tree<I, S, F, C>(
+        args: I,
+        is_bool: F,
+        names_command: C,
+    ) -> Result<Self, ParseInvocationError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        F: Fn(&str) -> bool,
+        C: Fn(&[String], &str) -> bool,
+    {
         let mut iter = args.into_iter().map(Into::into);
         let raw_program = iter.next().ok_or(ParseInvocationError::EmptyArgv)?;
         let program = program_name(&raw_program).to_string();
@@ -248,7 +276,7 @@ impl Invocation {
 
         let mut parser = TokenParser::default();
         for (index, token) in tokens.iter().enumerate() {
-            parser.feed(index, token, &is_bool)?;
+            parser.feed(index, token, &is_bool, &names_command)?;
         }
         // End of args: any pending bare flag becomes boolean.
         parser.flush_pending()?;
@@ -274,15 +302,21 @@ impl Invocation {
     /// # Errors
     ///
     /// As [`Invocation::parse`], for the prefix.
-    pub(crate) fn parse_prefix<F>(
+    pub(crate) fn parse_prefix<F, C>(
         argv: &[String],
         count: usize,
         is_bool: F,
+        names_command: C,
     ) -> Result<Self, ParseInvocationError>
     where
         F: Fn(&str) -> bool,
+        C: Fn(&[String], &str) -> bool,
     {
-        let mut prefix = Self::parse(argv[..count].iter().map(String::as_str), is_bool)?;
+        let mut prefix = Self::parse_in_tree(
+            argv[..count].iter().map(String::as_str),
+            is_bool,
+            names_command,
+        )?;
         prefix.command_line = render_command_line(&argv[0], &argv[1..]);
         Ok(prefix)
     }
@@ -300,7 +334,8 @@ struct TokenParser {
     /// Set by `--`: every later token is a positional.
     positional_only: bool,
     /// A bare `--key` whose value form we don't yet know. If the next token is
-    /// a plain value, it becomes the flag's value; otherwise the flag is bool.
+    /// a plain value that names no command, it becomes the flag's value;
+    /// otherwise the flag is bool.
     pending_flag: Option<String>,
 }
 
@@ -311,6 +346,7 @@ impl TokenParser {
         index: usize,
         token: &str,
         is_bool: impl Fn(&str) -> bool,
+        names_command: impl Fn(&[String], &str) -> bool,
     ) -> Result<(), ParseInvocationError> {
         if self.positional_only {
             self.flush_pending()?;
@@ -339,7 +375,7 @@ impl TokenParser {
 
         // Negative numbers as positionals: -123, -3.14
         if looks_like_negative_number(token) {
-            return self.value_or_positional(index, token);
+            return self.value_or_positional(index, token, names_command);
         }
 
         // Short flags: -x, -x=value, or -abc (bundled, all bool)
@@ -347,8 +383,9 @@ impl TokenParser {
             return self.short_flag(token, &token[1..], is_bool);
         }
 
-        // Plain positional. If a flag is pending, this token is its value.
-        self.value_or_positional(index, token)
+        // Plain positional. If a flag is pending, this token is its value,
+        // unless it names a command.
+        self.value_or_positional(index, token, names_command)
     }
 
     /// Consume a `--flag` token; `flag` is `token` without the `--`.
@@ -439,18 +476,22 @@ impl TokenParser {
         self.set_flag(key, "true".to_string())
     }
 
-    /// A non-flag token: the pending flag's value if one is waiting, else a
-    /// positional.
+    /// A non-flag token: the pending flag's value if one is waiting and the
+    /// token names no command, else a positional.
     fn value_or_positional(
         &mut self,
         index: usize,
         token: &str,
+        names_command: impl Fn(&[String], &str) -> bool,
     ) -> Result<(), ParseInvocationError> {
-        let Some(key) = self.pending_flag.take() else {
-            self.push_positional(index, token);
-            return Ok(());
-        };
-        self.set_flag(key, token.to_string())
+        if let Some(key) = self.pending_flag.take() {
+            if !names_command(&self.positionals, token) {
+                return self.set_flag(key, token.to_string());
+            }
+            self.set_bare_flag(key)?;
+        }
+        self.push_positional(index, token);
+        Ok(())
     }
 
     fn push_positional(&mut self, index: usize, token: &str) {
@@ -807,5 +848,53 @@ mod tests {
             ParseInvocationError::RepeatedFlag("v".to_string()).fix(),
             "Pass -v once."
         );
+    }
+
+    /// Parse with no boolean-flag schema, where `grep` is the only command.
+    fn parse_with_grep(args: &[&str]) -> Result<Invocation, ParseInvocationError> {
+        Invocation::parse_in_tree(
+            args.iter().copied(),
+            |_| false,
+            |positionals, token| positionals.is_empty() && token == "grep",
+        )
+    }
+
+    #[test]
+    fn a_command_name_is_never_a_flag_value() {
+        let bare = parse_with_grep(&["app", "--max", "grep", "pat"]).expect("should parse");
+        assert_eq!(bare.value_flag("max"), Some(""));
+        assert_eq!(
+            bare.positionals(),
+            &[String::from("grep"), String::from("pat")]
+        );
+        assert_eq!(bare.positional_indices(), &[1, 2]);
+
+        let short = parse_with_grep(&["app", "-n", "grep", "pat"]).expect("should parse");
+        assert_eq!(short.value_flag("n"), Some(""));
+        assert_eq!(
+            short.positionals(),
+            &[String::from("grep"), String::from("pat")]
+        );
+
+        let valued = parse_with_grep(&["app", "--max", "2", "grep"]).expect("should parse");
+        assert_eq!(valued.flag("max"), Some("2"));
+        assert_eq!(valued.positionals(), &[String::from("grep")]);
+
+        let equals = parse_with_grep(&["app", "--max=grep", "grep"]).expect("should parse");
+        assert_eq!(equals.flag("max"), Some("grep"));
+        assert_eq!(equals.positionals(), &[String::from("grep")]);
+
+        // Past the first positional, `grep` names no command here, so it is a
+        // value again.
+        let later = parse_with_grep(&["app", "grep", "--max", "grep"]).expect("should parse");
+        assert_eq!(later.flag("max"), Some("grep"));
+        assert_eq!(later.positionals(), &[String::from("grep")]);
+    }
+
+    #[test]
+    fn parse_knows_no_commands() {
+        let invocation = parse_no_bools(["app", "--max", "grep", "pat"]).expect("should parse");
+        assert_eq!(invocation.flag("max"), Some("grep"));
+        assert_eq!(invocation.positionals(), &[String::from("pat")]);
     }
 }

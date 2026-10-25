@@ -453,6 +453,92 @@ async fn the_commands_value_and_short_flags_before_the_name_say_where_they_go() 
 }
 
 #[tokio::test]
+async fn a_bare_flag_before_the_name_never_takes_the_name_as_its_value() {
+    let seen = Seen::default();
+    let cli = AgentCli::new("app", "Test CLI").command(
+        Command::new("grep", "Search the index")
+            .usage("app grep [--max=<n>] [-n <lines>] <pattern> [path...]")
+            .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+    );
+    let fixture = Fixture { cli, seen };
+    let not_reached = |flag: &str| {
+        (
+            "INVALID_FLAG",
+            format!(
+                "flag {flag} does not reach raw command `grep`: it receives only the tokens \
+                 after its name"
+            ),
+        )
+    };
+    for (argv, (code, message)) in [
+        (["app", "--max", "grep", "pat"], not_reached("--max")),
+        (["app", "-n", "grep", "pat"], not_reached("-n")),
+        (["app", "--select", "grep", "pat"], not_reached("--select")),
+        (
+            ["app", "--bogus", "grep", "pat"],
+            ("UNKNOWN_FLAG", "unknown flag(s): --bogus".to_string()),
+        ),
+    ] {
+        let (execution, seen) = run(&fixture, &argv).await;
+        assert!(!execution.is_raw(), "{argv:?}");
+        assert!(seen.is_empty(), "the handler ran for {argv:?}");
+        assert_eq!(execution.exit_code(), ExitCode::USAGE, "{argv:?}");
+        let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+        assert_eq!(json["error"]["code"], json!(code), "{json}");
+        assert_eq!(json["error"]["message"], json!(message), "{json}");
+        assert_eq!(json["command"], json!(argv.join(" ")), "{json}");
+    }
+}
+
+#[tokio::test]
+async fn a_bare_flag_before_a_nested_name_never_takes_it_as_its_value() {
+    let seen = Seen::default();
+    let cli = AgentCli::new("app", "Test CLI").command(
+        Command::new("code", "Code tools")
+            .usage("app code <subcommand>")
+            .subcommand(
+                Command::new("grep", "Search")
+                    .usage("app code grep [--max=<n>] <pattern>")
+                    .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+            ),
+    );
+    let (execution, seen) = run(
+        &Fixture { cli, seen },
+        &["app", "--max", "code", "grep", "pat"],
+    )
+    .await;
+
+    assert!(!execution.is_raw());
+    assert!(seen.is_empty(), "the handler ran");
+    assert_eq!(execution.exit_code(), ExitCode::USAGE);
+    let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
+    assert_eq!(json["error"]["code"], json!("INVALID_FLAG"), "{json}");
+    assert_eq!(
+        json["error"]["message"],
+        json!(
+            "flag --max does not reach raw command `code grep`: it receives only the tokens \
+             after its name"
+        )
+    );
+}
+
+#[tokio::test]
+async fn without_reserved_flags_a_bare_flag_before_the_name_is_not_gated() {
+    let seen = Seen::default();
+    let cli = AgentCli::new("app", "Test CLI")
+        .without_reserved_flags()
+        .command(
+            Command::new("grep", "Search the index (ripgrep-compatible output)")
+                .usage("app grep [rg-flags...] <pattern> [path...]")
+                .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+        );
+    let (execution, seen) = run(&Fixture { cli, seen }, &["app", "--profile", "grep", "pat"]).await;
+
+    assert!(execution.is_raw());
+    assert_eq!(seen, ["pat"]);
+}
+
+#[tokio::test]
 async fn a_nested_raw_command_is_named_by_its_path() {
     let seen = Seen::default();
     let cli = AgentCli::new("app", "Test CLI").command(
@@ -555,21 +641,26 @@ async fn a_line_the_parser_rejects_still_reaches_the_handler() {
 
 #[tokio::test]
 async fn a_value_flag_may_repeat_the_command_name() {
-    // `--profile` eats the first `grep` as its value; the second is the
-    // command. Splitting argv by searching for the command name would hand the
-    // handler ["grep", "pat"]; the parser's positional indices get it right.
-    // Without the reserved flags no flag before the name is refused.
+    // No top-level command is named `grep`, so `--profile` takes the first
+    // `grep` as its value; `code grep` is the command. Splitting argv by
+    // searching for the command name would hand the handler ["code", "grep",
+    // "pat"]; the parser's positional indices get it right. Without the
+    // reserved flags no flag before the name is refused.
     let seen = Seen::default();
     let cli = AgentCli::new("app", "Test CLI")
         .without_reserved_flags()
         .command(
-            Command::new("grep", "Search the index (ripgrep-compatible output)")
-                .usage("app grep [rg-flags...] <pattern> [path...]")
-                .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+            Command::new("code", "Code tools")
+                .usage("app code <subcommand>")
+                .subcommand(
+                    Command::new("grep", "Search")
+                        .usage("app code grep [args...]")
+                        .raw_handler(recording(&seen, ExitCode::SUCCESS)),
+                ),
         );
     let (execution, seen) = run(
         &Fixture { cli, seen },
-        &["app", "--profile", "grep", "grep", "pat"],
+        &["app", "--profile", "grep", "code", "grep", "pat"],
     )
     .await;
 
@@ -578,10 +669,10 @@ async fn a_value_flag_may_repeat_the_command_name() {
 }
 
 #[tokio::test]
-async fn an_undeclared_flag_eating_a_repeated_name_is_refused() {
-    // `--unknownflag` takes the first `grep` as its value, so the second is
-    // the command. The flag is still unknown, and before the name it is the
-    // framework's to refuse, not grep's to run without.
+async fn an_undeclared_flag_before_a_repeated_name_is_refused() {
+    // The first `grep` is the command, never `--unknownflag`'s value, and the
+    // second is grep's own pattern. The flag is unknown, and before the name
+    // it is the framework's to refuse, not grep's to run without.
     let (execution, seen) = run(
         &raw_cli(ExitCode::SUCCESS),
         &["app", "--unknownflag", "grep", "grep", "pat"],

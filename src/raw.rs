@@ -112,10 +112,11 @@ fn raw_result() -> Value {
 /// The Pass-0 scan knows this by construction; this recovers it when a raw
 /// command was reached through the parse instead (its name was not the leading
 /// token). It reads the parser's recorded positional indices rather than
-/// searching argv for the command name: `app --select grep grep pat` spells
-/// `grep` twice, once as a flag value, and only the parser knows which one was
-/// the command. `+ 2` converts a `raw_args` index to an argv index (`+ 1` for
-/// the program) and steps past the command token itself.
+/// searching argv for the command name: with a raw `grep` under `code` and no
+/// top-level `grep`, `app --select grep code grep pat` spells `grep` twice,
+/// once as a flag value, and only the parser knows which one was the command.
+/// `+ 2` converts a `raw_args` index to an argv index (`+ 1` for the program)
+/// and steps past the command token itself.
 pub(crate) fn args_start(invocation: &Invocation, path_len: usize) -> Option<usize> {
     let last = path_len.checked_sub(1)?;
     Some(invocation.positional_indices().get(last)? + 2)

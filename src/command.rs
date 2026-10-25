@@ -308,14 +308,6 @@ impl Command {
     /// [`AgentCli::without_reserved_flags`](crate::AgentCli::without_reserved_flags)
     /// no flag there is refused.
     ///
-    /// One shape cannot work: a flag before the command's name that the
-    /// framework does not know as a boolean (not a reserved flag, not a
-    /// `[--flag]` in a usage string) takes the next token as its value, as
-    /// `--key value` always does. `app --profile grep pat` reads `grep` as the
-    /// value of `--profile`, so no raw command is named and the line goes to
-    /// normal dispatch. Put such flags after the command's name, where they
-    /// are the handler's.
-    ///
     /// The command still appears in the root command tree (marked
     /// `"raw": true`), in `help`, and in
     /// [`AgentCli::audit`](crate::AgentCli::audit): it is a normal member of

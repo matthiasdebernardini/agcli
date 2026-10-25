@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Breaking changes
+
+On the wire, for agents and the programs that read agcli output:
+
+- **A command's name is never a flag's value.** A bare flag (no `=`) takes
+    the next token as its value only when that token does not name a
+    command where a command name can go; otherwise the flag is given no
+    value and the token is the command. A flag misplaced before a command's
+    name now gets the error that names it: `app --max grep pat` is
+    `INVALID_FLAG` "flag --max does not reach raw command `grep`",
+    `app --bogus grep pat` and `calc --bogus add 1 2` are `UNKNOWN_FLAG`, and
+    `ops --lines logs app` runs `logs`, which answers that `--lines` was given
+    no value. All of these used to be `UNKNOWN_COMMAND` for the next word.
+    Write `--flag=value` to pass a value spelled like a command.
+
+    `app --name status status`, which set `--name` to `status`, becomes
+    `app --name=status status`. Under `without_reserved_flags()`,
+    `app --profile grep grep pat` now hands raw `grep` `["grep", "pat"]`,
+    not `["pat"]`.
+
 ## [0.18.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.18.0) - 2026-10-24
 
 This release redesigns the Rust API. Handlers are plain async closures, agcli

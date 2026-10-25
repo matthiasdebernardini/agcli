@@ -375,8 +375,12 @@ the path mismatch as `USAGE_PATH_MISMATCH`.
   declared boolean, a reserved agent flag, `--help` and `--version` never take
   the next token.
 - Any other bare `--key` takes the next token as its value when that token is
-  not a flag. To keep a positional after an undeclared boolean, write
-  `--key=true` or put `--` before the positionals.
+  not a flag and does not name a command where one can go: a top-level
+  command before any positional, or a subcommand after its parent's name. So
+  in `app --tag add note x`, `add` is the command and `--tag` is given no
+  value; write `--tag=add` to pass a value spelled like a command. To keep a
+  positional after an undeclared boolean, write `--key=true` or put `--`
+  before the positionals.
 - `-x`, `-x=value` and `-x value` are short flags. `-abc` sets three booleans.
   `-abc=5` cannot say which flag the value belongs to, so it is a
   `PARSE_ERROR`.
@@ -969,8 +973,8 @@ The command still appears in the tree (marked `"raw": true`), in help, and in
   name belong to the command. Before the name, the tokens are the framework's:
   `app --help grep` answers help for `grep` (as `app help grep` does),
   `app -V grep` the version, `app --quiet=maybe grep pat` is `INVALID_FLAG`,
-  `app --=x grep pat` is `PARSE_ERROR`, and `app --bogus=1 grep pat` is
-  `UNKNOWN_FLAG`.
+  `app --=x grep pat` is `PARSE_ERROR`, and `app --bogus grep pat` is
+  `UNKNOWN_FLAG` like `app --bogus=1 grep pat`.
 - A raw handler receives only the tokens after its name, so a reserved agent
   flag before the name could reach nothing, and is refused instead of dropped.
   Nothing runs. `app --dry-run grep pat` is `DRY_RUN_UNSUPPORTED`: if `grep`
@@ -981,10 +985,6 @@ The command still appears in the tree (marked `"raw": true`), in help, and in
   which changes nothing anywhere, `--help` and `--version` are accepted
   before the name. Under `without_reserved_flags()`, no flag there is
   refused.
-- One shape cannot work. A flag before the name that the framework does not
-  know as a boolean takes the next token as its value, so
-  `app --profile grep pat` reads `grep` as the value of `--profile` and names no
-  raw command. Put such flags after the name, where they are the command's.
 - To forward a child process's status, convert `status.code()` with
   `ExitCode::try_from`. It is `None` when a signal killed the child; what that
   means is the command's to decide.

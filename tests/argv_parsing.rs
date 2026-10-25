@@ -385,3 +385,36 @@ async fn a_line_that_fails_to_parse_is_named_like_any_other() {
     assert_eq!(usage_error_code(&run), "PARSE_ERROR");
     assert_eq!(parse(&run)["command"], json!("calc --=x 'two words'"));
 }
+
+#[tokio::test]
+async fn a_commands_name_is_never_a_flags_value() {
+    // `--bogus` is given no value, so `add 1 2` is the command line, and the
+    // unknown flag is answered for `add`.
+    let run = cli().run(["calc", "--bogus", "add", "1", "2"]).await;
+    assert_eq!(usage_error_code(&run), "UNKNOWN_FLAG");
+    let envelope = parse(&run);
+    assert_eq!(
+        envelope["error"]["message"],
+        json!("unknown flag(s): --bogus")
+    );
+    let fix = envelope["fix"].as_str().expect("fix");
+    assert!(fix.starts_with("`add` takes no flags of its own."), "{fix}");
+
+    // `add` is the command even though `note` declares `--tag`: the flag
+    // lands on `add`, which takes none.
+    let run = cli().run(["calc", "--tag", "add", "note", "x"]).await;
+    assert_eq!(usage_error_code(&run), "UNKNOWN_FLAG");
+    let envelope = parse(&run);
+    assert_eq!(
+        envelope["error"]["message"],
+        json!("unknown flag(s): --tag")
+    );
+    let fix = envelope["fix"].as_str().expect("fix");
+    assert!(fix.starts_with("`add` takes no flags of its own."), "{fix}");
+
+    // `=` passes a value spelled like a command.
+    let run = cli().run(["calc", "--tag=add", "note", "x"]).await;
+    let envelope = parse(&run);
+    assert_eq!(envelope["ok"], json!(true), "{envelope}");
+    assert_eq!(envelope["result"]["text"], json!("x"));
+}

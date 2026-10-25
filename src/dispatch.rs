@@ -426,6 +426,26 @@ impl AgentCli {
             || (self.reserved_flags && reserved_flags::is_reserved_bool(flag))
     }
 
+    /// Whether `token`, read after `positionals`, names a command: every
+    /// positional so far names a command along one path from the root, none
+    /// of them raw (a raw command's tokens are its own), and `token` names a
+    /// child of the last, or a top-level command when there is none yet.
+    /// Every parse of argv passes this, so a command's name is never a bare
+    /// flag's value.
+    fn names_command(&self, positionals: &[String], token: &str) -> bool {
+        let mut commands = &self.commands;
+        for name in positionals {
+            let Some(found) = commands.get(name) else {
+                return false;
+            };
+            if found.raw().is_some() {
+                return false;
+            }
+            commands = &found.subcommands;
+        }
+        commands.contains_key(token)
+    }
+
     /// Parse argv, unless a raw command claims it first. A raw command can
     /// claim argv at three points: before parsing, when parsing fails, and
     /// after parsing when its name was not the leading token. In the last two
@@ -446,11 +466,13 @@ impl AgentCli {
         let preliminary_path = self.preliminary_command_path(argv);
         let bool_flags = Self::path_bool_flag_set(&preliminary_path);
         let is_bool = |flag: &str| self.parses_as_bool(&bool_flags, flag);
+        let names_command =
+            |positionals: &[String], token: &str| self.names_command(positionals, token);
         let raw_claim = |handler, args_start| {
             // The tokens up to the command's name are the framework's. They
             // parse whenever the whole line did; after a parse failure, a
             // prefix that fails to parse is the framework's own error.
-            Invocation::parse_prefix(argv, args_start, is_bool).map_or_else(
+            Invocation::parse_prefix(argv, args_start, is_bool, names_command).map_or_else(
                 ParsedArgv::Failed,
                 |prefix| ParsedArgv::Raw {
                     handler,
@@ -459,7 +481,11 @@ impl AgentCli {
                 },
             )
         };
-        let invocation = match Invocation::parse(argv.iter().map(String::as_str), is_bool) {
+        let invocation = match Invocation::parse_in_tree(
+            argv.iter().map(String::as_str),
+            is_bool,
+            names_command,
+        ) {
             Ok(value) => value,
             Err(error) => {
                 // A raw command still owns its argv when a *later* token
@@ -897,9 +923,11 @@ impl AgentCli {
 
     /// Collect every flag name declared as a pure boolean (`[--flag]`) across
     /// the entire command tree, including subcommands. Used only as a Pass 1
-    /// heuristic by [`Self::preliminary_command_path`] so that bare bool flags
-    /// in the input don't accidentally consume tokens that might be command
-    /// names. The final flag/positional split honors the resolved command
+    /// heuristic by [`Self::preliminary_command_path`]. A command's name is
+    /// never a flag's value in any parse, so the union only decides whether a
+    /// token that names no command, right after a bare flag some command
+    /// declares boolean, is a positional (which ends the walk) or that flag's
+    /// value. The final flag/positional split honors the resolved command
     /// path's schema, not this global union; see [`Self::path_bool_flag_set`].
     fn global_bool_flag_set(&self) -> HashSet<String> {
         let mut set = HashSet::new();
@@ -918,9 +946,11 @@ impl AgentCli {
     /// the resolved path, never flags declared by unrelated siblings.
     fn preliminary_command_path<'a>(&'a self, argv: &[String]) -> Vec<&'a Command> {
         let union_bools = self.global_bool_flag_set();
-        let Ok(invocation) = Invocation::parse(argv.iter().map(String::as_str), |flag| {
-            self.parses_as_bool(&union_bools, flag)
-        }) else {
+        let Ok(invocation) = Invocation::parse_in_tree(
+            argv.iter().map(String::as_str),
+            |flag| self.parses_as_bool(&union_bools, flag),
+            |positionals, token| self.names_command(positionals, token),
+        ) else {
             return Vec::new();
         };
 
