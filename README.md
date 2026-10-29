@@ -463,6 +463,10 @@ assert!(!run.to_json().contains("hunter2"));
 # }
 ```
 
+A secret value spelled like a command name, in a place where a command name
+can go, is read as the command, not as the value of the flag before it: write
+`--flag=value` for it.
+
 A token right after a bare flag may be that flag's value, even when it starts
 with a dash (`--passphrase -hunter2` is a flag and a value that looks like
 flags). When the flag is masked, that token is masked whole and its letters are
@@ -476,8 +480,7 @@ token. A raw command's tokens are never parsed: its flags lose their values and
 the token after a bare flag is masked, while its positionals are echoed unless
 the hook rewrites them, so use the hook for those. Positionals no usage marks
 secret, such as an unexpected extra argument, are echoed unless the hook
-rewrites them, and then the error text carries the hook's text, as `command`
-does. A handler that puts an argument in its own result or error text
+rewrites them, and then the error text shows `<redacted>`. A handler that puts an argument in its own result or error text
 must mask it itself. `audit()` reports a `Command::secret` name that no command on its path
 declares (`UNDECLARED_SECRET`: a flag counts from a parent's usage or a
 subcommand's, a positional only from the command's own) and a secret on a raw

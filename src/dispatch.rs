@@ -256,26 +256,6 @@ impl AgentCli {
         command_line
     }
 
-    /// `token` as error text may show it: the text the
-    /// [`AgentCli::redact_arg`] hook gives for it, as the `command` line
-    /// shows it.
-    pub(crate) fn echoed(&self, token: &str) -> String {
-        self.redact_arg
-            .as_deref()
-            .and_then(|hook| hook(token))
-            .unwrap_or_else(|| token.to_string())
-    }
-
-    /// Positional `index` of `invocation` as error text may show it: masked
-    /// when it was, else as [`Self::echoed`] has it.
-    pub(crate) fn echoed_at(&self, invocation: &Invocation, index: usize) -> String {
-        if invocation.positional_is_masked(index) {
-            redaction::MARKER.to_string()
-        } else {
-            self.echoed(&invocation.positionals()[index])
-        }
-    }
-
     /// The `command` line for argv the framework cannot read token by token:
     /// a line that failed to parse, or a raw command's, whose tokens are its
     /// own. See [`redaction::opaque_words`].
@@ -751,7 +731,7 @@ impl AgentCli {
             clock,
             CommandError::new(
                 ErrorCode::UNKNOWN_COMMAND,
-                format!("unknown command: {}", self.echoed_at(invocation, 0)),
+                format!("unknown command: {}", invocation.shown_positional(0)),
                 suggest::unknown_command_fix("command", unknown, &valid),
             )
             .next_actions(self.root_actions()),
@@ -784,7 +764,7 @@ impl AgentCli {
                     ErrorCode::UNKNOWN_SUBCOMMAND,
                     format!(
                         "unknown subcommand: {}",
-                        self.echoed_at(invocation, resolved.path.len())
+                        invocation.shown_positional(resolved.path.len())
                     ),
                     suggest::unknown_command_fix("subcommand", &resolved.remaining[0], &valid),
                 )
@@ -942,11 +922,9 @@ impl AgentCli {
                         arity,
                         &(0..resolved.remaining.len())
                             .map(|at| {
-                                self.echoed_at(
-                                    gate.invocation,
-                                    gate.invocation.positionals().len() - resolved.remaining.len()
-                                        + at,
-                                )
+                                let first =
+                                    gate.invocation.positionals().len() - resolved.remaining.len();
+                                gate.invocation.shown_positional(first + at).to_string()
                             })
                             .collect::<Vec<_>>(),
                     ),

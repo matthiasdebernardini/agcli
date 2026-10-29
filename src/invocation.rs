@@ -210,15 +210,15 @@ impl Invocation {
         self.masked_flags.clear();
         self.masked_positionals.clear();
         self.hidden_flags.clear();
-        for ((token, role), follows) in self
+        let masked_tokens = self
             .raw_args
             .iter()
             .zip(&self.roles)
             .zip(&self.follows)
             .zip(&shown)
             .filter(|(_, (_, masked))| *masked)
-            .map(|(parts, _)| parts)
-        {
+            .map(|(parts, _)| parts);
+        for ((token, role), follows) in masked_tokens {
             let tied = follows.masks(role, &mask_flag);
             match role {
                 Role::Flag(name) | Role::FlagValue(name) => {

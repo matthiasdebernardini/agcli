@@ -20,8 +20,7 @@ On the wire, for agents and the programs that read agcli output:
     starts with a dash, and the flags it would set are left out of
     `UNKNOWN_FLAG` and `PARSE_ERROR` text. The type's own parse error is
     left out of `arg_parse` and `flag_parse` errors for a masked value, and
-    error text that quotes a hook-rewritten argument carries the hook's text,
-    as `command` does. A line that used to
+    error text that quotes a hook-rewritten argument shows `<redacted>`. A line that used to
     rerun as printed no longer does when it carried such a value: declare the
     flag in the usage (`--passphrase=<value>`) to keep its value in `command`.
 

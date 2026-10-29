@@ -106,7 +106,7 @@ impl AgentCli {
                     &usage,
                     arity,
                     &(1..=given.len())
-                        .map(|at| self.echoed_at(invocation, at))
+                        .map(|at| invocation.shown_positional(at).to_string())
                         .collect::<Vec<_>>(),
                 )
                 .next_actions(self.root_actions()),
@@ -165,7 +165,7 @@ impl AgentCli {
                 clock,
                 CommandError::new(
                     ErrorCode::UNKNOWN_COMMAND,
-                    format!("unknown command: {}", self.echoed_at(invocation, offset)),
+                    format!("unknown command: {}", invocation.shown_positional(offset)),
                     suggest::unknown_command_fix("command", first, &valid),
                 )
                 .next_actions(self.root_actions()),
@@ -184,7 +184,7 @@ impl AgentCli {
                     ErrorCode::UNKNOWN_SUBCOMMAND,
                     format!(
                         "unknown subcommand: {}",
-                        self.echoed_at(invocation, offset + resolved.path.len())
+                        invocation.shown_positional(offset + resolved.path.len())
                     ),
                     suggest::unknown_command_fix("subcommand", &resolved.remaining[0], &valid),
                 )

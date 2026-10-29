@@ -33,7 +33,7 @@ fn base_cli() -> AgentCli {
         .clock(|| 0)
         .redact_arg(|arg| {
             let (field, _) = arg.split_once('=')?;
-            (field == "password").then(|| "password=<redacted>".to_string())
+            (field == "password").then(|| "password=<hooked>".to_string())
         })
         .command(
             Command::new("store", "Store operations").subcommand(
@@ -342,7 +342,7 @@ async fn the_hook_rewrites_arguments_it_recognizes() {
     );
     assert_eq!(
         envelope["command"],
-        json!("passwarden item edit github 'password=<redacted>'")
+        json!("passwarden item edit github 'password=<hooked>'")
     );
 }
 
@@ -356,6 +356,13 @@ async fn the_hook_is_applied_to_every_error_that_echoes_an_argument() {
             .as_str()
             .unwrap()
             .contains("<redacted>")
+    );
+    // The hook's own text is for `command`; error text shows the marker.
+    assert!(
+        !envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("hooked")
     );
     // UNKNOWN_COMMAND and UNKNOWN_SUBCOMMAND quote the bad word.
     let (_, envelope) = run(&["passwarden", "password=hunter2"]).await;
@@ -702,7 +709,7 @@ async fn words_nothing_masks_keep_their_shell_quoting() {
     let (_, envelope) = run(&["passwarden", "item", "edit", "it's", "password=hunter2"]).await;
     assert_eq!(
         envelope["command"],
-        json!(r"passwarden item edit 'it'\''s' 'password=<redacted>'")
+        json!(r"passwarden item edit 'it'\''s' 'password=<hooked>'")
     );
 }
 
