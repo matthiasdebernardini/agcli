@@ -73,6 +73,8 @@ pub struct Command {
     /// Opt out of extra-positional rejection for this command. Usage strings
     /// with a variadic tail (`...`) opt out implicitly.
     pub(crate) allow_extra_args: bool,
+    /// The flags and positionals marked with [`Command::secret`].
+    pub(crate) secrets: Vec<String>,
 }
 
 /// A command the framework registers itself. A command is at most one
@@ -126,6 +128,7 @@ impl Command {
             handles_dry_run: false,
             allow_unknown_flags: false,
             allow_extra_args: false,
+            secrets: Vec::new(),
         }
     }
 
@@ -158,6 +161,38 @@ impl Command {
     #[must_use]
     pub fn allow_extra_args(mut self) -> Self {
         self.allow_extra_args = true;
+        self
+    }
+
+    /// Mark a flag or positional of this command as secret: its value is
+    /// replaced by `<redacted>` in every envelope's `command` field, and never
+    /// appears in error text. The handler still reads the real value.
+    ///
+    /// `name` is how the usage string spells it, without dashes or angle
+    /// brackets: `passphrase` for `--passphrase=<value>`, `password` for
+    /// `<password>`. A secret flag also covers this command's subcommands. A
+    /// variadic positional (`<values...>`) is secret from its position on.
+    /// [`AgentCli::audit`](crate::AgentCli::audit) reports a name the usage
+    /// does not declare, since a misspelt secret protects nothing.
+    ///
+    /// Flags the usage does not declare are masked without this call.
+    ///
+    /// ```
+    /// use agcli::{Command, CommandOutput};
+    /// use serde_json::json;
+    ///
+    /// let unlock = Command::new("unlock", "Unlock the store")
+    ///     .usage("pw unlock <store> --passphrase=<value>")
+    ///     .secret("passphrase")
+    ///     .handler(|req| async move {
+    ///         let passphrase = req.flag("passphrase").unwrap_or_default();
+    ///         Ok(CommandOutput::new(json!({ "length": passphrase.len() })))
+    ///     });
+    /// # let _ = unlock;
+    /// ```
+    #[must_use]
+    pub fn secret(mut self, name: impl Into<String>) -> Self {
+        self.secrets.push(name.into());
         self
     }
 

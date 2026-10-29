@@ -142,10 +142,11 @@ impl CommandRequest {
         T::Err: fmt::Display,
     {
         let raw = self.require_arg(index, name)?;
+        let shown = self.invocation.shown_positional(self.path_len + index);
         let value = raw.parse::<T>().map_err(|err| {
             CommandError::new(
                 ErrorCode::INVALID_ARG,
-                format!("argument <{name}> is not valid: {raw:?} ({err})"),
+                format!("argument <{name}> is not valid: {shown:?} ({err})"),
                 format!("Pass a valid value for <{name}>."),
             )
             .exit_code(ExitCode::USAGE)
@@ -153,7 +154,7 @@ impl CommandRequest {
         if !parsed_value_is_finite(&value) {
             return Err(CommandError::new(
                 ErrorCode::INVALID_ARG,
-                format!("argument <{name}> is not finite: {raw:?}"),
+                format!("argument <{name}> is not finite: {shown:?}"),
                 format!(
                     "Pass a finite number for <{name}>. JSON cannot represent \
                      infinities or NaN."
@@ -192,10 +193,11 @@ impl CommandRequest {
                     )
                     .exit_code(ExitCode::USAGE));
                 }
+                let shown = self.invocation.shown_flag_value(key, raw);
                 let value = raw.parse::<T>().map_err(|err| {
                     CommandError::new(
                         ErrorCode::INVALID_FLAG,
-                        format!("flag {flag} is not valid: {raw:?} ({err})"),
+                        format!("flag {flag} is not valid: {shown:?} ({err})"),
                         format!("Pass a valid value for {flag}."),
                     )
                     .exit_code(ExitCode::USAGE)
@@ -203,7 +205,7 @@ impl CommandRequest {
                 if !parsed_value_is_finite(&value) {
                     return Err(CommandError::new(
                         ErrorCode::INVALID_FLAG,
-                        format!("flag {flag} is not finite: {raw:?}"),
+                        format!("flag {flag} is not finite: {shown:?}"),
                         format!(
                             "Pass a finite number for {flag}. JSON cannot represent \
                              infinities or NaN."
@@ -242,8 +244,9 @@ impl CommandRequest {
     /// non-boolean `--quiet=maybe`.
     pub fn flag_on(&self, key: &str) -> Result<bool, CommandError> {
         self.flag(key).map_or(Ok(false), |value| {
-            reserved_flags::parse_bool(value)
-                .ok_or_else(|| reserved_flags::not_a_boolean(key, value))
+            reserved_flags::parse_bool(value).ok_or_else(|| {
+                reserved_flags::not_a_boolean(key, self.invocation.shown_flag_value(key, value))
+            })
         })
     }
 

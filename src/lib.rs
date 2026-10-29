@@ -18,6 +18,7 @@ mod next_action;
 mod panic_hook;
 mod project;
 mod raw;
+mod redaction;
 mod reserved_flags;
 mod select;
 mod skill;

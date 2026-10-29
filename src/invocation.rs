@@ -7,6 +7,7 @@ use std::fmt;
 use std::iter;
 use std::path::Path;
 
+use crate::redaction::{self, MARKER, RedactFn};
 use crate::usage;
 
 /// A command line parsed into the program, its flags and its positionals, with
@@ -33,6 +34,30 @@ pub struct Invocation {
     /// so the first textual match is not always the right one.
     positional_indices: Vec<usize>,
     help_requested: bool,
+    /// What each token of `raw_args` is, so a redaction knows which tokens
+    /// are flag values and which are positionals.
+    roles: Vec<Role>,
+    /// Each token of `raw_args` as the shell word the `command` line shows.
+    shown_args: Vec<String>,
+    /// The flags whose value the `command` line and error text mask.
+    masked_flags: HashSet<String>,
+    /// The positionals (by index in `positionals`) they mask.
+    masked_positionals: HashSet<usize>,
+}
+
+/// What one token of argv is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Role {
+    /// `--`, a bundle of short flags, or a token that was never read.
+    Plain,
+    /// A flag token: `--key`, `--key=value`, `-k` or `-k=value`. Holds the
+    /// name.
+    Flag(String),
+    /// The token that was the value of the bare flag it follows. Holds the
+    /// flag's name.
+    FlagValue(String),
+    /// A positional. Holds its index among the positionals.
+    Positional(usize),
 }
 
 impl Invocation {
@@ -42,9 +67,17 @@ impl Invocation {
         &self.program
     }
 
-    /// The invocation as one re-runnable shell line: the program's file name,
-    /// then every argument, each single-quoted (POSIX style) unless it is made
-    /// only of shell-safe characters. The envelope's `command` field.
+    /// The invocation as one shell line: the program's file name, then every
+    /// argument, each single-quoted (POSIX style) unless it is made only of
+    /// shell-safe characters. The envelope's `command` field.
+    ///
+    /// [`Invocation::parse`] gives the line verbatim. Under an
+    /// [`AgentCli`](crate::AgentCli) the line is redacted, so a handler reads
+    /// what the envelope shows: the value of a flag the command does not
+    /// declare, of a [`Command::secret`](crate::Command::secret) flag or
+    /// positional, and any argument the
+    /// [`redact_arg`](crate::AgentCli::redact_arg) hook rewrites, are
+    /// replaced by `<redacted>`.
     #[must_use]
     pub fn command_line(&self) -> &str {
         &self.command_line
@@ -106,13 +139,84 @@ impl Invocation {
             .iter()
             .position(|token| token == "--")
             .unwrap_or(self.raw_args.len());
-        let (before, after) = self.raw_args.split_at(separator);
-        iter::once(shell_quote(&self.program))
-            .chain(before.iter().map(|token| shell_quote(token)))
-            .chain(iter::once(Cow::Borrowed(flag)))
-            .chain(after.iter().map(|token| shell_quote(token)))
+        let (before, after) = self.shown_args.split_at(separator);
+        iter::once(shell_quote(&self.program).into_owned())
+            .chain(before.iter().cloned())
+            .chain(iter::once(flag.to_string()))
+            .chain(after.iter().cloned())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// Mask what must not be echoed, and rebuild the `command` line from the
+    /// masked tokens. `mask_flag(name)` says whether the value of flag `name`
+    /// is masked, `mask_positional(index)` whether positional `index` (in
+    /// [`Invocation::positionals`]) is, and `hook` rewrites any token that
+    /// neither masks. A flag or positional the hook rewrites counts as masked.
+    pub(crate) fn redact(
+        &mut self,
+        hook: Option<&RedactFn>,
+        mask_flag: impl Fn(&str) -> bool,
+        mask_positional: impl Fn(usize) -> bool,
+    ) {
+        let shown: Vec<(String, bool)> = self
+            .raw_args
+            .iter()
+            .zip(&self.roles)
+            .map(|(token, role)| match role {
+                Role::Flag(name) if mask_flag(name) => (redaction::masked_flag_word(token), true),
+                Role::FlagValue(name) if mask_flag(name) => (MARKER.to_string(), true),
+                Role::Positional(index) if mask_positional(*index) => (MARKER.to_string(), true),
+                _ => redaction::hooked_word(hook, token),
+            })
+            .collect();
+        self.masked_flags.clear();
+        self.masked_positionals.clear();
+        for (role, (_, masked)) in self.roles.iter().zip(&shown) {
+            match role {
+                Role::Flag(name) | Role::FlagValue(name) if *masked => {
+                    self.masked_flags.insert(name.clone());
+                }
+                Role::Positional(index) if *masked => {
+                    self.masked_positionals.insert(*index);
+                }
+                _ => {}
+            }
+        }
+        self.shown_args = shown.into_iter().map(|(word, _)| word).collect();
+        self.command_line = self.line_of(&self.shown_args);
+    }
+
+    /// Replace the `command` line, for a line the framework does not parse.
+    pub(crate) fn set_command_line(&mut self, command_line: String) {
+        self.command_line = command_line;
+    }
+
+    /// The program, then `words`, as one shell line.
+    fn line_of(&self, words: &[String]) -> String {
+        iter::once(shell_quote(&self.program).into_owned())
+            .chain(words.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// `value`, the value of flag `name`, as error text may show it: masked
+    /// when the flag is.
+    pub(crate) fn shown_flag_value<'a>(&self, name: &str, value: &'a str) -> &'a str {
+        if self.masked_flags.contains(name) {
+            MARKER
+        } else {
+            value
+        }
+    }
+
+    /// Positional `index`, as error text may show it: masked when it is.
+    pub(crate) fn shown_positional(&self, index: usize) -> &str {
+        if self.masked_positionals.contains(&index) {
+            MARKER
+        } else {
+            &self.positionals[index]
+        }
     }
 
     /// True when a bare `--help` or `-h` is on the line. A `--help=<value>`
@@ -150,6 +254,15 @@ impl fmt::Display for ParseInvocationError {
 impl Error for ParseInvocationError {}
 
 impl ParseInvocationError {
+    /// This error with the value its token carries after `=` masked, for an
+    /// envelope: the token is malformed, but what it carries may be a secret.
+    pub(crate) fn redacted(&self) -> Self {
+        match self {
+            Self::InvalidFlag(token) => Self::InvalidFlag(redaction::mask_flag_value(token)),
+            other => other.clone(),
+        }
+    }
+
     /// The `fix` of the `PARSE_ERROR` envelope reporting this failure: how
     /// to spell the line so it parses.
     pub(crate) fn fix(&self) -> String {
@@ -206,7 +319,7 @@ pub(crate) fn render_command_line<S: AsRef<str>>(program: &str, args: &[S]) -> S
 /// True when `s` is a `-` followed by an ASCII digit (`-3`, `-0x10`,
 /// `-1,000`) or parses as a negative number (`-.5`, `-1e3`): a positional,
 /// never a bundle of short flags. No usage string declares a digit as a flag.
-fn looks_like_negative_number(s: &str) -> bool {
+pub(crate) fn looks_like_negative_number(s: &str) -> bool {
     s.strip_prefix('-').is_some_and(|rest| {
         rest.starts_with(|c: char| c.is_ascii_digit())
             || (!rest.is_empty() && rest.parse::<f64>().is_ok())
@@ -274,17 +387,25 @@ impl Invocation {
         let tokens: Vec<String> = iter.collect();
         let command_line = render_command_line(&program, &tokens);
 
-        let mut parser = TokenParser::default();
+        let mut parser = TokenParser::new(tokens.len());
         for (index, token) in tokens.iter().enumerate() {
             parser.feed(index, token, &is_bool, &names_command)?;
         }
         // End of args: any pending bare flag becomes boolean.
         parser.flush_pending()?;
 
+        let shown_args = tokens
+            .iter()
+            .map(|token| shell_quote(token).into_owned())
+            .collect();
         Ok(Self {
             program,
             command_line,
             raw_args: tokens,
+            roles: parser.roles,
+            shown_args,
+            masked_flags: HashSet::new(),
+            masked_positionals: HashSet::new(),
             flags: parser.flags,
             bare_flags: parser.bare_flags,
             positionals: parser.positionals,
@@ -292,38 +413,9 @@ impl Invocation {
             help_requested: parser.help_requested,
         })
     }
-
-    /// Parse the first `count` tokens of `argv` (program first) as the
-    /// framework's own, while [`Invocation::command_line`] still names the
-    /// whole line. The tokens from `count` on belong to a raw command, which
-    /// the framework does not parse, but the envelope that answers for the
-    /// prefix reruns the line as given.
-    ///
-    /// # Errors
-    ///
-    /// As [`Invocation::parse`], for the prefix.
-    pub(crate) fn parse_prefix<F, C>(
-        argv: &[String],
-        count: usize,
-        is_bool: F,
-        names_command: C,
-    ) -> Result<Self, ParseInvocationError>
-    where
-        F: Fn(&str) -> bool,
-        C: Fn(&[String], &str) -> bool,
-    {
-        let mut prefix = Self::parse_in_tree(
-            argv[..count].iter().map(String::as_str),
-            is_bool,
-            names_command,
-        )?;
-        prefix.command_line = render_command_line(&argv[0], &argv[1..]);
-        Ok(prefix)
-    }
 }
 
 /// The token-by-token state of [`Invocation::parse`].
-#[derive(Default)]
 struct TokenParser {
     flags: HashMap<String, String>,
     /// The flags set to `"true"` because they were given no value.
@@ -337,9 +429,24 @@ struct TokenParser {
     /// a plain value that names no command, it becomes the flag's value;
     /// otherwise the flag is bool.
     pending_flag: Option<String>,
+    /// The role of each token fed so far, by index.
+    roles: Vec<Role>,
 }
 
 impl TokenParser {
+    fn new(token_count: usize) -> Self {
+        Self {
+            flags: HashMap::new(),
+            bare_flags: HashSet::new(),
+            positionals: Vec::new(),
+            positional_indices: Vec::new(),
+            help_requested: false,
+            positional_only: false,
+            pending_flag: None,
+            roles: vec![Role::Plain; token_count],
+        }
+    }
+
     /// Consume the argv token at `index`.
     fn feed(
         &mut self,
@@ -370,7 +477,7 @@ impl TokenParser {
 
         // Long flags: --key=value or bare --key
         if let Some(flag) = token.strip_prefix("--") {
-            return self.long_flag(token, flag, is_bool);
+            return self.long_flag(index, token, flag, is_bool);
         }
 
         // Negative numbers as positionals: -123, -3.14
@@ -380,7 +487,7 @@ impl TokenParser {
 
         // Short flags: -x, -x=value, or -abc (bundled, all bool)
         if token.starts_with('-') && token.len() > 1 {
-            return self.short_flag(token, &token[1..], is_bool);
+            return self.short_flag(index, token, &token[1..], is_bool);
         }
 
         // Plain positional. If a flag is pending, this token is its value,
@@ -391,6 +498,7 @@ impl TokenParser {
     /// Consume a `--flag` token; `flag` is `token` without the `--`.
     fn long_flag(
         &mut self,
+        index: usize,
         token: &str,
         flag: &str,
         is_bool: impl Fn(&str) -> bool,
@@ -406,16 +514,19 @@ impl TokenParser {
             if key.is_empty() {
                 return Err(ParseInvocationError::InvalidFlag(token.to_string()));
             }
+            self.roles[index] = Role::Flag(key.to_string());
             return self.set_flag(key.to_string(), value.to_string());
         }
 
         // Bare --flag: known boolean, or candidate for next-token value.
+        self.roles[index] = Role::Flag(flag.to_string());
         self.bare_flag(flag, is_bool)
     }
 
     /// Consume a `-x` token; `short` is `token` without the `-`.
     fn short_flag(
         &mut self,
+        index: usize,
         token: &str,
         short: &str,
         is_bool: impl Fn(&str) -> bool,
@@ -429,10 +540,12 @@ impl TokenParser {
             if key.chars().count() != 1 {
                 return Err(ParseInvocationError::InvalidFlag(token.to_string()));
             }
+            self.roles[index] = Role::Flag(key.to_string());
             return self.set_flag(key.to_string(), value.to_string());
         }
 
         if short.chars().count() == 1 {
+            self.roles[index] = Role::Flag(short.to_string());
             return self.bare_flag(short, is_bool);
         }
 
@@ -486,6 +599,7 @@ impl TokenParser {
     ) -> Result<(), ParseInvocationError> {
         if let Some(key) = self.pending_flag.take() {
             if !names_command(&self.positionals, token) {
+                self.roles[index] = Role::FlagValue(key.clone());
                 return self.set_flag(key, token.to_string());
             }
             self.set_bare_flag(key)?;
@@ -495,6 +609,7 @@ impl TokenParser {
     }
 
     fn push_positional(&mut self, index: usize, token: &str) {
+        self.roles[index] = Role::Positional(self.positionals.len());
         self.positionals.push(token.to_string());
         self.positional_indices.push(index);
     }
@@ -896,5 +1011,72 @@ mod tests {
         let invocation = parse_no_bools(["app", "--max", "grep", "pat"]).expect("should parse");
         assert_eq!(invocation.flag("max"), Some("grep"));
         assert_eq!(invocation.positionals(), &[String::from("pat")]);
+    }
+
+    // --- redaction ---
+
+    fn parse_bool_flags<const N: usize>(args: [&str; N], bools: &[&str]) -> Invocation {
+        Invocation::parse(args, |flag| bools.contains(&flag)).expect("should parse")
+    }
+
+    #[test]
+    fn roles_tell_flag_values_from_positionals() {
+        let invocation = parse_no_bools(["app", "--a=1", "--b", "2", "-c", "3", "pos", "--", "-d"])
+            .expect("should parse");
+        assert_eq!(
+            invocation.roles,
+            [
+                Role::Flag("a".to_string()),
+                Role::Flag("b".to_string()),
+                Role::FlagValue("b".to_string()),
+                Role::Flag("c".to_string()),
+                Role::FlagValue("c".to_string()),
+                Role::Positional(0),
+                Role::Plain,
+                Role::Positional(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn redact_masks_flags_and_positionals_and_rebuilds_the_line() {
+        let mut invocation = parse_bool_flags(
+            [
+                "app", "run", "--tok", "s3cret", "--keep=1", "pw=x", "-q", "--", "--pw=y",
+            ],
+            &["q"],
+        );
+        let hook: &RedactFn = &|arg| arg.starts_with("pw=").then(|| "pw=<r>".to_string());
+        invocation.redact(Some(hook), |name| name == "tok", |index| index == 2);
+        assert_eq!(
+            invocation.command_line(),
+            "app run --tok <redacted> --keep=1 'pw=<r>' -q -- <redacted>"
+        );
+        assert_eq!(invocation.shown_flag_value("tok", "s3cret"), MARKER);
+        assert_eq!(invocation.shown_flag_value("keep", "1"), "1");
+        assert_eq!(invocation.shown_positional(0), "run");
+        assert_eq!(invocation.shown_positional(1), MARKER);
+        assert_eq!(invocation.shown_positional(2), MARKER);
+        // The real values stay readable.
+        assert_eq!(invocation.flag("tok"), Some("s3cret"));
+        assert_eq!(invocation.positionals()[1], "pw=x");
+        assert_eq!(
+            invocation.command_line_with_flag("--select=<fields>"),
+            "app run --tok <redacted> --keep=1 'pw=<r>' -q --select=<fields> -- <redacted>"
+        );
+    }
+
+    #[test]
+    fn an_invalid_flag_error_masks_its_value_for_an_envelope() {
+        let error = parse_no_bools(["app", "-abc=5"]).expect_err("should not parse");
+        assert_eq!(error.to_string(), "invalid flag syntax: -abc=5");
+        assert_eq!(
+            error.redacted().to_string(),
+            "invalid flag syntax: -abc=<redacted>"
+        );
+        assert_eq!(
+            ParseInvocationError::EmptyArgv.redacted(),
+            ParseInvocationError::EmptyArgv
+        );
     }
 }

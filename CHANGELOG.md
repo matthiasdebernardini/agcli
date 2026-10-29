@@ -8,6 +8,21 @@ All notable changes to this project will be documented in this file.
 
 On the wire, for agents and the programs that read agcli output:
 
+- **A secret in argv is no longer echoed.** The `command` field, and the error
+    text that quotes an argument, mask the value of any flag the command's
+    usage does not declare, in `--flag=value`, `--flag value`, `-x=value` and
+    `-x value`: `app run --passphrase=hunter2` reports
+    `app run --passphrase=<redacted>`. The `PARSE_ERROR` for a malformed token
+    such as `-abc=5` quotes it as `-abc=<redacted>`, a line that fails to
+    parse masks every token that is not a flag name or a command name, and the
+    flag values in a raw command's tokens are masked. A line that used to
+    rerun as printed no longer does when it carried such a value: declare the
+    flag in the usage (`--passphrase=<value>`) to keep its value in `command`.
+
+    In Rust, `Invocation::command_line` returns the masked line inside a
+    handler, as the envelope shows it; `Invocation::parse` still returns it
+    verbatim.
+
 - **A command's name is never a flag's value.** A bare flag (no `=`) takes
     the next token as its value only when that token does not name a
     command where a command name can go; otherwise the flag is given no
@@ -23,6 +38,21 @@ On the wire, for agents and the programs that read agcli output:
     `app --name=status status`. Under `without_reserved_flags()`,
     `app --profile grep grep pat` now hands raw `grep` `["grep", "pat"]`,
     not `["pat"]`.
+
+### Added
+
+- **`Command::secret(name)`** masks a declared flag or positional as
+    `<redacted>` in the `command` field and every error's text. The handler
+    still reads the real value. `name` is how the usage spells it, without
+    dashes or angle brackets.
+- **`AgentCli::redact_arg(hook)`** takes `Fn(&str) -> Option<String>`, applied
+    to each argv element before an envelope echoes it, for patterns only the
+    app knows, such as `field=value` assignments. See "Secrets in argv" in the
+    README.
+- **`audit()` reports `UNDECLARED_SECRET`**, a `Command::secret` name the usage
+    does not declare, and **`SECRET_ON_RAW_COMMAND`**, a secret marked on a raw
+    command, whose tokens are never parsed. Both are errors, since neither masks
+    anything.
 
 ## [0.18.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.18.0) - 2026-10-24
 

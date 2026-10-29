@@ -141,6 +141,50 @@ pub(crate) fn positional_arity(usage: &str) -> Option<Arity> {
     Some(Arity { required, optional })
 }
 
+/// A positional a usage string declares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PositionalName {
+    /// The placeholder's name: `id` for `<id>`, `path` for `[path...]`.
+    pub(crate) name: String,
+    /// Whether it takes every remaining positional (`...`).
+    pub(crate) variadic: bool,
+}
+
+/// The positionals a usage string declares, in order, named as the usage
+/// spells them. Read the same way as [`positional_arity`], so the two agree on
+/// what a positional is.
+pub(crate) fn positional_names(usage: &str) -> Vec<PositionalName> {
+    let to_positional = |text: &str| PositionalName {
+        name: text.trim_matches(|c| "[]<>.".contains(c)).to_string(),
+        variadic: text.contains("..."),
+    };
+    let mut names = Vec::new();
+    let mut tokens = usage.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        if let Some(inner) = token.strip_prefix('[') {
+            let is_positional = !inner.starts_with('-');
+            let mut group = token.to_string();
+            let mut last = token;
+            while !last.ends_with(']') {
+                let Some(next) = tokens.next() else { break };
+                group.push(' ');
+                group.push_str(next);
+                last = next;
+            }
+            if is_positional {
+                names.push(to_positional(&group));
+            }
+        } else if token.starts_with('-') {
+            if !token.contains('=') && tokens.peek().is_some_and(|t| t.starts_with('<')) {
+                tokens.next();
+            }
+        } else if token.starts_with('<') {
+            names.push(to_positional(token));
+        }
+    }
+    names
+}
+
 /// Render a flag name with the dash count an agent must actually type:
 /// `-n` for single-character flags, `--select` for long ones.
 pub(crate) fn flag_display(name: &str) -> String {
@@ -239,6 +283,30 @@ mod tests {
         assert!(set.contains("no-git"));
         assert!(set.contains("dry-run"));
         assert!(!set.contains("title"));
+    }
+
+    #[test]
+    fn positional_names_lists_placeholders_in_order() {
+        let names = |usage| {
+            positional_names(usage)
+                .into_iter()
+                .map(|p| (p.name, p.variadic))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names("app set <name> [<note>] [--tag <t>] [-n <count>] [path] <value>"),
+            [
+                ("name".to_string(), false),
+                ("note".to_string(), false),
+                ("path".to_string(), false),
+                ("value".to_string(), false),
+            ]
+        );
+        assert_eq!(
+            names("app run <cmd> [args...]"),
+            [("cmd".to_string(), false), ("args".to_string(), true)]
+        );
+        assert_eq!(names("app status [--follow]"), []);
     }
 
     // --- next_action_from_usage tests ---

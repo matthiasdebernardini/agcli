@@ -101,8 +101,13 @@ impl AgentCli {
             return self.error_execution(
                 invocation.command_line().to_string(),
                 clock,
-                dispatch::extra_arg_error("version", &usage, arity, given)
-                    .next_actions(self.root_actions()),
+                dispatch::extra_arg_error(
+                    "version",
+                    &usage,
+                    arity,
+                    &given.iter().map(|arg| self.echoed(arg)).collect::<Vec<_>>(),
+                )
+                .next_actions(self.root_actions()),
             );
         }
         // `version` names no command, so the flags are checked as the root's.
@@ -157,7 +162,7 @@ impl AgentCli {
                 clock,
                 CommandError::new(
                     ErrorCode::UNKNOWN_COMMAND,
-                    format!("unknown command: {first}"),
+                    format!("unknown command: {}", self.echoed(first)),
                     suggest::unknown_command_fix("command", first, &valid),
                 )
                 .next_actions(self.root_actions()),
@@ -174,7 +179,10 @@ impl AgentCli {
                 clock,
                 CommandError::new(
                     ErrorCode::UNKNOWN_SUBCOMMAND,
-                    format!("unknown subcommand: {}", resolved.remaining[0]),
+                    format!(
+                        "unknown subcommand: {}",
+                        self.echoed(&resolved.remaining[0])
+                    ),
                     suggest::unknown_command_fix("subcommand", &resolved.remaining[0], &valid),
                 )
                 .next_actions(self.subcommand_actions(&path_strs, command)),

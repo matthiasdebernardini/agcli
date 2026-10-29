@@ -270,7 +270,7 @@ async fn an_unknown_flag_before_the_name_is_refused_like_anywhere_else() {
     let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
     assert_eq!(json["error"]["code"], json!("UNKNOWN_FLAG"), "{json}");
     assert_eq!(json["error"]["message"], json!("unknown flag(s): --bogus"));
-    assert_eq!(json["command"], json!("app --bogus=1 grep pat"));
+    assert_eq!(json["command"], json!("app --bogus=<redacted> grep pat"));
 }
 
 #[tokio::test]
@@ -622,7 +622,10 @@ async fn a_malformed_token_before_the_name_is_the_frameworks_parse_error() {
     assert!(seen.is_empty(), "the handler ran");
     let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
     assert_eq!(json["error"]["code"], json!("PARSE_ERROR"), "{json}");
-    assert_eq!(json["error"]["message"], json!("invalid flag syntax: --=x"));
+    assert_eq!(
+        json["error"]["message"],
+        json!("invalid flag syntax: --=<redacted>")
+    );
 }
 
 #[tokio::test]

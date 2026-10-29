@@ -11,7 +11,7 @@ use crate::command::RawCommandHandler;
 use crate::command_error::CommandError;
 use crate::dispatch::RunMode;
 use crate::execution::{Execution, Output};
-use crate::invocation::{self, Invocation};
+use crate::invocation::Invocation;
 use crate::panic_hook::{self, PanicTarget};
 
 impl AgentCli {
@@ -25,13 +25,11 @@ impl AgentCli {
     pub(crate) async fn run_raw(
         &self,
         handler: &RawCommandHandler,
-        argv: &[String],
-        args_start: usize,
+        tail: Vec<String>,
+        command_line: String,
         clock: &Arc<ClockFn>,
         mode: RunMode,
     ) -> Execution {
-        let command_line = invocation::render_command_line(&argv[0], &argv[1..]);
-        let tail: Vec<String> = argv[args_start.min(argv.len())..].to_vec();
         let report = (mode == RunMode::Process).then(|| {
             self.panic_report(
                 command_line.clone(),

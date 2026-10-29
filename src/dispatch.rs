@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::io;
+use std::iter;
 use std::mem;
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use crate::invocation::{self, Invocation, ParseInvocationError};
 use crate::panic_hook::{self, PanicTarget};
 use crate::project;
 use crate::raw;
+use crate::redaction;
 use crate::reserved_flags;
 use crate::select;
 use crate::stream::StreamWriter;
@@ -124,10 +126,7 @@ impl AgentCli {
         let clock = match self.run_clock() {
             Ok(clock) => clock,
             Err(error) => {
-                return self.invalid_env(
-                    invocation::render_command_line(&argv[0], &argv[1..]),
-                    &error,
-                );
+                return self.invalid_env(self.opaque_command_line(&argv), &error);
             }
         };
 
@@ -138,18 +137,25 @@ impl AgentCli {
                 prefix,
             } => {
                 return self
-                    .raw_execution(handler, &argv, args_start, prefix.as_ref(), &clock, mode)
+                    .claim_raw(handler, &argv, args_start, prefix, &clock, mode)
                     .await;
             }
             ParsedArgv::Failed(error) => {
                 return self.error_execution(
-                    invocation::render_command_line(&argv[0], &argv[1..]),
+                    self.opaque_command_line(&argv),
                     &*clock,
-                    CommandError::new(ErrorCode::PARSE_ERROR, error.to_string(), error.fix())
-                        .next_actions(self.root_actions()),
+                    CommandError::new(
+                        ErrorCode::PARSE_ERROR,
+                        error.redacted().to_string(),
+                        error.fix(),
+                    )
+                    .next_actions(self.root_actions()),
                 );
             }
-            ParsedArgv::Invocation(invocation) => Arc::new(invocation),
+            ParsedArgv::Invocation(mut invocation) => {
+                self.redact_invocation(&mut invocation);
+                Arc::new(invocation)
+            }
         };
 
         // Every path below reads the boolean flags, so a value that is not a
@@ -228,6 +234,124 @@ impl AgentCli {
         self.run_handler(&gate, handler, request, mode).await
     }
 
+    /// The `command` line for a raw command, whose tokens from `args_start`
+    /// on are its own. The tokens before them are the framework's: `prefix`
+    /// is their parse, redacted like any other line, and without one they are
+    /// command names. `prefix` takes the line too, as its envelopes name it.
+    fn raw_command_line(
+        &self,
+        argv: &[String],
+        args_start: usize,
+        mut prefix: Option<&mut Invocation>,
+    ) -> String {
+        let head = match prefix.as_deref_mut() {
+            Some(prefix) => {
+                self.redact_invocation(prefix);
+                prefix.command_line().to_string()
+            }
+            None => invocation::render_command_line(&argv[0], &argv[1..args_start]),
+        };
+        let tail = redaction::raw_tail_words(&argv[args_start..], self.redact_arg.as_deref());
+        let command_line = iter::once(head).chain(tail).collect::<Vec<_>>().join(" ");
+        if let Some(prefix) = prefix {
+            prefix.set_command_line(command_line.clone());
+        }
+        command_line
+    }
+
+    /// `token` as error text may show it: masked when the
+    /// [`AgentCli::redact_arg`] hook rewrites it.
+    pub(crate) fn echoed(&self, token: &str) -> String {
+        match self.redact_arg.as_deref().and_then(|hook| hook(token)) {
+            Some(_) => redaction::MARKER.to_string(),
+            None => token.to_string(),
+        }
+    }
+
+    /// The `command` line for argv the framework cannot read token by token:
+    /// a line that failed to parse, or a raw command's, whose tokens are its
+    /// own. See [`redaction::opaque_words`].
+    pub(crate) fn opaque_command_line(&self, argv: &[String]) -> String {
+        let words =
+            redaction::opaque_words(&argv[1..], self.redact_arg.as_deref(), |path, token| {
+                self.names_command(path, token)
+            });
+        iter::once(invocation::shell_quote(invocation::program_name(&argv[0])).into_owned())
+            .chain(words)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Mask what `invocation` carries that must not be echoed, once the
+    /// command it names is known: the value of every flag that command does
+    /// not declare (a flag no usage declares is not known to be harmless), of
+    /// every [`Command::secret`](crate::Command::secret) flag, and of every
+    /// secret positional, then whatever the [`AgentCli::redact_arg`] hook
+    /// rewrites. Before a command is known, only the flags the framework
+    /// reserves are left alone.
+    fn redact_invocation(&self, invocation: &mut Invocation) {
+        let resolved = self.resolve_command(invocation.positionals());
+        let path_cmds = resolved
+            .as_ref()
+            .map_or_else(Vec::new, |resolved| self.path_command_refs(resolved.path));
+        let path_len = resolved.as_ref().map_or(0, |resolved| resolved.path.len());
+        let mut declared = HashSet::new();
+        for command in &path_cmds {
+            if let Some(usage) = &command.usage {
+                usage::extract_all_flag_names(usage, &mut declared);
+            }
+        }
+        let reserved = reserved_flags::reserved_flag_names();
+        let secret_flag = |name: &str| {
+            path_cmds
+                .iter()
+                .any(|command| command.secrets.iter().any(|secret| secret == name))
+        };
+        let mask_flag = |name: &str| {
+            let known = declared.contains(name)
+                || reserved_flags::is_framework_flag(name)
+                || (self.reserved_flags && reserved.contains(&name));
+            secret_flag(name) || !known
+        };
+        let secret_positionals = path_cmds.last().map_or_else(Vec::new, |leaf| {
+            let names = leaf
+                .usage
+                .as_deref()
+                .map_or_else(Vec::new, usage::positional_names);
+            names
+                .into_iter()
+                .enumerate()
+                .filter(|(_, positional)| leaf.secrets.contains(&positional.name))
+                .map(|(index, positional)| (index, positional.variadic))
+                .collect()
+        });
+        let mask_positional = |index: usize| {
+            index.checked_sub(path_len).is_some_and(|own| {
+                secret_positionals
+                    .iter()
+                    .any(|&(at, variadic)| own == at || (variadic && own > at))
+            })
+        };
+        invocation.redact(self.redact_arg.as_deref(), mask_flag, mask_positional);
+    }
+
+    /// Answer a raw command that claimed argv from `args_start` on: name the
+    /// line, split off the command's own tokens, and run it.
+    async fn claim_raw(
+        &self,
+        handler: &RawCommandHandler,
+        argv: &[String],
+        args_start: usize,
+        mut prefix: Option<Invocation>,
+        clock: &Arc<ClockFn>,
+        mode: RunMode,
+    ) -> Execution {
+        let command_line = self.raw_command_line(argv, args_start, prefix.as_mut());
+        let tail = argv[args_start.min(argv.len())..].to_vec();
+        self.raw_execution(handler, tail, prefix.as_ref(), command_line, clock, mode)
+            .await
+    }
+
     /// Run the raw command that claimed argv from `args_start` on, once the
     /// framework has answered for its own tokens: `prefix`, the parsed line up
     /// to the command's name, when the name was not the leading token. A help
@@ -239,9 +363,9 @@ impl AgentCli {
     async fn raw_execution(
         &self,
         handler: &RawCommandHandler,
-        argv: &[String],
-        args_start: usize,
+        tail: Vec<String>,
         prefix: Option<&Invocation>,
+        command_line: String,
         clock: &Arc<ClockFn>,
         mode: RunMode,
     ) -> Execution {
@@ -265,7 +389,7 @@ impl AgentCli {
                 return execution;
             }
         }
-        self.run_raw(handler, argv, args_start, clock, mode).await
+        self.run_raw(handler, tail, command_line, clock, mode).await
     }
 
     /// The refusal of a reserved agent flag before a raw command's name. A
@@ -472,14 +596,16 @@ impl AgentCli {
             // The tokens up to the command's name are the framework's. They
             // parse whenever the whole line did; after a parse failure, a
             // prefix that fails to parse is the framework's own error.
-            Invocation::parse_prefix(argv, args_start, is_bool, names_command).map_or_else(
-                ParsedArgv::Failed,
-                |prefix| ParsedArgv::Raw {
-                    handler,
-                    args_start,
-                    prefix: Some(prefix),
-                },
+            Invocation::parse_in_tree(
+                argv[..args_start].iter().map(String::as_str),
+                is_bool,
+                names_command,
             )
+            .map_or_else(ParsedArgv::Failed, |prefix| ParsedArgv::Raw {
+                handler,
+                args_start,
+                prefix: Some(prefix),
+            })
         };
         let invocation = match Invocation::parse_in_tree(
             argv.iter().map(String::as_str),
@@ -531,7 +657,7 @@ impl AgentCli {
         name: &str,
         value: &str,
     ) -> Execution {
-        let error = reserved_flags::not_a_boolean(name, value);
+        let error = reserved_flags::not_a_boolean(name, invocation.shown_flag_value(name, value));
         let command_line = invocation.command_line().to_string();
         let Some(resolved) = self.resolve_command(invocation.positionals()) else {
             return self.error_execution(
@@ -598,7 +724,7 @@ impl AgentCli {
             clock,
             CommandError::new(
                 ErrorCode::UNKNOWN_COMMAND,
-                format!("unknown command: {unknown}"),
+                format!("unknown command: {}", self.echoed(unknown)),
                 suggest::unknown_command_fix("command", unknown, &valid),
             )
             .next_actions(self.root_actions()),
@@ -629,7 +755,10 @@ impl AgentCli {
                 clock,
                 CommandError::new(
                     ErrorCode::UNKNOWN_SUBCOMMAND,
-                    format!("unknown subcommand: {}", resolved.remaining[0]),
+                    format!(
+                        "unknown subcommand: {}",
+                        self.echoed(&resolved.remaining[0])
+                    ),
                     suggest::unknown_command_fix("subcommand", &resolved.remaining[0], &valid),
                 )
                 .next_actions(self.subcommand_actions(&path_strs, command)),
@@ -768,10 +897,21 @@ impl AgentCli {
             && let Some(arity) = usage::positional_arity(usage)
             && resolved.remaining.len() > arity.required + arity.optional
         {
-            return Some(self.gate_error(
-                gate,
-                extra_arg_error(&gate.path_strs.join(" "), usage, arity, resolved.remaining),
-            ));
+            return Some(
+                self.gate_error(
+                    gate,
+                    extra_arg_error(
+                        &gate.path_strs.join(" "),
+                        usage,
+                        arity,
+                        &resolved
+                            .remaining
+                            .iter()
+                            .map(|arg| self.echoed(arg))
+                            .collect::<Vec<_>>(),
+                    ),
+                ),
+            );
         }
         None
     }

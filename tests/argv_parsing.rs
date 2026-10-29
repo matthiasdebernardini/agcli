@@ -281,7 +281,7 @@ async fn bundled_short_flags_with_a_value_are_a_parse_error() {
     assert_eq!(usage_error_code(&run), "PARSE_ERROR");
     assert_eq!(
         parse(&run)["error"]["message"],
-        json!("invalid flag syntax: -abc=5")
+        json!("invalid flag syntax: -abc=<redacted>")
     );
     let envelope = parse(&run);
     let fix = envelope["fix"].as_str().expect("fix");
@@ -383,7 +383,10 @@ async fn a_line_that_fails_to_parse_is_named_like_any_other() {
         .run(["/usr/local/bin/calc", "--=x", "two words"])
         .await;
     assert_eq!(usage_error_code(&run), "PARSE_ERROR");
-    assert_eq!(parse(&run)["command"], json!("calc --=x 'two words'"));
+    assert_eq!(
+        parse(&run)["command"],
+        json!("calc --=<redacted> <redacted>")
+    );
 }
 
 #[tokio::test]

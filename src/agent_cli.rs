@@ -17,6 +17,7 @@ use crate::invocation::Invocation;
 use crate::next_action::NextAction;
 use crate::panic_hook::{PanicReport, PanicTarget};
 use crate::project;
+use crate::redaction::RedactFn;
 use crate::reserved_flags;
 use crate::select;
 use crate::timestamp::Timestamp;
@@ -40,6 +41,8 @@ pub struct AgentCli {
     pub(crate) reserved_flags: bool,
     /// The clock set with [`AgentCli::clock`]; `None` is the default clock.
     pub(crate) clock: Option<Arc<ClockFn>>,
+    /// The hook set with [`AgentCli::redact_arg`].
+    pub(crate) redact_arg: Option<Arc<RedactFn>>,
 }
 
 impl fmt::Debug for AgentCli {
@@ -50,6 +53,7 @@ impl fmt::Debug for AgentCli {
             .field("version", &self.version)
             .field("command_count", &self.commands.len())
             .field("custom_clock", &self.clock.is_some())
+            .field("redact_arg", &self.redact_arg.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -72,6 +76,7 @@ impl AgentCli {
             root_extra: Map::new(),
             reserved_flags: true,
             clock: None,
+            redact_arg: None,
         }
     }
 
@@ -135,6 +140,51 @@ impl AgentCli {
     #[must_use]
     pub fn clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.clock = Some(Arc::new(move || clock::checked(clock())));
+        self
+    }
+
+    /// Redact argv elements the framework cannot know are secret, before any
+    /// envelope echoes them.
+    ///
+    /// Every envelope's `command` field repeats the argv, and a few errors
+    /// quote an argument. The framework already masks the value of a flag the
+    /// command's usage does not declare, and of anything marked with
+    /// [`Command::secret`]. `hook` covers what only the app knows, such as a
+    /// `field=value` positional whose field is sensitive. It runs on each argv
+    /// element as given, and returns the text to echo in its place, or `None`
+    /// to echo the element as it is. An element it rewrites is also kept out
+    /// of error text. The handler still receives the real values.
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use agcli::{AgentCli, Command, CommandOutput};
+    /// use serde_json::json;
+    ///
+    /// let cli = AgentCli::new("pw", "Password store")
+    ///     .redact_arg(|arg| {
+    ///         let (field, _) = arg.split_once('=')?;
+    ///         matches!(field, "password" | "token").then(|| format!("{field}=<redacted>"))
+    ///     })
+    ///     .command(
+    ///         Command::new("edit", "Edit an item")
+    ///             .usage("pw edit <item> <assignment>")
+    ///             .handler(|req| async move {
+    ///                 let assignment = req.require_arg(1, "assignment")?;
+    ///                 Ok(CommandOutput::new(json!({ "assignment_len": assignment.len() })))
+    ///             }),
+    ///     );
+    /// let run = cli.run(["pw", "edit", "github", "password=hunter2"]).await;
+    /// assert!(run.to_json().contains(r#""command":"pw edit github 'password=<redacted>'""#));
+    /// assert!(!run.to_json().contains("hunter2"));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn redact_arg(
+        mut self,
+        hook: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.redact_arg = Some(Arc::new(hook));
         self
     }
 

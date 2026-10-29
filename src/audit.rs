@@ -134,6 +134,7 @@ impl AgentCli {
             let path = path_buf.join(" ");
 
             Self::audit_command_shape(command, &path, report);
+            Self::audit_secrets(command, &path, report);
             if let Some(usage) = &command.usage {
                 self.audit_usage(command, usage, &path, report);
             }
@@ -305,6 +306,43 @@ impl AgentCli {
                             .map(|f| usage::flag_display(f))
                             .collect::<Vec<_>>()
                             .join(", ")
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Findings about `command`'s [`Command::secret`] marks. A name the usage
+    /// declares neither as a flag nor as a positional protects nothing, so the
+    /// secret it was meant to hide is echoed. A raw command's tokens are never
+    /// parsed, so no mark on it can apply.
+    fn audit_secrets(command: &Command, path: &str, report: &mut AuditReport) {
+        let usage = command.usage.as_deref().unwrap_or("");
+        if command.is_raw() && !command.secrets.is_empty() {
+            report.push(
+                AuditSeverity::Error,
+                "SECRET_ON_RAW_COMMAND",
+                path,
+                "raw command marks secrets; the framework never parses a raw command's \
+                 tokens, so none of them is masked by name. Mask them with \
+                 `AgentCli::redact_arg`"
+                    .to_string(),
+            );
+            return;
+        }
+        let mut flags = HashSet::new();
+        usage::extract_all_flag_names(usage, &mut flags);
+        let positionals = usage::positional_names(usage);
+        for name in &command.secrets {
+            if !flags.contains(name) && !positionals.iter().any(|p| &p.name == name) {
+                report.push(
+                    AuditSeverity::Error,
+                    "UNDECLARED_SECRET",
+                    path,
+                    format!(
+                        "secret `{name}` is neither a flag nor a positional of usage `{usage}`, \
+                         so nothing is masked for it; spell it as the usage does, without \
+                         dashes or angle brackets"
                     ),
                 );
             }

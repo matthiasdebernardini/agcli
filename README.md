@@ -394,6 +394,83 @@ the path mismatch as `USAGE_PATH_MISMATCH`.
 - Booleans are scoped to the resolved command, so two commands can use one flag
   name with different meanings.
 
+### Secrets in argv
+
+Every envelope's `command` field repeats the argv, and a few errors quote an
+argument, so a secret given as an argument would be printed back. agcli masks
+it as `<redacted>`, and the handler still reads the real value.
+
+- **Undeclared flags.** The value of a flag that no usage string on the
+  command's path declares and the framework does not reserve is never echoed,
+  in `--flag=value`, `--flag value`, `-x=value` and `-x value` alike. The
+  flag's name stays: `passwarden store unlock --passphrase=hunter2` is an
+  `UNKNOWN_FLAG` whose `command` reads
+  `passwarden store unlock --passphrase=<redacted>`. There is nothing to turn
+  on. This also covers the flags of a command that opts out of the check with
+  `allow_unknown_flags()`.
+- **Declared secrets.** Mark a flag or positional with `Command::secret`,
+  naming it as the usage spells it, without dashes or angle brackets. Its
+  value is masked in `command` and in the text of every error the framework
+  or `CommandRequest::arg_parse` and `flag_parse` raise. A secret flag covers
+  the command's subcommands, and a variadic positional is secret from its
+  position on.
+- **Patterns only the app knows.** `AgentCli::redact_arg` takes a hook that
+  sees each argv element as given and returns the text to echo instead, or
+  `None` to leave it. It runs on flags, flag values and positionals, in
+  `command` and in the errors that quote an argument.
+
+```rust
+use agcli::{AgentCli, Command, CommandOutput};
+use serde_json::json;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let cli = AgentCli::new("pw", "Password store")
+    .clock(|| 0)
+    // `field=value` assignments: keep the field, drop the value.
+    .redact_arg(|arg| {
+        let (field, _) = arg.split_once('=')?;
+        matches!(field, "password" | "token").then(|| format!("{field}=<redacted>"))
+    })
+    .command(
+        Command::new("unlock", "Unlock the store")
+            .usage("pw unlock <store> --passphrase=<value>")
+            .secret("passphrase")
+            .handler(|req| async move {
+                let passphrase = req.flag("passphrase").unwrap_or_default();
+                Ok(CommandOutput::new(json!({ "length": passphrase.len() })))
+            }),
+    )
+    .command(
+        Command::new("edit", "Edit an item")
+            .usage("pw edit <item> <assignment>")
+            .handler(|req| async move {
+                let assignment = req.require_arg(1, "assignment")?;
+                Ok(CommandOutput::new(json!({ "length": assignment.len() })))
+            }),
+    );
+
+let run = cli.run(["pw", "unlock", "vault", "--passphrase=hunter2"]).await;
+assert!(run.to_json().contains(r#""command":"pw unlock vault --passphrase=<redacted>""#));
+assert!(run.to_json().contains(r#""length":7"#)); // the handler read the real value
+
+let run = cli.run(["pw", "edit", "github", "password=hunter2"]).await;
+assert!(run.to_json().contains(r#""command":"pw edit github 'password=<redacted>'""#));
+assert!(!run.to_json().contains("hunter2"));
+# }
+```
+
+Where the framework cannot tell a value from a word, it masks more. A line
+that fails to parse keeps flag names and command names and masks every other
+token. A raw command's tokens are never parsed: its flags lose their values and
+the token after a bare flag is masked, while its positionals are echoed unless
+the hook rewrites them, so use the hook for those. Positionals no usage marks
+secret, such as an unexpected extra argument, are echoed unless the hook
+rewrites them. A handler that puts an argument in its own result or error text
+must mask it itself. `audit()` reports a `Command::secret` name the usage does
+not declare (`UNDECLARED_SECRET`) and a secret on a raw command
+(`SECRET_ON_RAW_COMMAND`), since neither masks anything.
+
 ### `next_actions`
 
 A `next_action` is a command and a description:
@@ -1166,8 +1243,9 @@ a stream's events with `stream_events()`. A raw handler still writes to the
 real stdout. With the clock pinned, the output is byte-stable.
 
 `audit()` checks the tree without running it. Every declared `next_action` must
-resolve to a real command, no command may be a dead end, and usage strings must
-be well formed. It also warns about missing descriptions and usage strings. It
+resolve to a real command, no command may be a dead end, usage strings must
+be well formed, and every `Command::secret` must name something the usage
+declares. It also warns about missing descriptions and usage strings. It
 sees what is declared (descriptions, usage strings, `default_next_action`s),
 not the `next_actions` a handler builds at run time.
 
@@ -1203,7 +1281,7 @@ order:
 | Key | Present | Value |
 |-----|---------|-------|
 | `ok` | always | `true` on success, `false` on failure |
-| `command` | always | the invocation as one shell line that reruns as printed: the program's file name, then every argument, single-quoted unless it is made only of ASCII letters, digits and `-_=/.:,@+` |
+| `command` | always | the invocation as one shell line: the program's file name, then every argument, single-quoted unless it is made only of ASCII letters, digits and `-_=/.:,@+`. A secret argument reads `<redacted>` (see [Secrets in argv](#secrets-in-argv)), so the line reruns as printed only when nothing was masked |
 | `timestamp` | always | RFC 3339 (the internet date-time format) in UTC, to the second, from 1970 to 9999: `2026-06-10T14:42:17Z` |
 | `exit_code` | always | the process status, 0 to 255 |
 | `schema_version` | when the CLI sets `AgentCli::schema_version` | a string |
