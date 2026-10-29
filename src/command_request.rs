@@ -142,11 +142,18 @@ impl CommandRequest {
         T::Err: fmt::Display,
     {
         let raw = self.require_arg(index, name)?;
-        let shown = self.invocation.shown_positional(self.path_len + index);
+        let at = self.path_len + index;
+        let shown = self.invocation.shown_positional(at);
         let value = raw.parse::<T>().map_err(|err| {
+            // A parse error may repeat the input, so a masked value gets none.
+            let detail = if self.invocation.positional_is_masked(at) {
+                String::new()
+            } else {
+                format!(" ({err})")
+            };
             CommandError::new(
                 ErrorCode::INVALID_ARG,
-                format!("argument <{name}> is not valid: {shown:?} ({err})"),
+                format!("argument <{name}> is not valid: {shown:?}{detail}"),
                 format!("Pass a valid value for <{name}>."),
             )
             .exit_code(ExitCode::USAGE)
@@ -195,9 +202,16 @@ impl CommandRequest {
                 }
                 let shown = self.invocation.shown_flag_value(key, raw);
                 let value = raw.parse::<T>().map_err(|err| {
+                    // A parse error may repeat the input, so a masked value
+                    // gets none.
+                    let detail = if self.invocation.flag_is_masked(key) {
+                        String::new()
+                    } else {
+                        format!(" ({err})")
+                    };
                     CommandError::new(
                         ErrorCode::INVALID_FLAG,
-                        format!("flag {flag} is not valid: {shown:?} ({err})"),
+                        format!("flag {flag} is not valid: {shown:?}{detail}"),
                         format!("Pass a valid value for {flag}."),
                     )
                     .exit_code(ExitCode::USAGE)

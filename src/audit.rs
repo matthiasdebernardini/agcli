@@ -119,7 +119,8 @@ impl AgentCli {
     pub fn audit(&self) -> AuditReport {
         let mut report = AuditReport::default();
         let mut path_buf: Vec<&str> = Vec::new();
-        self.audit_commands(&self.commands, &mut path_buf, &mut report);
+        let mut ancestors: Vec<&Command> = Vec::new();
+        self.audit_commands(&self.commands, &mut path_buf, &mut ancestors, &mut report);
         report
     }
 
@@ -127,6 +128,7 @@ impl AgentCli {
         &self,
         commands: &'a BTreeMap<String, Command>,
         path_buf: &mut Vec<&'a str>,
+        ancestors: &mut Vec<&'a Command>,
         report: &mut AuditReport,
     ) {
         for command in commands.values() {
@@ -134,7 +136,7 @@ impl AgentCli {
             let path = path_buf.join(" ");
 
             Self::audit_command_shape(command, &path, report);
-            Self::audit_secrets(command, &path, report);
+            Self::audit_secrets(command, ancestors, &path, report);
             if let Some(usage) = &command.usage {
                 self.audit_usage(command, usage, &path, report);
             }
@@ -152,7 +154,9 @@ impl AgentCli {
                 }
             }
 
-            self.audit_commands(&command.subcommands, path_buf, report);
+            ancestors.push(command);
+            self.audit_commands(&command.subcommands, path_buf, ancestors, report);
+            ancestors.pop();
             path_buf.pop();
         }
     }
@@ -312,12 +316,18 @@ impl AgentCli {
         }
     }
 
-    /// Findings about `command`'s [`Command::secret`] marks. A name the usage
-    /// declares neither as a flag nor as a positional protects nothing, so the
-    /// secret it was meant to hide is echoed. A raw command's tokens are never
-    /// parsed, so no mark on it can apply.
-    fn audit_secrets(command: &Command, path: &str, report: &mut AuditReport) {
-        let usage = command.usage.as_deref().unwrap_or("");
+    /// Findings about `command`'s [`Command::secret`] marks. A flag name
+    /// counts when any command on a path through `command` declares it (its
+    /// `ancestors`, itself, or a subcommand), as a run reads it; a positional
+    /// name must be one of `command`'s own. A name declared nowhere protects
+    /// nothing, so the secret it was meant to hide is echoed. A raw command's
+    /// tokens are never parsed, so no mark on it can apply.
+    fn audit_secrets(
+        command: &Command,
+        ancestors: &[&Command],
+        path: &str,
+        report: &mut AuditReport,
+    ) {
         if command.is_raw() && !command.secrets.is_empty() {
             report.push(
                 AuditSeverity::Error,
@@ -330,22 +340,51 @@ impl AgentCli {
             );
             return;
         }
+        let usage = command.usage.as_deref().unwrap_or("");
         let mut flags = HashSet::new();
-        usage::extract_all_flag_names(usage, &mut flags);
+        for ancestor in ancestors {
+            if let Some(usage) = &ancestor.usage {
+                usage::extract_all_flag_names(usage, &mut flags);
+            }
+        }
+        Self::collect_flags(command, &mut flags);
         let positionals = usage::positional_names(usage);
         for name in &command.secrets {
-            if !flags.contains(name) && !positionals.iter().any(|p| &p.name == name) {
+            let position = positionals.iter().position(|p| &p.name == name);
+            if !flags.contains(name) && position.is_none() {
                 report.push(
                     AuditSeverity::Error,
                     "UNDECLARED_SECRET",
                     path,
                     format!(
-                        "secret `{name}` is neither a flag nor a positional of usage `{usage}`, \
-                         so nothing is masked for it; spell it as the usage does, without \
-                         dashes or angle brackets"
+                        "secret `{name}` is neither a flag on this command's path nor a \
+                         positional of usage `{usage}`, so nothing is masked for it; spell \
+                         it as the usage does, without dashes or angle brackets"
                     ),
                 );
             }
+            if position.is_some_and(|at| positionals[..at].iter().any(|p| p.optional)) {
+                report.push(
+                    AuditSeverity::Warning,
+                    "SECRET_AFTER_OPTIONAL",
+                    path,
+                    format!(
+                        "secret positional `{name}` follows an optional one in usage `{usage}`; \
+                         when the optional is left out the secret takes its place, so every \
+                         positional from the first optional on is masked"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Add the flags `command` and all its subcommands declare to `flags`.
+    fn collect_flags(command: &Command, flags: &mut HashSet<String>) {
+        if let Some(usage) = &command.usage {
+            usage::extract_all_flag_names(usage, flags);
+        }
+        for subcommand in command.subcommands.values() {
+            Self::collect_flags(subcommand, flags);
         }
     }
 

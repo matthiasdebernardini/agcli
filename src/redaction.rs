@@ -44,6 +44,34 @@ pub(crate) fn hooked_word(hook: Option<&RedactFn>, token: &str) -> (String, bool
     )
 }
 
+/// True for a token that starts a flag: `-` and something, not a number.
+fn is_flag_token(token: &str) -> bool {
+    token.starts_with('-') && token.len() > 1 && !looks_like_negative_number(token)
+}
+
+/// The indexes of the flag tokens in `args` that sit right after a bare flag
+/// or a bundle of short flags. Read without the command tree, any of them may
+/// be the value of the flag before it, so a line the framework could not
+/// read masks them whole.
+pub(crate) fn tied_flag_tokens(args: &[String]) -> Vec<usize> {
+    let mut tied = Vec::new();
+    let mut after_bare = false;
+    for (at, token) in args.iter().enumerate() {
+        if token == "--" {
+            break;
+        }
+        if !is_flag_token(token) {
+            after_bare = false;
+            continue;
+        }
+        if after_bare {
+            tied.push(at);
+        }
+        after_bare = !token.contains('=');
+    }
+    tied
+}
+
 /// The shell words for `args` when the framework cannot tell which tokens are
 /// values: a line it failed to parse, or a raw command's tokens, which it
 /// never parses. A flag keeps its name and loses its `=value`, and every other
@@ -57,11 +85,14 @@ pub(crate) fn opaque_words(
 ) -> Vec<String> {
     let mut path: Vec<String> = Vec::new();
     let mut flags_ended = false;
+    let tied = tied_flag_tokens(args);
     let mut words = Vec::with_capacity(args.len());
-    for token in args {
+    for (at, token) in args.iter().enumerate() {
         let (word, hooked) = hooked_word(hook, token);
         if hooked {
             words.push(word);
+        } else if tied.contains(&at) {
+            words.push(MARKER.to_string());
         } else if flags_ended || !token.starts_with('-') || looks_like_negative_number(token) {
             if names_command(&path, token) {
                 path.push(token.clone());
@@ -92,6 +123,10 @@ pub(crate) fn raw_tail_words(tail: &[String], hook: Option<&RedactFn>) -> Vec<St
         if hooked {
             after_bare_flag = false;
             words.push(word);
+        } else if is_flag && after_bare_flag && token != "--" {
+            // It may be the value of the flag before it.
+            after_bare_flag = !token.contains('=');
+            words.push(MARKER.to_string());
         } else if is_flag {
             flags_ended = token == "--";
             after_bare_flag = !flags_ended && !token.contains('=');

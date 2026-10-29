@@ -227,3 +227,10 @@ async fn timestamp_renders_the_day_after_the_first_february() {
         "timestamp must be 1970-03-02, never the impossible 1970-02-30"
     );
 }
+
+// A secret given as a flag value is masked in the `command` line.
+golden!(
+    unknown_flag_value_is_masked,
+    &["calc", "add", "1", "2", "--token=hunter2"],
+    r#"{"ok":false,"command":"calc add 1 2 --token=<redacted>","timestamp":"1970-01-01T00:00:00Z","exit_code":2,"error":{"message":"unknown flag(s): --token","code":"UNKNOWN_FLAG","retryable":false},"fix":"`add` takes no flags of its own. Reserved agent flags (--select, --compact, --quiet, --dry-run, --yes, --no-input, --no-cache, --no-color, --stdin, --json) are accepted on every command, as are --help and --version.","next_actions":[{"command":"calc add <a> <b>","description":"Run this command template","params":{"a":{"required":true},"b":{"required":true}}},{"command":"calc","description":"Inspect the full command tree"}]}"#
+);

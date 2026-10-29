@@ -105,7 +105,9 @@ impl AgentCli {
                     "version",
                     &usage,
                     arity,
-                    &given.iter().map(|arg| self.echoed(arg)).collect::<Vec<_>>(),
+                    &(1..=given.len())
+                        .map(|at| self.echoed_at(invocation, at))
+                        .collect::<Vec<_>>(),
                 )
                 .next_actions(self.root_actions()),
             );
@@ -155,6 +157,7 @@ impl AgentCli {
             return self.root_execution(invocation, clock);
         };
 
+        let offset = invocation.positionals().len() - targets.len();
         let Some(resolved) = self.resolve_command(targets) else {
             let valid: Vec<&str> = self.commands.keys().map(String::as_str).collect();
             return self.error_execution(
@@ -162,7 +165,7 @@ impl AgentCli {
                 clock,
                 CommandError::new(
                     ErrorCode::UNKNOWN_COMMAND,
-                    format!("unknown command: {}", self.echoed(first)),
+                    format!("unknown command: {}", self.echoed_at(invocation, offset)),
                     suggest::unknown_command_fix("command", first, &valid),
                 )
                 .next_actions(self.root_actions()),
@@ -181,7 +184,7 @@ impl AgentCli {
                     ErrorCode::UNKNOWN_SUBCOMMAND,
                     format!(
                         "unknown subcommand: {}",
-                        self.echoed(&resolved.remaining[0])
+                        self.echoed_at(invocation, offset + resolved.path.len())
                     ),
                     suggest::unknown_command_fix("subcommand", &resolved.remaining[0], &valid),
                 )

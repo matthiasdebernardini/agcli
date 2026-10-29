@@ -15,7 +15,13 @@ On the wire, for agents and the programs that read agcli output:
     `app run --passphrase=<redacted>`. The `PARSE_ERROR` for a malformed token
     such as `-abc=5` quotes it as `-abc=<redacted>`, a line that fails to
     parse masks every token that is not a flag name or a command name, and the
-    flag values in a raw command's tokens are masked. A line that used to
+    flag values in a raw command's tokens, and before its name, are masked.
+    A token right after a masked bare flag is masked whole, even when it
+    starts with a dash, and the flags it would set are left out of
+    `UNKNOWN_FLAG` and `PARSE_ERROR` text. The type's own parse error is
+    left out of `arg_parse` and `flag_parse` errors for a masked value, and
+    error text that quotes a hook-rewritten argument carries the hook's text,
+    as `command` does. A line that used to
     rerun as printed no longer does when it carried such a value: declare the
     flag in the usage (`--passphrase=<value>`) to keep its value in `command`.
 
@@ -49,10 +55,13 @@ On the wire, for agents and the programs that read agcli output:
     to each argv element before an envelope echoes it, for patterns only the
     app knows, such as `field=value` assignments. See "Secrets in argv" in the
     README.
-- **`audit()` reports `UNDECLARED_SECRET`**, a `Command::secret` name the usage
-    does not declare, and **`SECRET_ON_RAW_COMMAND`**, a secret marked on a raw
+- **`audit()` reports `UNDECLARED_SECRET`**, a `Command::secret` name that no
+    command on its path declares (a flag counts from a parent's usage or a
+    subcommand's), and **`SECRET_ON_RAW_COMMAND`**, a secret marked on a raw
     command, whose tokens are never parsed. Both are errors, since neither masks
-    anything.
+    anything. **`SECRET_AFTER_OPTIONAL`** warns about a secret positional after
+    an optional one: when the optional is left out, every positional from the
+    first optional on is masked.
 
 ## [0.18.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.18.0) - 2026-10-24
 

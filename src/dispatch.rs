@@ -141,19 +141,16 @@ impl AgentCli {
                     .await;
             }
             ParsedArgv::Failed(error) => {
+                let (masked_message, masked_fix) = error.masked(&argv[1..]);
                 return self.error_execution(
                     self.opaque_command_line(&argv),
                     &*clock,
-                    CommandError::new(
-                        ErrorCode::PARSE_ERROR,
-                        error.redacted().to_string(),
-                        error.fix(),
-                    )
-                    .next_actions(self.root_actions()),
+                    CommandError::new(ErrorCode::PARSE_ERROR, masked_message, masked_fix)
+                        .next_actions(self.root_actions()),
                 );
             }
             ParsedArgv::Invocation(mut invocation) => {
-                self.redact_invocation(&mut invocation);
+                self.redact_invocation(&mut invocation, false);
                 Arc::new(invocation)
             }
         };
@@ -246,7 +243,7 @@ impl AgentCli {
     ) -> String {
         let head = match prefix.as_deref_mut() {
             Some(prefix) => {
-                self.redact_invocation(prefix);
+                self.redact_invocation(prefix, true);
                 prefix.command_line().to_string()
             }
             None => invocation::render_command_line(&argv[0], &argv[1..args_start]),
@@ -259,12 +256,23 @@ impl AgentCli {
         command_line
     }
 
-    /// `token` as error text may show it: masked when the
-    /// [`AgentCli::redact_arg`] hook rewrites it.
+    /// `token` as error text may show it: the text the
+    /// [`AgentCli::redact_arg`] hook gives for it, as the `command` line
+    /// shows it.
     pub(crate) fn echoed(&self, token: &str) -> String {
-        match self.redact_arg.as_deref().and_then(|hook| hook(token)) {
-            Some(_) => redaction::MARKER.to_string(),
-            None => token.to_string(),
+        self.redact_arg
+            .as_deref()
+            .and_then(|hook| hook(token))
+            .unwrap_or_else(|| token.to_string())
+    }
+
+    /// Positional `index` of `invocation` as error text may show it: masked
+    /// when it was, else as [`Self::echoed`] has it.
+    pub(crate) fn echoed_at(&self, invocation: &Invocation, index: usize) -> String {
+        if invocation.positional_is_masked(index) {
+            redaction::MARKER.to_string()
+        } else {
+            self.echoed(&invocation.positionals()[index])
         }
     }
 
@@ -289,12 +297,18 @@ impl AgentCli {
     /// secret positional, then whatever the [`AgentCli::redact_arg`] hook
     /// rewrites. Before a command is known, only the flags the framework
     /// reserves are left alone.
-    fn redact_invocation(&self, invocation: &mut Invocation) {
-        let resolved = self.resolve_command(invocation.positionals());
+    ///
+    /// `before_raw` is true for the tokens before a raw command's name: they
+    /// can never reach it, so no usage declares any of them.
+    fn redact_invocation(&self, invocation: &mut Invocation, before_raw: bool) {
+        let resolved = self
+            .resolve_command(invocation.positionals())
+            .filter(|_| !before_raw);
         let path_cmds = resolved
             .as_ref()
             .map_or_else(Vec::new, |resolved| self.path_command_refs(resolved.path));
         let path_len = resolved.as_ref().map_or(0, |resolved| resolved.path.len());
+        let given = invocation.positionals().len().saturating_sub(path_len);
         let mut declared = HashSet::new();
         for command in &path_cmds {
             if let Some(usage) = &command.usage {
@@ -313,23 +327,36 @@ impl AgentCli {
                 || (self.reserved_flags && reserved.contains(&name));
             secret_flag(name) || !known
         };
-        let secret_positionals = path_cmds.last().map_or_else(Vec::new, |leaf| {
-            let names = leaf
-                .usage
-                .as_deref()
-                .map_or_else(Vec::new, usage::positional_names);
-            names
-                .into_iter()
-                .enumerate()
-                .filter(|(_, positional)| leaf.secrets.contains(&positional.name))
-                .map(|(index, positional)| (index, positional.variadic))
-                .collect()
-        });
+        // Positionals the usage declares, by position. When fewer are given
+        // than declared, an optional one may have been skipped, so a
+        // positional can sit in a later one's slot: from the first optional
+        // on, every one is masked if any later one is secret.
+        let (secret_positionals, masked_from) = path_cmds.last().map_or_else(
+            || (Vec::new(), None),
+            |leaf| {
+                let declared = leaf
+                    .usage
+                    .as_deref()
+                    .map_or_else(Vec::new, usage::positional_names);
+                let secret: Vec<(usize, bool)> = declared
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, positional)| leaf.secrets.contains(&positional.name))
+                    .map(|(index, positional)| (index, positional.variadic))
+                    .collect();
+                let first_optional = declared.iter().position(|positional| positional.optional);
+                let masked_from = first_optional.filter(|&optional| {
+                    given < declared.len() && secret.iter().any(|&(at, _)| at >= optional)
+                });
+                (secret, masked_from)
+            },
+        );
         let mask_positional = |index: usize| {
             index.checked_sub(path_len).is_some_and(|own| {
-                secret_positionals
-                    .iter()
-                    .any(|&(at, variadic)| own == at || (variadic && own > at))
+                masked_from.is_some_and(|from| own >= from)
+                    || secret_positionals
+                        .iter()
+                        .any(|&(at, variadic)| own == at || (variadic && own > at))
             })
         };
         invocation.redact(self.redact_arg.as_deref(), mask_flag, mask_positional);
@@ -724,7 +751,7 @@ impl AgentCli {
             clock,
             CommandError::new(
                 ErrorCode::UNKNOWN_COMMAND,
-                format!("unknown command: {}", self.echoed(unknown)),
+                format!("unknown command: {}", self.echoed_at(invocation, 0)),
                 suggest::unknown_command_fix("command", unknown, &valid),
             )
             .next_actions(self.root_actions()),
@@ -757,7 +784,7 @@ impl AgentCli {
                     ErrorCode::UNKNOWN_SUBCOMMAND,
                     format!(
                         "unknown subcommand: {}",
-                        self.echoed(&resolved.remaining[0])
+                        self.echoed_at(invocation, resolved.path.len())
                     ),
                     suggest::unknown_command_fix("subcommand", &resolved.remaining[0], &valid),
                 )
@@ -819,7 +846,12 @@ impl AgentCli {
         };
         let mut unknown: Vec<&String> = invocation.flags().keys().filter(|f| !allowed(f)).collect();
         unknown.sort();
-        let first_unknown = unknown.first()?;
+        unknown.first()?;
+        // A flag set by a token masked whole is not named: its letters would
+        // spell the secret.
+        let (hidden, unknown): (Vec<&String>, Vec<&String>) = unknown
+            .into_iter()
+            .partition(|name| invocation.flag_is_hidden(name));
         let mut declared_sorted: Vec<&str> = declared.iter().map(String::as_str).collect();
         declared_sorted.sort_unstable();
         // Typo candidates cover the reserved and framework flags too:
@@ -830,7 +862,10 @@ impl AgentCli {
         candidates.extend(reserved);
         candidates.extend(["help", "version"]);
         let mut fix = String::new();
-        if let Some(near) = suggest::nearest_name(first_unknown, &candidates) {
+        if let Some(near) = unknown
+            .first()
+            .and_then(|first| suggest::nearest_name(first, &candidates))
+        {
             let _ = write!(&mut fix, "Did you mean `{}`? ", usage::flag_display(&near));
         }
         if declared_sorted.is_empty() {
@@ -859,6 +894,7 @@ impl AgentCli {
         let unknown_list = unknown
             .iter()
             .map(|f| usage::flag_display(f))
+            .chain((!hidden.is_empty()).then(|| redaction::MARKER.to_string()))
             .collect::<Vec<_>>()
             .join(", ");
         Some(CommandError::new(
@@ -904,10 +940,14 @@ impl AgentCli {
                         &gate.path_strs.join(" "),
                         usage,
                         arity,
-                        &resolved
-                            .remaining
-                            .iter()
-                            .map(|arg| self.echoed(arg))
+                        &(0..resolved.remaining.len())
+                            .map(|at| {
+                                self.echoed_at(
+                                    gate.invocation,
+                                    gate.invocation.positionals().len() - resolved.remaining.len()
+                                        + at,
+                                )
+                            })
                             .collect::<Vec<_>>(),
                     ),
                 ),

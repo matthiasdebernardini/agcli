@@ -413,7 +413,10 @@ it as `<redacted>`, and the handler still reads the real value.
   value is masked in `command` and in the text of every error the framework
   or `CommandRequest::arg_parse` and `flag_parse` raise. A secret flag covers
   the command's subcommands, and a variadic positional is secret from its
-  position on.
+  position on. When fewer positionals are given than the usage declares and a
+  secret one follows an optional one, every positional from the first optional
+  on is masked, since the secret may sit in the optional's slot. A value of the
+  wrong type gets no parse error text, which could repeat it.
 - **Patterns only the app knows.** `AgentCli::redact_arg` takes a hook that
   sees each argv element as given and returns the text to echo instead, or
   `None` to leave it. It runs on flags, flag values and positionals, in
@@ -460,16 +463,26 @@ assert!(!run.to_json().contains("hunter2"));
 # }
 ```
 
+A token right after a bare flag may be that flag's value, even when it starts
+with a dash (`--passphrase -hunter2` is a flag and a value that looks like
+flags). When the flag is masked, that token is masked whole and its letters are
+left out of `UNKNOWN_FLAG` and `PARSE_ERROR` text; a masked short flag in a
+bundle (`-vt secret`) masks the token after the bundle the same way. Flags
+before a raw command's name are always masked, since none of them can reach it.
+
 Where the framework cannot tell a value from a word, it masks more. A line
 that fails to parse keeps flag names and command names and masks every other
 token. A raw command's tokens are never parsed: its flags lose their values and
 the token after a bare flag is masked, while its positionals are echoed unless
 the hook rewrites them, so use the hook for those. Positionals no usage marks
 secret, such as an unexpected extra argument, are echoed unless the hook
-rewrites them. A handler that puts an argument in its own result or error text
-must mask it itself. `audit()` reports a `Command::secret` name the usage does
-not declare (`UNDECLARED_SECRET`) and a secret on a raw command
-(`SECRET_ON_RAW_COMMAND`), since neither masks anything.
+rewrites them, and then the error text carries the hook's text, as `command`
+does. A handler that puts an argument in its own result or error text
+must mask it itself. `audit()` reports a `Command::secret` name that no command on its path
+declares (`UNDECLARED_SECRET`: a flag counts from a parent's usage or a
+subcommand's, a positional only from the command's own) and a secret on a raw
+command (`SECRET_ON_RAW_COMMAND`), since neither masks anything. It warns
+about a secret positional after an optional one (`SECRET_AFTER_OPTIONAL`).
 
 ### `next_actions`
 

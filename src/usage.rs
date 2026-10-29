@@ -148,6 +148,8 @@ pub(crate) struct PositionalName {
     pub(crate) name: String,
     /// Whether it takes every remaining positional (`...`).
     pub(crate) variadic: bool,
+    /// Whether it may be left out (`[<name>]`).
+    pub(crate) optional: bool,
 }
 
 /// The positionals a usage string declares, in order, named as the usage
@@ -157,6 +159,7 @@ pub(crate) fn positional_names(usage: &str) -> Vec<PositionalName> {
     let to_positional = |text: &str| PositionalName {
         name: text.trim_matches(|c| "[]<>.".contains(c)).to_string(),
         variadic: text.contains("..."),
+        optional: text.starts_with('['),
     };
     let mut names = Vec::new();
     let mut tokens = usage.split_whitespace().peekable();
