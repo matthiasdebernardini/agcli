@@ -29,6 +29,17 @@ use crate::stream::StreamWriteError;
 ///     data: None,
 /// };
 /// ```
+///
+/// The exit code is writable by the crate alone, so an error cannot be given
+/// the success code by a field write; [`CommandError::exit_code`] rejects it.
+/// Writing the field does not compile:
+///
+/// ```compile_fail
+/// use agcli::{CommandError, ErrorCode, ExitCode};
+///
+/// let mut error = CommandError::new(ErrorCode::new("FAILED"), "failed", "Retry.");
+/// error.exit_code = Some(ExitCode::SUCCESS);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use]
@@ -48,7 +59,9 @@ pub struct CommandError {
     /// Optional typed process exit code. `None` → [`ExitCode::ERROR`]. Set it
     /// with [`CommandError::exit_code`] using an [`ExitCode`] constant so an
     /// agent can branch on the failure class without parsing the message.
-    pub exit_code: Option<ExitCode>,
+    /// Only the crate writes the field, so no error carries
+    /// [`ExitCode::SUCCESS`].
+    pub(crate) exit_code: Option<ExitCode>,
     /// Optional structured payload for the failure. `None` → the envelope has
     /// no `data` key. Set it with [`CommandError::data`] when the failure
     /// carries facts an agent should read rather than parse out of prose: the
@@ -130,7 +143,10 @@ impl CommandError {
 
     /// Set the process exit code, which is also the envelope's `exit_code`:
     /// the failure class a shell or an agent branches on. Without this call,
-    /// an error exits with [`ExitCode::ERROR`].
+    /// an error exits with [`ExitCode::ERROR`]. The field it sets is private
+    /// to the crate: read the code back from
+    /// [`Execution::exit_code`](crate::Execution::exit_code) or the
+    /// envelope's `exit_code`.
     ///
     /// # Panics
     ///

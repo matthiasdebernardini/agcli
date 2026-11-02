@@ -167,6 +167,7 @@ async fn framework_help_is_still_reachable_by_name() {
     assert!(!execution.is_raw());
     let json: Value = serde_json::from_str(&execution.to_json()).unwrap();
     assert_eq!(json["result"]["name"], json!("grep"));
+    assert_eq!(json["result"]["raw"], json!(true));
 }
 
 #[tokio::test]

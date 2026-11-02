@@ -243,3 +243,25 @@ async fn quiet_reaches_the_handler_and_still_yields_a_valid_envelope() {
     assert_eq!(json["next_actions"], json!([]));
     assert_eq!(execution.exit_code(), ExitCode::SUCCESS);
 }
+
+#[test]
+#[should_panic(expected = "root_field \"version\"")]
+fn a_root_field_named_version_is_refused() {
+    let _ = AgentCli::new("app", "Test CLI").root_field("version", "9");
+}
+
+#[test]
+#[should_panic(expected = "root_field \"agent_flags\"")]
+fn a_root_field_named_agent_flags_is_refused() {
+    let _ = AgentCli::new("app", "Test CLI")
+        .without_reserved_flags()
+        .root_field("agent_flags", json!([{ "flag": "--bogus" }]));
+}
+
+#[tokio::test]
+async fn a_root_field_outside_the_framework_keys_still_appears() {
+    let cli = AgentCli::new("app", "Test CLI").root_field("owner", "ops");
+    let json = parse(&cli.run(["app"]).await);
+
+    assert_eq!(json["result"]["owner"], json!("ops"));
+}

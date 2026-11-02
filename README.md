@@ -657,7 +657,8 @@ valid names in `fix`. An unknown command is `UNKNOWN_COMMAND` the same way, with
 distance of at most 2, and less than the name's length). Registering two
 commands with the same name panics, as does a mistake in any other builder
 call: an error with exit code 0, a list whose `total` is below its rows, a
-`skill()` on a name that is not a slug.
+`skill()` on a name that is not a slug, a `root_field` that names one of the
+framework's keys.
 
 The framework answers these itself:
 
@@ -666,9 +667,10 @@ The framework answers these itself:
   `error_codes`. Each command entry has `name`, `description` and `usage`, plus
   `subcommands`, `"raw": true` or `"stream": true` where they apply.
   `AgentCli::root_field(key, value)` adds a key of your own, such as live
-  health. It cannot replace the framework's keys.
+  health. Naming one of the framework's keys panics when the CLI is built.
 - **`--help` or `-h` anywhere, and `help <command...>`**: the named command's
-  `name`, `description`, `usage` and `subcommands`.
+  `name`, `description`, `usage` and `subcommands`, plus `"raw": true` or
+  `"stream": true` where they apply.
 - **`--version` or `-V` anywhere, and `version` alone**: `name` and `version`.
   The positionals must name a command or nothing: `app nope --version` is
   `UNKNOWN_COMMAND` for `nope`, as it is with `--help`, and `app version extra`
@@ -1194,6 +1196,9 @@ build of the CLI, not an agent's invocation.
 Every timestamp comes from the run's clock, read when the thing happens: an
 event's `ts` as the event is written, the envelope's `timestamp` when it is
 built at the end of the run, and a `HANDLER_PANIC` envelope's at the panic.
+When the run's clock cannot be read at the panic, because reading it is what
+panicked or because it reads past `Timestamp::MAX`, that envelope carries the
+system clock instead.
 
 The default clock reads `SOURCE_DATE_EPOCH` when it is set (the
 reproducible-builds convention), else the system clock. A `SOURCE_DATE_EPOCH`
@@ -1207,7 +1212,11 @@ byte-stable output, and a handler that stamps its own fields reads the same
 clock with `req.now()`, so a `created_at` is pinned with the rest. A clock that
 reads past `Timestamp::MAX` (9999-12-31T23:59:59Z) panics: no RFC 3339
 timestamp can name that second, and writing a wrong one would be a silent
-fallback.
+fallback. Under `run_env`, that panic inside a handler still ends with one
+`HANDLER_PANIC` envelope whose message names the reading. While a thread is
+already panicking, in the panic hook or in a `Drop` during an unwind, such a
+reading gives the system clock instead: a second panic there would abort the
+process.
 
 ### Panics
 

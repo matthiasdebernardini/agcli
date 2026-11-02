@@ -19,7 +19,6 @@ use crate::command_request::CommandRequest;
 use crate::execution::{Execution, Output};
 use crate::invocation::{self, Invocation, ParseInvocationError};
 use crate::panic_hook::{self, PanicTarget};
-use crate::project;
 use crate::raw;
 use crate::redaction;
 use crate::reserved_flags;
@@ -58,7 +57,11 @@ impl AgentCli {
     /// [`ExitCode::ERROR`], and this function does not return. The envelope
     /// goes to stdout, as the terminal
     /// line for a streaming command, and to stderr for a raw command, whose
-    /// stdout is its own. This holds under `panic = "abort"` too. Panics
+    /// stdout is its own. The envelope's timestamp is the run's clock at the
+    /// moment of the panic, or the system clock when the run's clock cannot be
+    /// read then, because reading it is what panicked or because it reads past
+    /// [`Timestamp::MAX`](crate::Timestamp::MAX). This holds under
+    /// `panic = "abort"` too. Panics
     /// outside a handler, and panics in tasks a handler spawned that the
     /// runtime catches, behave as they would without agcli; a stack overflow
     /// or an allocation failure aborts before any hook runs.
@@ -938,10 +941,7 @@ impl AgentCli {
         gate: &Gate<'_>,
         resolved: &ResolvedCommand<'_, '_>,
     ) -> Option<Execution> {
-        if self.reserved_flags
-            && !gate.path_cmds.iter().any(|c| c.allow_extra_args)
-            && let Some(usage) = &gate.command.usage
-            && let Some(arity) = usage::positional_arity(usage)
+        if let Some((usage, arity)) = self.positional_bound(gate.path_cmds)
             && resolved.remaining.len() > arity.required + arity.optional
         {
             let first = gate.invocation.positionals().len() - resolved.remaining.len();
@@ -954,6 +954,28 @@ impl AgentCli {
             ));
         }
         None
+    }
+
+    /// The leaf usage and its arity when the runtime refuses positionals past
+    /// that arity for the command at the end of `path_cmds`, root first.
+    /// `None` when it accepts any number: the reserved flags are off, a
+    /// command on the path allows extra args, the leaf is raw, has no usage,
+    /// or its usage is variadic. [`AgentCli::audit`] reads the same bound, so
+    /// a `next_action` whose positionals it counts past that arity is one the
+    /// runtime refuses with `EXTRA_ARG`.
+    pub(crate) fn positional_bound<'c>(
+        &self,
+        path_cmds: &[&'c Command],
+    ) -> Option<(&'c str, Arity)> {
+        if !self.reserved_flags || path_cmds.iter().any(|c| c.allow_extra_args) {
+            return None;
+        }
+        let leaf = path_cmds.last()?;
+        if leaf.is_raw() {
+            return None;
+        }
+        let usage = leaf.usage.as_deref()?;
+        Some((usage, usage::positional_arity(usage)?))
     }
 
     /// `--dry-run` promises "preview without mutating" on every command.
@@ -1025,42 +1047,8 @@ impl AgentCli {
         // command supports --select / --compact / --quiet for free.
         let mut select_warning = None;
         if self.reserved_flags && command.applies_reserved_projection() {
-            let selected = invocation.value_flag("select");
-            if let Some(raw) = selected {
-                (result, select_warning) = select::apply_select_flag(result, raw);
-            }
-            if reserved_flags::bool_flag_on(invocation.flag("compact")) {
-                // An explicit --select names what the agent wants, so beside
-                // it --compact only drops nulls and empty containers: keeping
-                // the command's `compact_fields` instead could empty the
-                // selection without a word.
-                match &compact_fields {
-                    Some(fields) if selected.is_none() => {
-                        let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
-                        result = project::select(&result, &refs);
-                    }
-                    _ => {
-                        let compacted = project::compact(&result);
-                        // A selection --compact empties is kept as selected,
-                        // with a word, the way a --select miss is. Emptied
-                        // counts at any depth: a list's rows survive as `{}`.
-                        if selected.is_some()
-                            && project::is_hollow(&compacted)
-                            && compacted != result
-                        {
-                            let warning = "--compact removed every selected field because they \
-                                           were null or empty. Returning the selection \
-                                           uncompacted.";
-                            select_warning = Some(select_warning.map_or_else(
-                                || warning.to_string(),
-                                |previous| format!("{previous} {warning}"),
-                            ));
-                        } else {
-                            result = compacted;
-                        }
-                    }
-                }
-            }
+            (result, select_warning) =
+                select::project_output(result, invocation, compact_fields.as_deref());
         }
         if self.reserved_flags && reserved_flags::bool_flag_on(invocation.flag("quiet")) {
             next_actions.clear();

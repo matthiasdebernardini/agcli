@@ -16,12 +16,22 @@ use crate::execution::{Execution, Output};
 use crate::invocation::Invocation;
 use crate::next_action::NextAction;
 use crate::panic_hook::{PanicReport, PanicTarget};
-use crate::project;
 use crate::redaction::RedactFn;
 use crate::reserved_flags;
 use crate::select;
 use crate::timestamp::Timestamp;
 use crate::usage;
+
+/// The root tree's own keys. The framework decides whether each appears, so
+/// [`AgentCli::root_field`] refuses them.
+pub(crate) const FRAMEWORK_ROOT_KEYS: [&str; 6] = [
+    "description",
+    "version",
+    "commands",
+    "agent_flags",
+    "exit_codes",
+    "error_codes",
+];
 
 /// The definition of an agent-native CLI: its name, description, version and
 /// command tree, and the framework behaviour that wraps every command (flag
@@ -136,10 +146,18 @@ impl AgentCli {
     /// The run panics, with a message naming the bound, when the clock reads
     /// past [`Timestamp::MAX`] (253402300799, 9999-12-31T23:59:59Z): no
     /// RFC 3339 timestamp can name that second, and writing a wrong one would
-    /// be a silent fallback.
+    /// be a silent fallback. When a handler panics under
+    /// [`AgentCli::run_env`] and the clock cannot be read at the panic,
+    /// because reading it is what panicked or because it reads past
+    /// [`Timestamp::MAX`], the `HANDLER_PANIC` envelope carries the system
+    /// clock instead, since a second panic inside the panic would abort the
+    /// process; its `error.message` says what panicked. More generally, a
+    /// read past [`Timestamp::MAX`] while the thread is already panicking,
+    /// in the panic hook or in a `Drop` that reads the clock during an
+    /// unwind, returns the system clock instead of panicking again.
     #[must_use]
     pub fn clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
-        self.clock = Some(Arc::new(move || clock::checked(clock())));
+        self.clock = Some(Arc::new(move || clock::read_custom(&clock)));
         self
     }
 
@@ -215,12 +233,23 @@ impl AgentCli {
     }
 
     /// Add `key` to the root tree's `result`, for something an agent should
-    /// see first, such as live health. The framework's own keys
-    /// (`description`, `version`, `commands`, `agent_flags`, `exit_codes`,
-    /// `error_codes`) win over a field of the same name.
+    /// see first, such as live health.
+    ///
+    /// # Panics
+    ///
+    /// When `key` is one of the root tree's own keys (`description`,
+    /// `version`, `commands`, `agent_flags`, `exit_codes`, `error_codes`):
+    /// the framework decides whether each appears and what it holds, so a
+    /// field of the same name is a mistake in the CLI definition.
     #[must_use]
     pub fn root_field(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
-        self.root_extra.insert(key.into(), value.into());
+        let key: String = key.into();
+        assert!(
+            !FRAMEWORK_ROOT_KEYS.contains(&key.as_str()),
+            "root_field {key:?} is one of the root tree's own keys: {}",
+            FRAMEWORK_ROOT_KEYS.join(", ")
+        );
+        self.root_extra.insert(key, value.into());
         self
     }
 
@@ -266,9 +295,9 @@ impl AgentCli {
     /// version) result, honoring the reserved output flags. The root tree
     /// advertises `--select` / `--compact` / `--quiet` on *every* command, so
     /// these paths must honor them too: the root tree of a large CLI is
-    /// exactly where an agent wants `--select=commands`. (The handler path
-    /// has its own application with per-command `compact_fields` support.)
-    /// The envelope's timestamp is read from `clock` now.
+    /// exactly where an agent wants `--select=commands`. The projection is
+    /// [`select::project_output`], the one the handler path uses, with no
+    /// `compact_fields`. The envelope's timestamp is read from `clock` now.
     pub(crate) fn framework_success(
         &self,
         invocation: &Invocation,
@@ -278,12 +307,7 @@ impl AgentCli {
     ) -> Execution {
         let mut select_warning = None;
         if self.reserved_flags {
-            if let Some(raw) = invocation.value_flag("select") {
-                (result, select_warning) = select::apply_select_flag(result, raw);
-            }
-            if reserved_flags::bool_flag_on(invocation.flag("compact")) {
-                result = project::compact(&result);
-            }
+            (result, select_warning) = select::project_output(result, invocation, None);
             if reserved_flags::bool_flag_on(invocation.flag("quiet")) {
                 next_actions.clear();
             }

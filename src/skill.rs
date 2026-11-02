@@ -185,12 +185,25 @@ fn collapse(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Emit `value` as a YAML scalar, quoting only when a plain one would parse as
-/// something else (a mapping, a comment, an anchor). A CLI description is
-/// author-supplied prose: `"name: does X"` must not silently become a nested
-/// key.
+/// The plain scalars YAML 1.1 and 1.2 read as null or a boolean, compared
+/// ASCII case-insensitively.
+const YAML_KEYWORDS: [&str; 10] = [
+    "null", "~", "true", "false", "yes", "no", "on", "off", "y", "n",
+];
+
+/// Emit `value` as a YAML scalar, quoted when a plain one could parse as
+/// something else (a mapping, a comment, an anchor, null, a boolean, a
+/// number or a date). A CLI description is author-supplied prose:
+/// `"name: does X"` must not silently become a nested key, and a CLI named
+/// `null` must not become a null name. Every value that starts with a digit,
+/// `.` or `+` is quoted, so some harmless ones such as `3 apples` are quoted
+/// too: telling them from numbers and dates is not worth the parser.
 fn yaml_scalar(value: &str) -> String {
     let needs_quotes = value.is_empty()
+        || YAML_KEYWORDS
+            .iter()
+            .any(|keyword| value.eq_ignore_ascii_case(keyword))
+        || value.starts_with(|c: char| c.is_ascii_digit() || c == '.' || c == '+')
         || value.contains(": ")
         || value.contains(" #")
         || value.ends_with(':')
@@ -402,6 +415,40 @@ impl AgentCli {
                 )
                 .into(),
             output: Output::Envelope,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::yaml_scalar;
+
+    #[test]
+    fn yaml_scalar_quotes_whatever_a_plain_scalar_could_misread() {
+        let cases = [
+            ("null", r#""null""#),
+            ("NULL", r#""NULL""#),
+            ("~", r#""~""#),
+            ("true", r#""true""#),
+            ("Yes", r#""Yes""#),
+            ("off", r#""off""#),
+            ("123", r#""123""#),
+            ("1e3", r#""1e3""#),
+            ("0x1f", r#""0x1f""#),
+            (".5", r#"".5""#),
+            ("2026-11-01", r#""2026-11-01""#),
+            ("deploy", "deploy"),
+            ("hello world", "hello world"),
+            ("", r#""""#),
+            ("a: b", r#""a: b""#),
+            ("a #b", r#""a #b""#),
+            ("a:", r#""a:""#),
+            ("-x", r#""-x""#),
+            (r#"say "hi""#, r#""say \"hi\"""#),
+            ("it's", r#""it's""#),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(yaml_scalar(value), expected, "{value:?}");
         }
     }
 }

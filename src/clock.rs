@@ -1,15 +1,17 @@
 //! The run's clock: where every envelope and stream event of a run reads its
 //! timestamp from, at the moment it is written.
 
+use std::cell::Cell;
 use std::env;
 use std::fmt;
 use std::sync::Arc;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::timestamp::Timestamp;
 
 /// A run's clock: one set with [`AgentCli::clock`](crate::AgentCli::clock),
-/// wrapped by [`checked`], or the default one.
+/// wrapped by [`read_custom`], or the default one.
 pub(crate) type ClockFn = dyn Fn() -> Timestamp + Send + Sync;
 
 /// The variable that pins the default clock, per the reproducible-builds
@@ -83,6 +85,60 @@ pub(crate) fn system_now() -> Timestamp {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs()),
     )
+}
+
+thread_local! {
+    /// True while this thread reads a custom clock, so the panic hook knows
+    /// not to read that clock again when the reading is what panicked.
+    static READING_CUSTOM: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Read a custom clock set with [`AgentCli::clock`](crate::AgentCli::clock)
+/// and check its reading, with this thread marked as reading it for the
+/// whole call. The mark clears when the call returns or unwinds.
+///
+/// While this thread is panicking (in the panic hook, or in a `Drop` that
+/// runs during unwinding), a reading past [`Timestamp::MAX`] gives the
+/// system clock instead: a second panic there would abort the process.
+///
+/// # Panics
+///
+/// When `clock` panics, or, outside a panic, reads past [`Timestamp::MAX`],
+/// as [`checked`] does.
+pub(crate) fn read_custom(clock: &dyn Fn() -> u64) -> Timestamp {
+    let _reading = ReadingCustom::start();
+    let secs = clock();
+    if thread::panicking() {
+        return Timestamp::from_epoch_secs(secs).unwrap_or_else(system_now);
+    }
+    checked(secs)
+}
+
+/// True while this thread is inside [`read_custom`], including while a panic
+/// it raised runs the panic hook, before unwinding. False while the thread's
+/// locals are being torn down.
+pub(crate) fn reading_custom() -> bool {
+    READING_CUSTOM.try_with(Cell::get).unwrap_or(false)
+}
+
+/// Marks this thread as reading a custom clock until dropped, then puts the
+/// previous mark back.
+struct ReadingCustom {
+    previous: bool,
+}
+
+impl ReadingCustom {
+    fn start() -> Self {
+        Self {
+            previous: READING_CUSTOM.with(|reading| reading.replace(true)),
+        }
+    }
+}
+
+impl Drop for ReadingCustom {
+    fn drop(&mut self) {
+        READING_CUSTOM.with(|reading| reading.set(self.previous));
+    }
 }
 
 /// The timestamp a clock reading of `secs` names.

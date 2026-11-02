@@ -10,6 +10,13 @@
 //! the guarded future itself, so it is right on whichever worker thread polls
 //! the future next.
 //!
+//! The envelope is stamped with the run's clock at the moment of the panic.
+//! When the run's clock cannot be read at the panic, because reading it is
+//! what panicked or because it reads past
+//! [`Timestamp::MAX`](crate::Timestamp::MAX), the envelope carries the system
+//! clock instead: a second panic inside the hook would make std abort with no
+//! envelope. The panic message in `error.message` says what went wrong.
+//!
 //! Because the hook runs before unwinding starts, this also works under
 //! `panic = "abort"`. A stack overflow or an allocation failure aborts
 //! without running any hook, so neither can be reported.
@@ -21,7 +28,7 @@ use std::panic::{self, PanicHookInfo};
 use std::process;
 use std::sync::{Arc, Once};
 
-use crate::clock::ClockFn;
+use crate::clock::{self, ClockFn};
 use crate::codes::ExitCode;
 use crate::command::BoxFuture;
 use crate::envelope::{Envelope, ErrorEnvelope};
@@ -88,7 +95,10 @@ fn active_report() -> Option<Arc<PanicReport>> {
 }
 
 /// Write the run's `HANDLER_PANIC` envelope, stamped with the clock's reading
-/// now, and exit with [`ExitCode::ERROR`].
+/// now, and exit with [`ExitCode::ERROR`]. When the run's clock cannot be
+/// read at the panic, because reading it is what panicked or because it reads
+/// past [`Timestamp::MAX`](crate::Timestamp::MAX), the system clock stamps it
+/// instead: a second panic inside the hook would abort the process.
 fn report_panic(report: &PanicReport, info: &PanicHookInfo<'_>) -> ! {
     let payload = info.payload();
     let detail = payload
@@ -98,7 +108,11 @@ fn report_panic(report: &PanicReport, info: &PanicHookInfo<'_>) -> ! {
         .unwrap_or("unknown panic");
     let mut envelope = report.envelope.clone();
     envelope.error.message = format!("handler panicked: {detail}");
-    envelope.timestamp = (report.clock)();
+    envelope.timestamp = if clock::reading_custom() {
+        clock::system_now()
+    } else {
+        (report.clock)()
+    };
     let envelope = Envelope::Error(envelope);
     match report.target {
         PanicTarget::Stdout => execution::write_line(ProcessStream::Stdout, &envelope.to_json()),

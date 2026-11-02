@@ -240,6 +240,9 @@ impl AgentCli {
         if command.is_stream() {
             result.insert("stream".to_string(), Value::Bool(true));
         }
+        if command.is_raw() {
+            result.insert("raw".to_string(), Value::Bool(true));
+        }
 
         self.framework_success(
             invocation,
@@ -255,7 +258,7 @@ impl AgentCli {
         Self::command_docs_into(program, &mut path_buf, &self.commands, &mut docs);
         let mut result = Map::new();
 
-        // Insert user-provided extras first so core keys always win
+        // `root_field` refuses the framework's keys, so no extra collides.
         result.extend(self.root_extra.clone());
 
         result.insert(
@@ -377,10 +380,22 @@ impl CommandDoc<'_> {
 mod tests {
     use super::*;
 
+    use crate::agent_cli::FRAMEWORK_ROOT_KEYS;
     use crate::codes::ExitCode;
     use crate::command_output::CommandOutput;
     use crate::envelope::Envelope;
     use crate::test_support::{rich_cli, sample_cli};
+
+    #[test]
+    fn framework_root_keys_are_exactly_the_keys_the_root_inserts() {
+        let cli = AgentCli::new("app", "x").version("1.0.0");
+        let Value::Object(result) = cli.root_result("app") else {
+            panic!("expected an object");
+        };
+        let inserted: HashSet<&str> = result.keys().map(String::as_str).collect();
+        let listed: HashSet<&str> = FRAMEWORK_ROOT_KEYS.into_iter().collect();
+        assert_eq!(inserted, listed);
+    }
 
     #[tokio::test]
     async fn root_returns_self_documenting_json_tree() {
@@ -426,24 +441,12 @@ mod tests {
         assert_eq!(envelope.error.code, ErrorCode::UNKNOWN_SUBCOMMAND);
     }
 
-    // --- root_field cannot shadow core keys ---
+    // --- root_field refuses core keys ---
 
-    #[tokio::test]
-    async fn root_field_cannot_shadow_core_keys() {
-        let cli = AgentCli::new("test", "Test CLI")
-            .version("1.0.0")
-            .root_field("description", json!("hacked"))
-            .root_field("version", json!("hacked"))
-            .root_field("commands", json!("hacked"));
-
-        let run = cli.run(["test"]).await;
-        let Envelope::Success(envelope) = run.envelope() else {
-            panic!("expected success envelope");
-        };
-        // Core keys must not be overwritten by root_field
-        assert_eq!(envelope.result["description"], json!("Test CLI"));
-        assert_eq!(envelope.result["version"], json!("1.0.0"));
-        assert!(envelope.result["commands"].is_array());
+    #[test]
+    #[should_panic(expected = "root_field \"description\"")]
+    fn root_field_refuses_a_core_key_the_root_always_sets() {
+        let _ = AgentCli::new("test", "Test CLI").root_field("description", json!("hacked"));
     }
 
     // --- help alias + --version ---

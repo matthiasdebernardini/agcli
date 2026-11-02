@@ -409,27 +409,46 @@ impl AgentCli {
     /// leading program name, leads straight into a placeholder/flag matches
     /// *zero* command tokens and names no runnable command, so it is rejected
     /// (it would be a dead link for an agent following the trail).
+    ///
+    /// A literal token that names no subcommand, after a command with a
+    /// handler, starts that command's arguments (`app logs api`). The
+    /// template resolves when the runtime accepts that many positionals: the
+    /// literal and every literal or `<...>` placeholder after it, up to the
+    /// first token that starts with `-` or `[` or contains `=`, counted
+    /// against [`AgentCli::positional_bound`]. After a group
+    /// without a handler, or before any command, the literal names nothing and
+    /// the template dangles.
     fn next_action_resolves(&self, template: &str) -> bool {
         let mut tokens = template.split_whitespace().peekable();
         if tokens.peek() == Some(&self.name.as_str()) {
             tokens.next();
         }
+        // A literal or a `<...>` placeholder fills one positional; a token
+        // that starts a flag or an optional segment ends them, and so does a
+        // `key=value` token.
+        let is_positional = |token: &&str| {
+            !(token.starts_with('[') || token.starts_with('-') || token.contains('='))
+        };
+        let is_literal = |token: &&str| is_positional(token) && !token.starts_with('<');
         let mut commands = &self.commands;
-        let mut matched_command = false;
+        let mut path: Vec<&Command> = Vec::new();
         let mut saw_token = false;
-        for token in tokens {
+        while let Some(token) = tokens.next() {
             saw_token = true;
-            if token.starts_with('<')
-                || token.starts_with('[')
-                || token.starts_with('-')
-                || token.contains('=')
-            {
+            if !is_literal(&token) {
                 break;
             }
             match commands.get(token) {
                 Some(found) => {
                     commands = &found.subcommands;
-                    matched_command = true;
+                    path.push(found);
+                }
+                // A literal after a command that runs starts its arguments.
+                None if path.last().is_some_and(|c| c.handler.is_some()) => {
+                    let given = 1 + tokens.take_while(is_positional).count();
+                    return self
+                        .positional_bound(&path)
+                        .is_none_or(|(_, arity)| given <= arity.required + arity.optional);
                 }
                 None => return false,
             }
@@ -438,7 +457,7 @@ impl AgentCli {
         // affordance (no tokens after the optional program name). A template
         // that had tokens but matched no command (leading placeholder/flag) is
         // a dead link.
-        matched_command || !saw_token
+        !path.is_empty() || !saw_token
     }
 }
 
@@ -504,6 +523,135 @@ mod tests {
                 .iter()
                 .any(|f| f.code == "DANGLING_NEXT_ACTION")
         );
+    }
+
+    /// The `DANGLING_NEXT_ACTION` findings of `cli`'s audit.
+    fn dangling(cli: &AgentCli) -> Vec<AuditFinding> {
+        cli.audit()
+            .findings
+            .into_iter()
+            .filter(|f| f.code == "DANGLING_NEXT_ACTION")
+            .collect()
+    }
+
+    /// An `app` CLI with a `logs <svc>` command and a `grp` group without a
+    /// handler, whose `logs` command carries `action` as its default.
+    fn logs_cli(action: &str) -> AgentCli {
+        AgentCli::new("app", "x")
+            .command(
+                Command::new("logs", "Show logs")
+                    .usage("app logs <svc>")
+                    .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) })
+                    .default_next_action(NextAction::new(action, "go")),
+            )
+            .command(
+                Command::new("grp", "A group").subcommand(
+                    Command::new("leaf", "A leaf")
+                        .usage("app grp leaf")
+                        .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) }),
+                ),
+            )
+    }
+
+    #[test]
+    fn audit_literal_argument_after_a_command_with_a_handler_resolves() {
+        assert_eq!(dangling(&logs_cli("app logs api")).len(), 0);
+    }
+
+    /// An `app` CLI whose one command is `command`, carrying `action` as its
+    /// default `next_action`.
+    fn action_cli(command: Command, action: &str) -> AgentCli {
+        AgentCli::new("app", "x")
+            .command(command.default_next_action(NextAction::new(action, "go")))
+    }
+
+    /// A `status` command with the usage `app status`: it takes no arguments.
+    fn status_command() -> Command {
+        Command::new("status", "Show status")
+            .usage("app status")
+            .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) })
+    }
+
+    #[test]
+    fn audit_literal_argument_past_the_arity_dangles() {
+        assert_eq!(dangling(&logs_cli("app logs api extra")).len(), 1);
+    }
+
+    #[test]
+    fn audit_literal_argument_to_a_command_without_arguments_dangles() {
+        assert_eq!(
+            dangling(&action_cli(status_command(), "app status api")).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn audit_literal_argument_to_a_command_allowing_extra_args_resolves() {
+        let cli = action_cli(status_command().allow_extra_args(), "app status api");
+        assert_eq!(dangling(&cli).len(), 0);
+    }
+
+    #[test]
+    fn audit_literal_arguments_to_a_variadic_usage_resolve() {
+        let run = Command::new("run", "Run a command")
+            .usage("app run <cmd> [args...]")
+            .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) });
+        assert_eq!(dangling(&action_cli(run, "app run echo a b")).len(), 0);
+    }
+
+    #[test]
+    fn audit_placeholder_past_the_arity_dangles() {
+        assert_eq!(dangling(&logs_cli("app logs api <n>")).len(), 1);
+    }
+
+    #[test]
+    fn audit_arguments_to_a_raw_command_resolve() {
+        let grep = Command::new("grep", "Search files")
+            .usage("app grep <pattern>")
+            .raw_handler(|_args| async move { ExitCode::SUCCESS });
+        let cli = action_cli(status_command(), "app grep TODO src").command(grep);
+        assert_eq!(dangling(&cli).len(), 0);
+    }
+
+    #[test]
+    fn audit_literal_argument_to_a_command_with_a_handler_and_subcommands_resolves() {
+        let svc = Command::new("svc", "Show a service")
+            .usage("app svc <name>")
+            .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) })
+            .subcommand(
+                Command::new("list", "List services")
+                    .usage("app svc list")
+                    .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) }),
+            );
+        assert_eq!(dangling(&action_cli(svc, "app svc api")).len(), 0);
+    }
+
+    #[test]
+    fn audit_literal_argument_past_the_arity_without_reserved_flags_resolves() {
+        let cli = logs_cli("app logs api extra").without_reserved_flags();
+        assert_eq!(dangling(&cli).len(), 0);
+    }
+
+    #[test]
+    fn audit_literal_argument_past_the_arity_under_an_ancestor_allowing_extra_args_resolves() {
+        let grp = Command::new("grp", "A group")
+            .allow_extra_args()
+            .subcommand(
+                Command::new("leaf", "A leaf")
+                    .usage("app grp leaf")
+                    .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) }),
+            );
+        assert_eq!(dangling(&action_cli(grp, "app grp leaf extra")).len(), 0);
+    }
+
+    #[test]
+    fn audit_literal_argument_after_a_group_without_a_handler_dangles() {
+        assert_eq!(dangling(&logs_cli("app grp typo")).len(), 1);
+    }
+
+    #[test]
+    fn audit_literal_unknown_first_token_dangles() {
+        assert_eq!(dangling(&logs_cli("app typo")).len(), 1);
     }
 
     #[test]

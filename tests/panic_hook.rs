@@ -16,11 +16,12 @@
 //! accident.
 
 use std::env;
+use std::hint;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{self, Command as Process, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agcli::{AgentCli, Command, CommandOutput, StreamEvent};
+use agcli::{AgentCli, Command, CommandOutput, StreamEvent, Timestamp};
 use serde_json::{Value, json};
 use tokio::runtime::{self, Runtime};
 
@@ -73,6 +74,21 @@ fn child() {
             CLOCK.store(86_400, Ordering::SeqCst);
             panic!("panic after the clock moved")
         }),
+        "clock" => command.handler(|req| async move {
+            // The CLI's clock reads milliseconds, past `Timestamp::MAX`, so
+            // reading it panics inside the handler.
+            Ok(CommandOutput::new(json!({ "now": req.now() })))
+        }),
+        "panicking_clock" => command.handler(|req| async move {
+            // The CLI's clock panics, so reading it panics inside the handler.
+            Ok(CommandOutput::new(json!({ "now": req.now() })))
+        }),
+        "unwrap" => command.handler(|_req| async move {
+            // A panic of its own, under a clock that cannot be read: the
+            // handler never reads it.
+            hint::black_box(None::<u8>).unwrap();
+            Ok(CommandOutput::new(json!({})))
+        }),
         "spawned" => command.handler(|_req| async move {
             let joined = tokio::spawn(async { panic!("panic in a spawned task") }).await;
             Ok(CommandOutput::new(
@@ -93,9 +109,15 @@ fn child() {
         }
         other => panic!("unknown child case {other:?}"),
     };
-    let cli = AgentCli::new("app", "Panic hook test CLI")
-        .clock(|| CLOCK.load(Ordering::SeqCst))
-        .command(command);
+    let cli = AgentCli::new("app", "Panic hook test CLI").command(command);
+    let cli = if matches!(case.as_str(), "clock" | "unwrap") {
+        // Milliseconds by mistake.
+        cli.clock(|| 1_700_000_000_000)
+    } else if case == "panicking_clock" {
+        cli.clock(|| -> u64 { panic!("no clock") })
+    } else {
+        cli.clock(|| CLOCK.load(Ordering::SeqCst))
+    };
     let runtime = runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .build()
@@ -238,6 +260,104 @@ fn the_panic_envelope_reads_the_clock_when_the_panic_happens() {
     assert_eq!(lines.len(), 1, "exactly one envelope: {lines:?}");
     assert_handler_panic(&lines[0], "panic after the clock moved");
     assert_eq!(lines[0]["timestamp"], json!("1970-01-02T00:00:00Z"));
+}
+
+#[test]
+fn a_clock_that_panics_in_the_handler_still_writes_the_envelope() {
+    // The hook cannot read the clock that just panicked: it stamps the
+    // envelope with the system clock instead of panicking inside the panic.
+    let output = run_case("clock");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = json_lines(&output.stdout);
+    assert_eq!(lines.len(), 1, "exactly one envelope: {lines:?}");
+    let envelope = &lines[0];
+    assert_eq!(
+        envelope["error"]["code"],
+        json!("HANDLER_PANIC"),
+        "{envelope}"
+    );
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("the clock read 1700000000000 seconds")),
+        "{envelope}"
+    );
+    let timestamp = envelope["timestamp"].as_str().expect("a timestamp string");
+    assert!(
+        timestamp.parse::<Timestamp>().is_ok(),
+        "an RFC 3339 timestamp: {envelope}"
+    );
+}
+
+#[test]
+fn a_clock_that_panics_by_itself_still_writes_the_envelope() {
+    // The reading never gets past `Timestamp::MAX`, so only the mark that the
+    // thread is reading the custom clock keeps the hook from calling it again
+    // and aborting the process.
+    let output = run_case("panicking_clock");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = json_lines(&output.stdout);
+    assert_eq!(lines.len(), 1, "exactly one envelope: {lines:?}");
+    let envelope = &lines[0];
+    assert_eq!(
+        envelope["error"]["code"],
+        json!("HANDLER_PANIC"),
+        "{envelope}"
+    );
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no clock")),
+        "{envelope}"
+    );
+    let timestamp = envelope["timestamp"].as_str().expect("a timestamp string");
+    assert!(
+        timestamp.parse::<Timestamp>().is_ok(),
+        "an RFC 3339 timestamp: {envelope}"
+    );
+}
+
+#[test]
+fn a_handler_panic_under_a_clock_past_the_maximum_still_writes_the_envelope() {
+    // The hook cannot read a clock past `Timestamp::MAX` either: it stamps
+    // the envelope with the system clock instead of panicking inside the
+    // panic.
+    let output = run_case("unwrap");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = json_lines(&output.stdout);
+    assert_eq!(lines.len(), 1, "exactly one envelope: {lines:?}");
+    let envelope = &lines[0];
+    assert_eq!(
+        envelope["error"]["code"],
+        json!("HANDLER_PANIC"),
+        "{envelope}"
+    );
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("`Option::unwrap()` on a `None` value")),
+        "{envelope}"
+    );
+    let timestamp = envelope["timestamp"].as_str().expect("a timestamp string");
+    assert!(
+        timestamp.parse::<Timestamp>().is_ok(),
+        "an RFC 3339 timestamp: {envelope}"
+    );
 }
 
 #[test]

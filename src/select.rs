@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use crate::invocation::Invocation;
 use crate::next_action::{ActionParam, NextAction};
 use crate::project;
+use crate::reserved_flags;
 
 /// Split a `--select` value (`"id,name, body"`) into trimmed, non-empty
 /// field names.
@@ -107,6 +108,56 @@ pub(crate) fn apply_select_flag(result: Value, raw: &str) -> (Value, Option<Stri
             missed.join(", ")
         )),
     )
+}
+
+/// Apply the reserved `--select` and `--compact` flags on `invocation` to a
+/// result, in that order, and return the projected result with its
+/// `select_warning`.
+///
+/// `compact_fields` are the fields a command's `--compact` keeps; framework
+/// answers pass `None`, and so get the generic drop of nulls and empty
+/// containers. Every success path calls this one function, so each gets the
+/// same guards:
+///
+/// - An explicit `--select` names what the agent wants, so beside it
+///   `--compact` only drops nulls and empty containers: keeping
+///   `compact_fields` instead could empty the selection without a word.
+/// - A selection `--compact` would empty is kept uncompacted, with a warning
+///   appended to any `--select` warning, the way a `--select` miss is.
+///   Emptied counts at any depth: a list's rows survive as `{}`.
+pub(crate) fn project_output(
+    mut result: Value,
+    invocation: &Invocation,
+    compact_fields: Option<&[String]>,
+) -> (Value, Option<String>) {
+    let select = invocation.value_flag("select");
+    let mut select_warning = None;
+    if let Some(raw) = select {
+        (result, select_warning) = apply_select_flag(result, raw);
+    }
+    if !reserved_flags::bool_flag_on(invocation.flag("compact")) {
+        return (result, select_warning);
+    }
+    match compact_fields {
+        Some(fields) if select.is_none() => {
+            let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+            result = project::select(&result, &refs);
+        }
+        _ => {
+            let compacted = project::compact(&result);
+            if select.is_some() && project::is_hollow(&compacted) && compacted != result {
+                let warning = "--compact removed every selected field because they were null \
+                               or empty. Returning the selection uncompacted.";
+                select_warning = Some(select_warning.map_or_else(
+                    || warning.to_string(),
+                    |previous| format!("{previous} {warning}"),
+                ));
+            } else {
+                result = compacted;
+            }
+        }
+    }
+    (result, select_warning)
 }
 
 /// What a `--select` on `result` can name: the kind of field (`top-level`
@@ -480,6 +531,31 @@ mod tests {
                 .next_actions
                 .iter()
                 .all(|action| !action.command.contains("--select=<fields>"))
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_that_empties_a_framework_selection_keeps_it_with_a_warning() {
+        // Help for a leaf has an empty `subcommands`: the framework answer
+        // gets the same guard a handler's result does.
+        let cli = AgentCli::new("app", "x").command(
+            Command::new("get", "get")
+                .usage("app get")
+                .handler(|_req| async move { Ok(CommandOutput::new(json!({}))) }),
+        );
+        let run = cli
+            .run(["app", "help", "get", "--select=subcommands", "--compact"])
+            .await;
+        let Envelope::Success(envelope) = run.envelope() else {
+            panic!("expected success envelope");
+        };
+        assert_eq!(envelope.result, json!({ "subcommands": [] }));
+        assert_eq!(
+            envelope.select_warning.as_deref(),
+            Some(
+                "--compact removed every selected field because they were null or empty. \
+                 Returning the selection uncompacted."
+            )
         );
     }
 }

@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **`CommandError`'s `exit_code` field is private.** Writing the field could
+    give an error the success code, so an error envelope answered
+    `"ok":false` with exit status 0, and an agent checking `$?` read success.
+    `CommandError::exit_code(code)`, which refuses `ExitCode::SUCCESS`, is
+    now the only way to set it. Before: `error.exit_code =
+    Some(ExitCode::USAGE)`. After:
+    `CommandError::new(..).exit_code(ExitCode::USAGE)`, and read the code
+    back from the `Execution` or the envelope.
+- **`root_field` panics on a framework key.** `description`, `version`,
+    `commands`, `agent_flags`, `exit_codes` and `error_codes` are the
+    framework's: such a field was overridden where the framework set the key
+    and shown where it left it out, so with no `.version()` the root tree
+    showed a version `--version` did not know. Before:
+    `.root_field("version", "9")` built. After: it panics when the CLI is
+    built; name the field something else.
+
 ### Changed
 
 - **`Debug` on `Invocation`, and so on `CommandRequest`, shows only the
@@ -19,19 +37,42 @@ All notable changes to this project will be documented in this file.
     serde_json's `preserve_order` too, as it already did for a list's rows.
     Under default features nothing changes.
 
+### Fixed
+
+- **A handler panic no longer aborts the process under `run_env` when the
+    custom clock panics or reads past `Timestamp::MAX`.** The panic hook
+    read that clock again to stamp its envelope, panicked inside the panic,
+    and std aborted with no output (exit 134). In both cases the
+    `HANDLER_PANIC` envelope now carries the system clock. A clock in
+    milliseconds is the usual cause.
+- **`--select` beside `--compact` never empties a framework answer.** `help`,
+    the root tree, `version` and `skill` keep a selection `--compact` would
+    empty, with the `select_warning` a handler's result already got:
+    `app help get --select=subcommands --compact` answered `{}`.
+- **`help` for a raw command carries `"raw": true`**, as the root tree does.
+- **`audit` accepts a literal `next_action` whose last words are its
+    command's arguments.** `app logs api` was an Error-level
+    `DANGLING_NEXT_ACTION`, so `audit().is_clean()` failed on a correct CLI.
+    Positionals the command cannot take, past its usage's arity, are still
+    flagged, as running them is `EXTRA_ARG`, and arguments to a raw command,
+    which the runtime never counts, are not counted either.
+- **The skill's frontmatter quotes a value YAML would misread** as null, a
+    boolean, a number or a date: a CLI named `null` rendered `name: null`.
+
 ### Internal
 
 - A Beautiful Rust pass (rust-best-practices 1.5.0): no `bool` parameters in
-    shared helpers, `Follows` as an enum
-    instead of a list and a flag, one pass to redact an invocation, named
-    results instead of look-alike tuples, `flag_parse` asking whether a flag
-    was given bare instead of comparing against `""`, and the root
-    `next_action` built in one place. `doctor`, `doctor_with` and `skill`
-    document that a duplicate command name panics. Clippy with the
-    BeautifulRust lint set reports only the standing exceptions:
-    exhaustive public enums, the `required(bool)` and `retryable(bool)`
-    setters, two test helpers that take a `bool`, and deliberate casts and
-    prints in tests and examples.
+    shared helpers, `Follows` as an enum instead of a list and a flag, one
+    pass to redact an invocation, named results instead of look-alike
+    tuples, `flag_parse` asking whether a flag was given bare instead of
+    comparing against `""`, and the root `next_action` built in one place.
+    `doctor`, `doctor_with` and `skill` document that a duplicate command
+    name panics. Clippy with the BeautifulRust lint set reports only the
+    standing exceptions: exhaustive public enums, the `required(bool)` and
+    `retryable(bool)` setters, two test helpers that take a `bool`, and
+    deliberate casts and prints in tests and examples.
+- `--select` and `--compact` are applied by one function on every success
+    path, the handler's and the framework's, so the two cannot drift again.
 
 ## [0.19.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.19.0) - 2026-10-29
 
