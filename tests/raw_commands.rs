@@ -35,7 +35,7 @@ struct Fixture {
 fn recording(seen: &Seen, exit: ExitCode) -> impl Fn(Vec<String>) -> Ready<ExitCode> + use<> {
     let seen = Arc::clone(seen);
     move |args| {
-        *seen.lock().unwrap() = args;
+        *seen.lock().expect("the seen mutex is never poisoned") = args;
         future::ready(exit)
     }
 }
@@ -55,7 +55,11 @@ fn raw_cli(exit: ExitCode) -> Fixture {
 /// Run `argv` and return the execution plus the argv the handler saw.
 async fn run(fixture: &Fixture, argv: &[&str]) -> (agcli::Execution, Vec<String>) {
     let execution = fixture.cli.run(argv.to_vec()).await;
-    let seen = fixture.seen.lock().unwrap().clone();
+    let seen = fixture
+        .seen
+        .lock()
+        .expect("the seen mutex is never poisoned")
+        .clone();
     (execution, seen)
 }
 

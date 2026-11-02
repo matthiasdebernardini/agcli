@@ -489,6 +489,32 @@ async fn the_handler_receives_the_real_values() {
     assert_eq!(envelope["result"]["token"], json!(11));
 }
 
+#[tokio::test]
+async fn a_handlers_debug_output_of_its_request_shows_no_secret() {
+    let cli = cli().command(
+        Command::new("unlock", "Unlock with a passphrase")
+            .usage("passwarden unlock [--passphrase=<p>]")
+            .secret("passphrase")
+            .handler(|req| async move {
+                Ok(CommandOutput::new(json!({
+                    "real": req.flag("passphrase") == Some(SECRET),
+                    "request": format!("{req:?}"),
+                    "invocation": format!("{:?}", req.invocation()),
+                })))
+            }),
+    );
+    let execution = cli
+        .run(["passwarden", "unlock", "--passphrase=hunter2"])
+        .await;
+    let envelope = parse(&execution);
+    assert_eq!(envelope["result"]["real"], json!(true));
+    for key in ["request", "invocation"] {
+        let debug = envelope["result"][key].as_str().expect("debug text");
+        assert!(!debug.contains(SECRET), "{key} leaked: {debug}");
+        assert!(debug.contains("<redacted>"), "{key}: {debug}");
+    }
+}
+
 #[test]
 fn audit_flags_a_secret_the_usage_does_not_declare() {
     let cli = AgentCli::new("app", "x")

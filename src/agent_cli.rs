@@ -302,12 +302,15 @@ impl AgentCli {
         }
     }
 
+    /// The action that points an agent at the full command tree: the CLI's
+    /// bare name, which prints the root envelope.
+    pub(crate) fn root_action(&self) -> NextAction {
+        NextAction::new(self.name.clone(), "Inspect the full command tree")
+    }
+
     pub(crate) fn root_actions(&self) -> Vec<NextAction> {
         if self.commands.is_empty() {
-            return vec![NextAction::new(
-                self.name.clone(),
-                "Inspect the full command tree",
-            )];
+            return vec![self.root_action()];
         }
 
         self.commands
@@ -332,7 +335,7 @@ impl AgentCli {
         let usage = command.usage_or_default(&self.name, path);
         vec![
             usage::next_action_from_usage(&usage, "Run this command template"),
-            NextAction::new(self.name.clone(), "Inspect the full command tree"),
+            self.root_action(),
         ]
     }
 
@@ -362,10 +365,7 @@ impl AgentCli {
             actions.push(usage::next_action_from_usage(&usage, &sub.description));
             path_buf.pop();
         }
-        actions.push(NextAction::new(
-            self.name.clone(),
-            "Inspect the full command tree",
-        ));
+        actions.push(self.root_action());
         actions
     }
 

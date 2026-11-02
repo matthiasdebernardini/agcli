@@ -240,6 +240,11 @@ impl AgentCli {
     /// checks", usage `<cli> doctor`, no flags of its own. To name it, describe
     /// it, or give it flags, build the [`Command`] yourself and pass it to
     /// [`AgentCli::doctor_with`].
+    ///
+    /// # Panics
+    ///
+    /// When a command named `doctor` is already registered: a second
+    /// registration would silently replace the first.
     #[must_use]
     pub fn doctor(self, checks: Vec<Check>) -> Self {
         self.doctor_with(
@@ -282,6 +287,11 @@ impl AgentCli {
     /// A usage string is optional. Without one the framework fills in
     /// `<cli> <name>`, which keeps flag validation on (declaring no flags)
     /// rather than silently switching it off for the whole command.
+    ///
+    /// # Panics
+    ///
+    /// When a command with the same name as `command` is already registered:
+    /// a second registration would silently replace the first.
     #[must_use]
     pub fn doctor_with(self, mut command: Command, checks: Vec<Check>) -> Self {
         if command.usage.is_none() {
@@ -293,13 +303,11 @@ impl AgentCli {
             let checks = Arc::clone(&checks);
             async move {
                 let mut entries = Vec::with_capacity(checks.len());
-                let mut healthy = true;
                 let mut skipped = 0usize;
                 let mut fail_exit: Option<ExitCode> = None;
                 for check in checks.iter() {
                     let result = check.run(req.clone()).await;
                     if result.is_failed() {
-                        healthy = false;
                         // Prefer a specific (non-ERROR) exit code over the
                         // generic ERROR so the shell sees the most
                         // actionable failure class regardless of the order
@@ -325,12 +333,12 @@ impl AgentCli {
                     entries.push(Value::Object(entry));
                 }
                 let mut output = CommandOutput::new(json!({
-                    "healthy": healthy,
+                    "healthy": fail_exit.is_none(),
                     "skipped": skipped,
                     "checks": entries,
                 }));
-                if !healthy {
-                    output = output.exit_code(fail_exit.unwrap_or(ExitCode::ERROR));
+                if let Some(code) = fail_exit {
+                    output = output.exit_code(code);
                 }
                 Ok(output)
             }

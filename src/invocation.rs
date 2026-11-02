@@ -8,6 +8,8 @@ use std::iter;
 use std::mem;
 use std::path::Path;
 
+use crate::codes::ErrorCode;
+use crate::command_error::CommandError;
 use crate::redaction::{self, MARKER, RedactFn};
 use crate::usage;
 
@@ -18,7 +20,11 @@ use crate::usage;
 /// [`CommandRequest::invocation`](crate::CommandRequest::invocation). Code
 /// that parses argv outside an [`AgentCli`](crate::AgentCli) builds one with
 /// [`Invocation::parse`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Its `Debug` output shows only [`Invocation::command_line`], which inside a
+/// handler is the redacted line the envelopes carry, so logging a handler's
+/// invocation never prints a masked value.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Invocation {
     program: String,
     command_line: String,
@@ -54,21 +60,40 @@ pub struct Invocation {
     hidden_flags: HashSet<String>,
 }
 
+impl fmt::Debug for Invocation {
+    /// Shows only `command_line`: the other fields hold argv as given, which
+    /// may carry the values every envelope masks.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Invocation")
+            .field("command_line", &self.command_line)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The flags of the token before a token, when it left a value open.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Follows {
-    names: Vec<String>,
-    /// True for a bundle of short flags, which opens no value, so a
-    /// positional after it cannot be told from one. A bare flag's own value is
-    /// a `FlagValue`; a positional after it is a command name.
-    bundle: bool,
+enum Follows {
+    /// The token before left no value open.
+    #[default]
+    Nothing,
+    /// A bare flag that is not a known boolean, by name. Its own value is a
+    /// `FlagValue`; a positional after it is a command name, so only a token
+    /// that is not a positional is tied to it.
+    BareFlag(String),
+    /// A bundle of short flags, by name. A bundle opens no value, so a
+    /// positional after it cannot be told from one, and any token after it
+    /// is tied to it.
+    Bundle(Vec<String>),
 }
 
 impl Follows {
     /// Whether a token with `role` is tied to a flag `mask_flag` masks.
     fn masks(&self, role: &Role, mask_flag: &impl Fn(&str) -> bool) -> bool {
-        let value_like = self.bundle || !matches!(role, Role::Positional(_));
-        value_like && self.names.iter().any(|name| mask_flag(name))
+        match self {
+            Self::Nothing => false,
+            Self::BareFlag(name) => !matches!(role, Role::Positional(_)) && mask_flag(name),
+            Self::Bundle(names) => names.iter().any(|name| mask_flag(name)),
+        }
     }
 }
 
@@ -142,6 +167,12 @@ impl Invocation {
         })
     }
 
+    /// True when flag `name` was given with no value: a bare `--name`, which
+    /// [`Invocation::flag`] reads as `"true"`.
+    pub(crate) fn given_bare(&self, name: &str) -> bool {
+        self.bare_flags.contains(name)
+    }
+
     /// The positional arguments in order, the command path first.
     #[must_use]
     pub fn positionals(&self) -> &[String] {
@@ -186,15 +217,15 @@ impl Invocation {
         mask_flag: impl Fn(&str) -> bool,
         mask_positional: impl Fn(usize) -> bool,
     ) {
-        let shown: Vec<(String, bool)> = self
-            .raw_args
-            .iter()
-            .zip(&self.roles)
-            .zip(&self.follows)
-            .map(|((token, role), follows)| {
-                if follows.masks(role, &mask_flag) {
-                    return (MARKER.to_string(), true);
-                }
+        let mut shown_args = Vec::with_capacity(self.raw_args.len());
+        let mut masked_flags = HashSet::new();
+        let mut masked_positionals = HashSet::new();
+        let mut hidden_flags = HashSet::new();
+        for ((token, role), follows) in self.raw_args.iter().zip(&self.roles).zip(&self.follows) {
+            let tied = follows.masks(role, &mask_flag);
+            let (word, masked) = if tied {
+                (MARKER.to_string(), true)
+            } else {
                 match role {
                     Role::Flag(name) if mask_flag(name) => {
                         (redaction::masked_flag_word(token), true)
@@ -203,38 +234,34 @@ impl Invocation {
                     Role::Positional(index) if mask_positional(*index) => {
                         (MARKER.to_string(), true)
                     }
-                    _ => redaction::hooked_word(hook, token),
+                    _ => redaction::hook_word(hook, token).map_or_else(
+                        || (shell_quote(token).into_owned(), false),
+                        |word| (word, true),
+                    ),
                 }
-            })
-            .collect();
-        self.masked_flags.clear();
-        self.masked_positionals.clear();
-        self.hidden_flags.clear();
-        let masked_tokens = self
-            .raw_args
-            .iter()
-            .zip(&self.roles)
-            .zip(&self.follows)
-            .zip(&shown)
-            .filter(|(_, (_, masked))| *masked)
-            .map(|(parts, _)| parts);
-        for ((token, role), follows) in masked_tokens {
-            let tied = follows.masks(role, &mask_flag);
+            };
+            shown_args.push(word);
+            if !masked {
+                continue;
+            }
             match role {
                 Role::Flag(name) | Role::FlagValue(name) => {
-                    self.masked_flags.insert(name.clone());
+                    masked_flags.insert(name.clone());
                 }
                 Role::Positional(index) => {
-                    self.masked_positionals.insert(*index);
+                    masked_positionals.insert(*index);
                 }
                 Role::Plain => {}
             }
-            if tied && !matches!(role, Role::FlagValue(_) | Role::Positional(_)) {
-                self.hidden_flags.extend(flag_names_of(token));
+            if tied && matches!(role, Role::Flag(_) | Role::Plain) {
+                hidden_flags.extend(flag_names_of(token));
             }
         }
-        self.shown_args = shown.into_iter().map(|(word, _)| word).collect();
-        self.command_line = self.line_of(&self.shown_args);
+        self.masked_flags = masked_flags;
+        self.masked_positionals = masked_positionals;
+        self.hidden_flags = hidden_flags;
+        self.command_line = self.line_of(&shown_args);
+        self.shown_args = shown_args;
     }
 
     /// Replace the `command` line, for a line the framework does not parse.
@@ -320,14 +347,13 @@ impl fmt::Display for ParseInvocationError {
 impl Error for ParseInvocationError {}
 
 impl ParseInvocationError {
-    /// The message and fix of the `PARSE_ERROR` envelope for this failure on
-    /// `args` (argv after the program), with what the failing token carries
-    /// masked: the value after its `=`, or the whole token, or the name of the
-    /// flag it sets, when it sits right after a bare flag and so may be that
-    /// flag's value.
-    pub(crate) fn masked(&self, args: &[String]) -> (String, String) {
+    /// The `PARSE_ERROR` error for this failure on `args` (argv after the
+    /// program), with what the failing token carries masked: the value after
+    /// its `=`, or the whole token, or the name of the flag it sets, when it
+    /// sits right after a bare flag and so may be that flag's value.
+    pub(crate) fn masked_error(&self, args: &[String]) -> CommandError {
         let tied = redaction::tied_flag_tokens(args);
-        match self {
+        let (message, fix) = match self {
             Self::InvalidFlag(token) => {
                 let hidden = tied.iter().any(|&at| &args[at] == token);
                 let shown = if hidden {
@@ -348,7 +374,8 @@ impl ParseInvocationError {
                 )
             }
             _ => (self.to_string(), self.fix()),
-        }
+        };
+        CommandError::new(ErrorCode::PARSE_ERROR, message, fix)
     }
 
     /// The `fix` of the `PARSE_ERROR` envelope reporting this failure: how
@@ -669,10 +696,7 @@ impl TokenParser {
         for ch in short.chars() {
             self.set_bare_flag(ch.to_string())?;
         }
-        self.waiting = Follows {
-            names: short.chars().map(String::from).collect(),
-            bundle: true,
-        };
+        self.waiting = Follows::Bundle(short.chars().map(String::from).collect());
         Ok(())
     }
 
@@ -690,10 +714,7 @@ impl TokenParser {
             return Err(ParseInvocationError::RepeatedFlag(name.to_string()));
         }
         self.pending_flag = Some(name.to_string());
-        self.waiting = Follows {
-            names: vec![name.to_string()],
-            bundle: false,
-        };
+        self.waiting = Follows::BareFlag(name.to_string());
         Ok(())
     }
 
@@ -1196,14 +1217,22 @@ mod tests {
         assert_eq!(error.to_string(), "invalid flag syntax: -abc=5");
         let args = ["-abc=5".to_string()];
         assert_eq!(
-            error.masked(&args).0,
+            error.masked_error(&args).message,
             "invalid flag syntax: -abc=<redacted>"
         );
         let args = ["--k".to_string(), "-abc=5".to_string()];
-        assert_eq!(error.masked(&args).0, "invalid flag syntax: <redacted>");
+        assert_eq!(
+            error.masked_error(&args).message,
+            "invalid flag syntax: <redacted>"
+        );
         let error = ParseInvocationError::RepeatedFlag("z".to_string());
         let args = ["--k", "--z", "--z"].map(String::from);
-        assert_eq!(error.masked(&args).0, "a flag given twice");
-        assert_eq!(error.masked(&["--z".to_string()]).0, "-z given twice");
+        let masked = error.masked_error(&args);
+        assert_eq!(masked.message, "a flag given twice");
+        assert_eq!(masked.fix, "Pass each flag once.");
+        assert_eq!(
+            error.masked_error(&["--z".to_string()]).message,
+            "-z given twice"
+        );
     }
 }

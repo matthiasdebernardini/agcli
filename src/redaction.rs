@@ -35,13 +35,11 @@ pub(crate) fn masked_flag_word(token: &str) -> String {
     )
 }
 
-/// `token` as one shell word, after the hook: the hook's text when it
-/// rewrites the token. `hooked` says whether it did.
-pub(crate) fn hooked_word(hook: Option<&RedactFn>, token: &str) -> (String, bool) {
-    hook.and_then(|hook| hook(token)).map_or_else(
-        || (shell_quote(token).into_owned(), false),
-        |text| (shell_quote(&text).into_owned(), true),
-    )
+/// The hook's text for `token` as one shell word, or `None` when the hook
+/// leaves the token alone, in which case the caller decides how to show it.
+pub(crate) fn hook_word(hook: Option<&RedactFn>, token: &str) -> Option<String> {
+    hook.and_then(|hook| hook(token))
+        .map(|text| shell_quote(&text).into_owned())
 }
 
 /// True for a token that starts a flag: `-` and something, not a number.
@@ -83,29 +81,31 @@ pub(crate) fn opaque_words(
     hook: Option<&RedactFn>,
     names_command: impl Fn(&[String], &str) -> bool,
 ) -> Vec<String> {
-    let mut path: Vec<String> = Vec::new();
-    let mut flags_ended = false;
     let tied = tied_flag_tokens(args);
-    let mut words = Vec::with_capacity(args.len());
-    for (at, token) in args.iter().enumerate() {
-        let (word, hooked) = hooked_word(hook, token);
-        if hooked {
-            words.push(word);
-        } else if tied.contains(&at) {
-            words.push(MARKER.to_string());
-        } else if flags_ended || !token.starts_with('-') || looks_like_negative_number(token) {
-            if names_command(&path, token) {
-                path.push(token.clone());
-                words.push(word);
+    // The state carried from token to token: the command path read so far,
+    // and whether a `--` has ended the flags.
+    let start: (Vec<String>, bool) = (Vec::new(), false);
+    args.iter()
+        .enumerate()
+        .scan(start, |(path, flags_ended), (at, token)| {
+            let word = if let Some(word) = hook_word(hook, token) {
+                word
+            } else if tied.contains(&at) {
+                MARKER.to_string()
+            } else if *flags_ended || !token.starts_with('-') || looks_like_negative_number(token) {
+                if names_command(path, token) {
+                    path.push(token.clone());
+                    shell_quote(token).into_owned()
+                } else {
+                    MARKER.to_string()
+                }
             } else {
-                words.push(MARKER.to_string());
-            }
-        } else {
-            flags_ended = token == "--";
-            words.push(masked_flag_word(token));
-        }
-    }
-    words
+                *flags_ended = token == "--";
+                masked_flag_word(token)
+            };
+            Some(word)
+        })
+        .collect()
 }
 
 /// The shell words for the tokens of a raw command, which the framework never
@@ -118,9 +118,8 @@ pub(crate) fn raw_tail_words(tail: &[String], hook: Option<&RedactFn>) -> Vec<St
     let mut after_bare_flag = false;
     let mut words = Vec::with_capacity(tail.len());
     for token in tail {
-        let (word, hooked) = hooked_word(hook, token);
         let is_flag = !flags_ended && token.starts_with('-') && !looks_like_negative_number(token);
-        if hooked {
+        if let Some(word) = hook_word(hook, token) {
             after_bare_flag = false;
             words.push(word);
         } else if is_flag && after_bare_flag && token != "--" {
@@ -135,7 +134,7 @@ pub(crate) fn raw_tail_words(tail: &[String], hook: Option<&RedactFn>) -> Vec<St
             after_bare_flag = false;
             words.push(MARKER.to_string());
         } else {
-            words.push(word);
+            words.push(shell_quote(token).into_owned());
         }
     }
     words
@@ -169,12 +168,9 @@ mod tests {
     #[test]
     fn the_hook_text_replaces_a_token_and_is_quoted() {
         let hook: &RedactFn = &|arg| arg.starts_with("pw=").then(|| "pw=<x>".to_string());
-        assert_eq!(
-            hooked_word(Some(hook), "pw=1"),
-            ("'pw=<x>'".to_string(), true)
-        );
-        assert_eq!(hooked_word(Some(hook), "a b"), ("'a b'".to_string(), false));
-        assert_eq!(hooked_word(None, "pw=1"), ("pw=1".to_string(), false));
+        assert_eq!(hook_word(Some(hook), "pw=1"), Some("'pw=<x>'".to_string()));
+        assert_eq!(hook_word(Some(hook), "a b"), None);
+        assert_eq!(hook_word(None, "pw=1"), None);
     }
 
     #[test]

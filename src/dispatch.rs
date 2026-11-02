@@ -141,25 +141,23 @@ impl AgentCli {
                     .await;
             }
             ParsedArgv::Failed(error) => {
-                let (masked_message, masked_fix) = error.masked(&argv[1..]);
                 return self.error_execution(
                     self.opaque_command_line(&argv),
                     &*clock,
-                    CommandError::new(ErrorCode::PARSE_ERROR, masked_message, masked_fix)
+                    error
+                        .masked_error(&argv[1..])
                         .next_actions(self.root_actions()),
                 );
             }
             ParsedArgv::Invocation(mut invocation) => {
-                self.redact_invocation(&mut invocation, false);
+                self.redact_invocation(&mut invocation);
                 Arc::new(invocation)
             }
         };
 
         // Every path below reads the boolean flags, so a value that is not a
         // boolean is refused before any of them can misread it.
-        if let Some((name, value)) =
-            reserved_flags::invalid_bool_flag(invocation.flags(), self.reserved_flags)
-        {
+        if let Some((name, value)) = self.invalid_bool_flag(invocation.flags()) {
             return self.invalid_bool_execution(&invocation, &*clock, name, value);
         }
 
@@ -243,7 +241,7 @@ impl AgentCli {
     ) -> String {
         let head = match prefix.as_deref_mut() {
             Some(prefix) => {
-                self.redact_invocation(prefix, true);
+                self.redact_raw_prefix(prefix);
                 prefix.command_line().to_string()
             }
             None => invocation::render_command_line(&argv[0], &argv[1..args_start]),
@@ -277,20 +275,34 @@ impl AgentCli {
     /// secret positional, then whatever the [`AgentCli::redact_arg`] hook
     /// rewrites. Before a command is known, only the flags the framework
     /// reserves are left alone.
-    ///
-    /// `before_raw` is true for the tokens before a raw command's name: they
-    /// can never reach it, so no usage declares any of them.
-    fn redact_invocation(&self, invocation: &mut Invocation, before_raw: bool) {
-        let resolved = self
-            .resolve_command(invocation.positionals())
-            .filter(|_| !before_raw);
-        let path_cmds = resolved
-            .as_ref()
-            .map_or_else(Vec::new, |resolved| self.path_command_refs(resolved.path));
-        let path_len = resolved.as_ref().map_or(0, |resolved| resolved.path.len());
+    fn redact_invocation(&self, invocation: &mut Invocation) {
+        let (path_cmds, path_len) = self.resolve_command(invocation.positionals()).map_or_else(
+            || (Vec::new(), 0),
+            |resolved| (self.path_command_refs(resolved.path), resolved.path.len()),
+        );
+        self.redact_for_path(invocation, &path_cmds, path_len);
+    }
+
+    /// Mask what the tokens before a raw command's name carry that must not
+    /// be echoed. They can never reach the command, so no usage declares any
+    /// of them: only the flags the framework reserves are left alone, and the
+    /// [`AgentCli::redact_arg`] hook rewrites the rest as usual.
+    fn redact_raw_prefix(&self, prefix: &mut Invocation) {
+        self.redact_for_path(prefix, &[], 0);
+    }
+
+    /// Redact `invocation` for the command path `path_cmds`, root first, which
+    /// its first `path_len` positionals name: see
+    /// [`AgentCli::redact_invocation`] for what is masked.
+    fn redact_for_path(
+        &self,
+        invocation: &mut Invocation,
+        path_cmds: &[&Command],
+        path_len: usize,
+    ) {
         let given = invocation.positionals().len().saturating_sub(path_len);
         let mut declared = HashSet::new();
-        for command in &path_cmds {
+        for command in path_cmds {
             if let Some(usage) = &command.usage {
                 usage::extract_all_flag_names(usage, &mut declared);
             }
@@ -311,9 +323,9 @@ impl AgentCli {
         // than declared, an optional one may have been skipped, so a
         // positional can sit in a later one's slot: from the first optional
         // on, every one is masked if any later one is secret.
-        let (secret_positionals, masked_from) = path_cmds.last().map_or_else(
-            || (Vec::new(), None),
-            |leaf| {
+        let (secret_positionals, masked_from) = match path_cmds.last() {
+            None => (Vec::new(), None),
+            Some(leaf) => {
                 let declared = leaf
                     .usage
                     .as_deref()
@@ -329,8 +341,8 @@ impl AgentCli {
                     given < declared.len() && secret.iter().any(|&(at, _)| at >= optional)
                 });
                 (secret, masked_from)
-            },
-        );
+            }
+        };
         let mask_positional = |index: usize| {
             index.checked_sub(path_len).is_some_and(|own| {
                 masked_from.is_some_and(|from| own >= from)
@@ -354,7 +366,7 @@ impl AgentCli {
         mode: RunMode,
     ) -> Execution {
         let command_line = self.raw_command_line(argv, args_start, prefix.as_mut());
-        let tail = argv[args_start.min(argv.len())..].to_vec();
+        let tail = argv[args_start..].to_vec();
         self.raw_execution(handler, tail, prefix.as_ref(), command_line, clock, mode)
             .await
     }
@@ -377,9 +389,7 @@ impl AgentCli {
         mode: RunMode,
     ) -> Execution {
         if let Some(prefix) = prefix {
-            if let Some((name, value)) =
-                reserved_flags::invalid_bool_flag(prefix.flags(), self.reserved_flags)
-            {
+            if let Some((name, value)) = self.invalid_bool_flag(prefix.flags()) {
                 return self.invalid_bool_execution(prefix, &**clock, name, value);
             }
             if let Some(execution) = self.framework_route(prefix, &**clock) {
@@ -652,6 +662,27 @@ impl AgentCli {
         ParsedArgv::Invocation(invocation)
     }
 
+    /// The first boolean flag on `flags` (a framework flag, or a reserved
+    /// agent flag when this CLI reserves them) whose value is not a boolean
+    /// spelling, with that value. Names are checked in sorted order, so the
+    /// answer does not depend on map iteration order.
+    fn invalid_bool_flag<'a>(
+        &self,
+        flags: impl IntoIterator<Item = (&'a String, &'a String)>,
+    ) -> Option<(&'a str, &'a str)> {
+        let mut invalid: Vec<(&str, &str)> = flags
+            .into_iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .filter(|(name, value)| {
+                (reserved_flags::is_framework_flag(name)
+                    || (self.reserved_flags && reserved_flags::is_reserved_bool(name)))
+                    && reserved_flags::parse_bool(value).is_none()
+            })
+            .collect();
+        invalid.sort_unstable();
+        invalid.into_iter().next()
+    }
+
     /// The answer to a framework or reserved boolean flag `name` given
     /// `value`, which is not a boolean. Once the positionals resolve to a
     /// command it answers like a gate error: that command's next actions,
@@ -913,23 +944,14 @@ impl AgentCli {
             && let Some(arity) = usage::positional_arity(usage)
             && resolved.remaining.len() > arity.required + arity.optional
         {
-            return Some(
-                self.gate_error(
-                    gate,
-                    extra_arg_error(
-                        &gate.path_strs.join(" "),
-                        usage,
-                        arity,
-                        &(0..resolved.remaining.len())
-                            .map(|at| {
-                                let first =
-                                    gate.invocation.positionals().len() - resolved.remaining.len();
-                                gate.invocation.shown_positional(first + at).to_string()
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                ),
-            );
+            let first = gate.invocation.positionals().len() - resolved.remaining.len();
+            let shown: Vec<String> = (first..first + resolved.remaining.len())
+                .map(|index| gate.invocation.shown_positional(index).to_string())
+                .collect();
+            return Some(self.gate_error(
+                gate,
+                extra_arg_error(&gate.path_strs.join(" "), usage, arity, &shown),
+            ));
         }
         None
     }

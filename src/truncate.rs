@@ -290,7 +290,7 @@ mod tests {
                 "must reject {shape}"
             );
         }
-        let mut no_file = consistent.clone();
+        let mut no_file = consistent;
         no_file
             .as_object_mut()
             .expect("object")

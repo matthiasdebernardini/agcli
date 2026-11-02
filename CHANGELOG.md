@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **`Debug` on `Invocation`, and so on `CommandRequest`, shows only the
+    command line**, which inside a handler is the redacted one the envelopes
+    carry. The derived `Debug` printed every argument as given, so
+    `tracing::debug!(?req)` in a handler logged the values every envelope
+    masks. Before: `Invocation { program: "pw", command_line: ..,
+    raw_args: ["unlock", "--passphrase=hunter2"], .. }`. After:
+    `Invocation { command_line: "pw unlock --passphrase=<redacted>", .. }`.
+- **`StreamLine` implements `Eq`** (the `deserialize` feature), like the
+    other wire types. Before: `PartialEq` only. After: `PartialEq + Eq`.
+- **A `select_warning` lists an object's fields in sorted order** under
+    serde_json's `preserve_order` too, as it already did for a list's rows.
+    Under default features nothing changes.
+
+### Internal
+
+- A Beautiful Rust pass (rust-best-practices 1.5.0): no `bool` parameters in
+    shared helpers, `Follows` as an enum
+    instead of a list and a flag, one pass to redact an invocation, named
+    results instead of look-alike tuples, `flag_parse` asking whether a flag
+    was given bare instead of comparing against `""`, and the root
+    `next_action` built in one place. `doctor`, `doctor_with` and `skill`
+    document that a duplicate command name panics. Clippy with the
+    BeautifulRust lint set reports only the standing exceptions:
+    exhaustive public enums, the `required(bool)` and `retryable(bool)`
+    setters, two test helpers that take a `bool`, and deliberate casts and
+    prints in tests and examples.
+
 ## [0.19.0](https://github.com/matthiasdebernardini/agcli/releases/tag/v0.19.0) - 2026-10-29
 
 ### Breaking changes

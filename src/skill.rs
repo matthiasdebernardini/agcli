@@ -23,7 +23,6 @@ use crate::command::{Builtin, Command};
 use crate::command_error::CommandError;
 use crate::execution::{Execution, Output};
 use crate::invocation::Invocation;
-use crate::next_action::NextAction;
 use crate::reserved_flags::{self, RESERVED_FLAG_DOCS};
 use crate::tree::CommandDoc;
 
@@ -148,7 +147,7 @@ fn description_line(cli: &AgentCli) -> String {
 
 /// Flatten the command tree into a markdown list, one usage template per line,
 /// subcommands indented under their parent.
-fn commands_into(out: &mut String, docs: &[CommandDoc], depth: usize) {
+fn commands_into(out: &mut String, docs: &[CommandDoc<'_>], depth: usize) {
     for doc in docs {
         let indent = "  ".repeat(depth);
         let contract = if doc.raw {
@@ -169,13 +168,13 @@ fn commands_into(out: &mut String, docs: &[CommandDoc], depth: usize) {
 }
 
 /// True when any command in the tree streams.
-fn any_stream(docs: &[CommandDoc]) -> bool {
+fn any_stream(docs: &[CommandDoc<'_>]) -> bool {
     docs.iter()
         .any(|doc| doc.stream || any_stream(&doc.subcommands))
 }
 
 /// True when any command in the tree is raw.
-fn any_raw(docs: &[CommandDoc]) -> bool {
+fn any_raw(docs: &[CommandDoc<'_>]) -> bool {
     docs.iter().any(|doc| doc.raw || any_raw(&doc.subcommands))
 }
 
@@ -247,6 +246,9 @@ impl AgentCli {
     /// `name` and the directory `--install` writes, and a harness accepts
     /// neither otherwise. A mistake in the CLI definition, so it fails the
     /// build of the CLI, not an agent's invocation.
+    ///
+    /// Also when a command named `skill` is already registered: a second
+    /// registration would silently replace the first.
     #[must_use]
     pub fn skill(self) -> Self {
         assert!(
@@ -259,10 +261,7 @@ impl AgentCli {
         let mut command = Command::new("skill", "Print this CLI as an agent skill (SKILL.md)")
             .usage(usage)
             .handles_dry_run()
-            .default_next_action(NextAction::new(
-                self.name.clone(),
-                "Inspect the full command tree",
-            ));
+            .default_next_action(self.root_action());
         command.builtin = Some(Builtin::Skill);
         self.command(command)
     }
@@ -280,8 +279,6 @@ impl AgentCli {
     /// `SKILL.md` document and, under `--install=<dir>`, write it to
     /// `<dir>/<name>/SKILL.md`.
     pub(crate) fn skill_execution(&self, invocation: &Invocation, clock: &ClockFn) -> Execution {
-        let root_action = || NextAction::new(self.name.clone(), "Inspect the full command tree");
-
         // No `--install`: the document itself is the answer. A bare
         // `--install` reads as the empty directory, so it is refused below
         // instead of writing `./true/<name>/SKILL.md` and reporting success.
@@ -290,14 +287,14 @@ impl AgentCli {
                 "markdown": self.skill_markdown(),
                 "skill_name": self.name,
             });
-            return self.framework_success(invocation, clock, result, vec![root_action()]);
+            return self.framework_success(invocation, clock, result, vec![self.root_action()]);
         };
 
         let dir = raw_dir.trim();
         // `--install=~/skills` never reaches tilde expansion: a shell expands
         // `~` only at the start of a word, not after `=`. A literal `~`
         // directory is never what the caller meant.
-        let tilde = dir.split('/').next().is_some_and(|c| c.starts_with('~'));
+        let tilde = dir.starts_with('~');
         if dir.is_empty() || tilde {
             let fix = if tilde {
                 format!(
@@ -320,7 +317,7 @@ impl AgentCli {
                     format!("--install needs a directory, got {raw_dir:?}"),
                     fix,
                 )
-                .next_action(root_action()),
+                .next_action(self.root_action()),
             );
         }
 
@@ -343,7 +340,7 @@ impl AgentCli {
                 return self.error_execution(
                     invocation.command_line().to_string(),
                     clock,
-                    reserved_flags::not_a_boolean("dry-run", value).next_action(root_action()),
+                    reserved_flags::not_a_boolean("dry-run", value).next_action(self.root_action()),
                 );
             };
             on
@@ -377,7 +374,7 @@ impl AgentCli {
             invocation,
             clock,
             Value::Object(result),
-            vec![root_action()],
+            vec![self.root_action()],
         )
     }
 
@@ -401,10 +398,7 @@ impl AgentCli {
                         "Check the directory exists and is writable.",
                     )
                     .exit_code(ExitCode::ERROR)
-                    .next_action(NextAction::new(
-                        self.name.clone(),
-                        "Inspect the full command tree",
-                    )),
+                    .next_action(self.root_action()),
                 )
                 .into(),
             output: Output::Envelope,

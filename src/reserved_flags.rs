@@ -62,7 +62,8 @@ pub(crate) fn parse_bool(value: &str) -> Option<bool> {
 /// that spelled its intent out.
 ///
 /// Dispatch rejects any other value of a reserved or framework boolean with
-/// `INVALID_FLAG` before anything reads it (see [`invalid_bool_flag`]), so
+/// `INVALID_FLAG` before anything reads it (see
+/// [`AgentCli::invalid_bool_flag`](crate::AgentCli::invalid_bool_flag)), so
 /// for those flags "not a boolean" never reaches here.
 pub(crate) fn bool_flag_on(value: Option<&str>) -> bool {
     value.and_then(parse_bool) == Some(true)
@@ -82,26 +83,6 @@ pub(crate) fn not_a_boolean(name: &str, value: &str) -> CommandError {
         ),
     )
     .exit_code(ExitCode::USAGE)
-}
-
-/// The first boolean flag on `flags` (a framework flag, or a reserved agent
-/// flag when `reserved` is on) whose value is not a boolean spelling, with
-/// that value. Names are checked in sorted order, so the answer does not
-/// depend on map iteration order.
-pub(crate) fn invalid_bool_flag<'a>(
-    flags: impl IntoIterator<Item = (&'a String, &'a String)>,
-    reserved: bool,
-) -> Option<(&'a str, &'a str)> {
-    let mut invalid: Vec<(&str, &str)> = flags
-        .into_iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .filter(|(name, value)| {
-            (is_framework_flag(name) || (reserved && is_reserved_bool(name)))
-                && parse_bool(value).is_none()
-        })
-        .collect();
-    invalid.sort_unstable();
-    invalid.into_iter().next()
 }
 
 /// The framework-reserved agent-native flags with their semantics, in the

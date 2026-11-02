@@ -1,3 +1,5 @@
+//! Criterion benchmarks for dispatching commands, truncating output and streaming events.
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::json;
 use tokio::runtime::Runtime;
@@ -71,7 +73,7 @@ fn bench_root_invocation(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let run = cli.run(["bench"]).await;
-                    assert_eq!(run.exit_code(), ExitCode::SUCCESS);
+                    assert_eq!(run.exit_code(), ExitCode::SUCCESS, "bench run exit code");
                 });
             });
         });
@@ -83,7 +85,7 @@ fn bench_root_invocation(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let run = cli.run(["bench"]).await;
-                    assert_eq!(run.exit_code(), ExitCode::SUCCESS);
+                    assert_eq!(run.exit_code(), ExitCode::SUCCESS, "bench run exit code");
                 });
             });
         });
@@ -108,7 +110,7 @@ fn bench_command_execution(c: &mut Criterion) {
                 b.iter(|| {
                     rt.block_on(async {
                         let run = cli.run(["bench", t, "hello"]).await;
-                        assert_eq!(run.exit_code(), ExitCode::SUCCESS);
+                        assert_eq!(run.exit_code(), ExitCode::SUCCESS, "bench run exit code");
                     });
                 });
             },
@@ -205,7 +207,11 @@ fn bench_stream(c: &mut Criterion) {
                     // In-process: the events are captured, then rendered with
                     // the terminal line the way `print` would.
                     let run = cli.run(["bench", "stream"]).await;
-                    assert_eq!(run.stream_events().len(), usize::from(events));
+                    assert_eq!(
+                        run.stream_events().len(),
+                        usize::from(events),
+                        "streamed event count"
+                    );
                     let _ = run.to_json();
                 });
             });

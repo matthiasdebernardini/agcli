@@ -115,7 +115,10 @@ pub(crate) fn apply_select_flag(result: Value, raw: &str) -> (Value, Option<Stri
 /// nor an array with an object row, so no select can project it.
 fn selectable_fields(result: &Value) -> Option<(&'static str, Vec<String>)> {
     match result {
-        Value::Object(map) => Some(("top-level", map.keys().cloned().collect())),
+        Value::Object(map) => {
+            let keys: BTreeSet<&String> = map.keys().collect();
+            Some(("top-level", keys.into_iter().cloned().collect()))
+        }
         Value::Array(rows) => {
             let objects: Vec<&Map<String, Value>> =
                 rows.iter().filter_map(Value::as_object).collect();

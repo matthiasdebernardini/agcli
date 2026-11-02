@@ -192,7 +192,7 @@ impl CommandRequest {
             Some(raw) => {
                 let flag = usage::flag_display(key);
                 // A bare flag reads as "true" but carries no value.
-                if !raw.is_empty() && self.invocation.value_flag(key) == Some("") {
+                if self.invocation.given_bare(key) {
                     return Err(CommandError::new(
                         ErrorCode::INVALID_FLAG,
                         format!("flag {flag} was given no value"),
@@ -341,7 +341,7 @@ impl CommandRequest {
 /// floats as `null`, an envelope-corrupting value the typed helpers refuse
 /// to produce.
 fn parsed_value_is_finite<T: Any>(value: &T) -> bool {
-    let any = value as &dyn Any;
+    let any: &dyn Any = value;
     any.downcast_ref::<f64>()
         .map(|f| f.is_finite())
         .or_else(|| any.downcast_ref::<f32>().map(|f| f.is_finite()))

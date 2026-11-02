@@ -121,7 +121,7 @@ struct StampedEvent<'event> {
 /// does not know is ignored, so a reader keeps working on the output of a
 /// later agcli that only added a field.
 #[cfg(feature = "deserialize")]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamLine {
     /// A non-terminal event line.
     Event {
@@ -518,6 +518,8 @@ mod tests {
         // land in the same stream, and nothing lands after the handler returns.
         let (out, handle) = StreamWriter::captured(Arc::new(|| Timestamp::UNIX_EPOCH));
         let spawned = out.clone();
+        // A clone a task still holds once the handler has returned.
+        let kept = out.clone();
         let worker = std::thread::spawn(move || spawned.emit(&log("from the task")));
         worker
             .join()
@@ -527,7 +529,6 @@ mod tests {
             .expect("an open stream accepts events");
         assert_eq!(handle.close().len(), 2);
 
-        let kept = out.clone();
         assert!(matches!(
             kept.emit(&log("late")),
             Err(StreamWriteError::Closed)

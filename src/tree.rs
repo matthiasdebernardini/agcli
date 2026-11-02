@@ -12,7 +12,6 @@ use crate::command_error::CommandError;
 use crate::dispatch;
 use crate::execution::Execution;
 use crate::invocation::Invocation;
-use crate::next_action::NextAction;
 use crate::reserved_flags::RESERVED_FLAG_DOCS;
 use crate::suggest;
 use crate::usage::Arity;
@@ -129,10 +128,7 @@ impl AgentCli {
             invocation,
             clock,
             Value::Object(result),
-            vec![NextAction::new(
-                self.name.clone(),
-                "Inspect the full command tree",
-            )],
+            vec![self.root_action()],
         )
     }
 

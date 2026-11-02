@@ -76,7 +76,7 @@ fn run_case(case: &str) -> Output {
 /// command line is in the envelope, on stderr when `on_stderr`, else stdout.
 fn assert_masked(case: &str, on_stderr: bool) {
     let output = run_case(case);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(1), "exit status of case {case}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stdout.contains(SECRET), "stdout leaked: {stdout}");

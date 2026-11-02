@@ -15,7 +15,7 @@ const MALFORMED: [&str; 3] = ["EXTRA_ARG", "UNKNOWN_FLAG", "PARSE_ERROR"];
 
 /// Crawl `program` through `run`, which answers an argv with its envelope as
 /// JSON, and return every literal command it ran.
-pub async fn literal_actions_run_as_printed(
+pub(crate) async fn literal_actions_run_as_printed(
     program: &str,
     mut run: impl AsyncFnMut(Vec<String>) -> Value,
 ) -> BTreeSet<String> {
